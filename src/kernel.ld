@@ -31,6 +31,7 @@ SECTIONS
         *loader.o(.text .text.*)
         *sh.o(.text .text.*)
         *srv_net.o(.text .text.*)
+        *net_ip.o(.text .text.*)
         *fat16.o(.text .text.*)
     }
     .urodata : {
@@ -43,6 +44,7 @@ SECTIONS
         *loader.o(.rodata .rodata.* .srodata .srodata.*)
         *sh.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_net.o(.rodata .rodata.* .srodata .srodata.*)
+        *net_ip.o(.rodata .rodata.* .srodata .srodata.*)
         *fat16.o(.rodata .rodata.* .srodata .srodata.*)
     }
     . = ALIGN(4096);
@@ -86,6 +88,7 @@ SECTIONS
     __unet_start = .;
     .unet : {
         *srv_net.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+        *net_ip.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
     }
     . = ALIGN(4096);
     __unet_end = .;

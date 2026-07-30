@@ -56,6 +56,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/trap.c`       | timer setup, trap/`ecall` dispatch, interrupt ownership |
 | `src/plic.c`       | the interrupt controller — how a device reaches the kernel |
 | `src/srv_net.c`    | **virtio-net driver** — user mode, owns the card |
+| `src/net_ip.c`     | ARP, IPv4, UDP and a minimal TCP client |
 | `src/task.c`       | task table, preemptive round-robin scheduler, syscalls |
 | `src/ipc.c`        | synchronous rendezvous `send`/`recv` |
 | `src/vfs.h`        | **the one interface** + client wrappers |
@@ -299,6 +300,7 @@ $ read the fs server's private data region
 14. the PLIC, and interrupts delivered to a user-mode driver
 15. DMA memory, and a virtio-net driver that sends and receives
 16. interrupt-driven networking, and a ping that gets an answer
+17. UDP, and enough TCP to open a connection, talk and close it
 
 ## Loading a program
 
@@ -449,11 +451,50 @@ run, or the first frames arrive with nowhere to go.
 `make runpcap` writes every frame to `build/net.pcap`, which is how to check
 the driver without trusting its own report of what it did.
 
+## UDP and TCP
+
+`srv_net.c` handles virtqueues and frames; `net_ip.c` handles addresses and
+protocols. They are still one task — splitting them would cost a message per
+packet — but they are separate files, so neither half can quietly reach into
+the other.
+
+**UDP is complete.** It is an eight-byte header and a checksum, and both are
+here. The checksum covers a *pseudo-header* that never goes on the wire — the
+two addresses, the protocol and the length — which is what makes a datagram
+delivered to the wrong host fail rather than be accepted.
+
+**TCP is not complete, and it is worth being exact about what is missing.**
+What works is a client that opens a connection, sends, receives and closes in
+order:
+
+```
+tcp: SYN -> 10.0.2.2:9998
+tcp: SYN-ACK received, connection established
+tcp: sent 16 bytes
+tcp: received 16 bytes: "hello-from-host"
+tcp: closing
+tcp: closed
+```
+
+What is absent is everything that makes TCP reliable rather than merely
+correct on a perfect link: no retransmission, no timers, no out-of-order
+reassembly, no window management beyond a fixed advertised window, no
+congestion control, and a fixed initial sequence number instead of a random
+one. Over a virtual link that never drops a packet none of this shows —
+which is the reason to write it down. **This implementation would hang on the
+first lost segment.**
+
+Both are verified from the far side rather than from the driver's own
+account: `nc -u -l 9999` and `nc -l 9998` on the host receive what the guest
+claims to have sent, and the host's reply arrives back in the guest.
+
 ## Next steps
 
 - a blocking `read()` on the console, so the shell stops polling the driver
   (the driver is interrupt-driven now; its client is not)
-- a network *server*: bind the driver at `/net/` so programs reach it through
+- retransmission and timers, without which the TCP above is a demonstration
+  rather than a transport
+- a network *server*: bind the stack at `/net/` so programs reach it through
   the same open/read/write interface as everything else
 - answering ARP and ICMP rather than only initiating them
 - capabilities on the task-building syscalls, which are currently open to all

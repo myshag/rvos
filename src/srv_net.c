@@ -7,11 +7,13 @@
    buffers come from SYS_DMA_ALLOC, the one call that reports both halves of
    a mapping.
 
-   First milestone: find the card, complete the handshake, and put one frame
-   on the wire. */
+   This file is the driver only: virtqueues and frames. Addresses and
+   protocols live in net_ip.c, so neither half can quietly reach into the
+   other even though they share a task. */
 #include "syscall.h"
 #include "ulib.h"
 #include "virtio.h"
+#include "netif.h"
 
 static volatile uint32 *dev;          /* MMIO base of the device we found */
 
@@ -33,6 +35,9 @@ static void say_num(const char *l, unsigned long v, const char *t)
     say(l); say(n); say(t);
 }
 
+void net_puts(const char *s) { say(s); }
+void net_putn(const char *l, unsigned long v, const char *t) { say_num(l, v, t); }
+
 static void say_hex2(unsigned v)
 {
     const char *d = "0123456789abcdef";
@@ -49,7 +54,8 @@ static uint64 tx_desc_pa, tx_avail_pa, tx_used_pa;
 static char  *tx_buf;
 static uint64 tx_buf_pa;
 
-static uint8 mac[6];
+uint8 net_mac[6];        /* the protocol layer reads this */
+#define mac net_mac
 
 /* ---- the receive queue ---------------------------------------------- */
 #define NRX 4
@@ -188,30 +194,6 @@ static void rx_recycle(uint16 id)
     wr(VIRTIO_QUEUE_NOTIFY, 0);
 }
 
-/* An ARP request for the gateway. A real frame rather than random bytes, so
-   the other end has something to answer and a capture is readable. */
-static int build_arp(char *p)
-{
-    static const uint8 bcast[6] = { 0xff,0xff,0xff,0xff,0xff,0xff };
-    static const uint8 me_ip[4] = { 10, 0, 2, 15 };
-    static const uint8 gw_ip[4] = { 10, 0, 2, 2 };
-    int o = 0;
-
-    umemcpy(p + o, bcast, 6); o += 6;          /* ethernet destination */
-    umemcpy(p + o, mac, 6);   o += 6;          /* ethernet source */
-    p[o++] = 0x08; p[o++] = 0x06;              /* ethertype: ARP */
-
-    p[o++] = 0x00; p[o++] = 0x01;              /* hardware type: ethernet */
-    p[o++] = 0x08; p[o++] = 0x00;              /* protocol type: IPv4 */
-    p[o++] = 6;    p[o++] = 4;                 /* address lengths */
-    p[o++] = 0x00; p[o++] = 0x01;              /* opcode: request */
-    umemcpy(p + o, mac, 6);   o += 6;          /* sender hardware address */
-    umemcpy(p + o, me_ip, 4); o += 4;          /* sender protocol address */
-    umemset(p + o, 0, 6);     o += 6;          /* target hardware: unknown */
-    umemcpy(p + o, gw_ip, 4); o += 4;          /* target protocol address */
-    return o;                                  /* 42 bytes */
-}
-
 /* Block until the card says something happened. The device has its own
    interrupt-status register on top of the PLIC's masking, and both have to be
    cleared: VIRTIO_INT_ACK tells the card, SYS_IRQ_ACK tells the controller.
@@ -243,11 +225,12 @@ static char *receive(int *len, uint16 *id)
     }
 }
 
-static int transmit(const char *frame, int len)
+
+int net_transmit(const void *vframe, int len)
 {
     struct virtio_net_hdr *h = (struct virtio_net_hdr *)tx_buf;
     umemset(h, 0, sizeof(*h));                 /* no offloads, no segmentation */
-    umemcpy(tx_buf + sizeof(*h), frame, (unsigned long)len);
+    umemcpy(tx_buf + sizeof(*h), vframe, (unsigned long)len);
 
     tx_desc[0].addr  = tx_buf_pa;
     tx_desc[0].len   = (uint32)(sizeof(*h) + len);
@@ -271,62 +254,6 @@ static int transmit(const char *frame, int len)
         wait_irq();
     }
     return 0;
-}
-
-/* The one's-complement sum both IPv4 and ICMP use. Folding the carries back
-   in is what makes it end-around; leaving that out gives a checksum that is
-   right for small packets and wrong for large ones. */
-static uint16 checksum(const uint8 *p, int len)
-{
-    uint32 sum = 0;
-    for (int i = 0; i + 1 < len; i += 2)
-        sum += ((uint32)p[i] << 8) | p[i + 1];
-    if (len & 1)
-        sum += (uint32)p[len - 1] << 8;
-    while (sum >> 16)
-        sum = (sum & 0xffff) + (sum >> 16);
-    return (uint16)(~sum & 0xffff);
-}
-
-static void put16(uint8 *p, unsigned v) { p[0] = (uint8)(v >> 8); p[1] = (uint8)v; }
-
-static const uint8 me_ip[4] = { 10, 0, 2, 15 };
-static const uint8 gw_ip[4] = { 10, 0, 2, 2 };
-static uint8 gw_mac[6];
-
-/* An ICMP echo request to the gateway, wrapped in IPv4 and ethernet. */
-static int build_ping(uint8 *p, uint16 seq)
-{
-    int o = 0;
-    umemcpy(p + o, gw_mac, 6); o += 6;
-    umemcpy(p + o, mac, 6);    o += 6;
-    put16(p + o, 0x0800);      o += 2;          /* ethertype: IPv4 */
-
-    uint8 *ip = p + o;
-    int icmp_len = 8 + 8;                       /* header + payload */
-    ip[0] = 0x45;                               /* IPv4, 5-word header */
-    ip[1] = 0;
-    put16(ip + 2, (unsigned)(20 + icmp_len));   /* total length */
-    put16(ip + 4, 0x1234);                      /* identification */
-    put16(ip + 6, 0);                           /* no fragmentation */
-    ip[8]  = 64;                                /* ttl */
-    ip[9]  = 1;                                 /* protocol: ICMP */
-    put16(ip + 10, 0);                          /* checksum, filled below */
-    umemcpy(ip + 12, me_ip, 4);
-    umemcpy(ip + 16, gw_ip, 4);
-    put16(ip + 10, checksum(ip, 20));           /* header only, by definition */
-
-    uint8 *ic = ip + 20;
-    ic[0] = 8;                                  /* echo request */
-    ic[1] = 0;
-    put16(ic + 2, 0);                           /* checksum, filled below */
-    put16(ic + 4, 0xabcd);                      /* identifier */
-    put16(ic + 6, seq);
-    for (int i = 0; i < 8; i++)
-        ic[8 + i] = (uint8)('a' + i);
-    put16(ic + 2, checksum(ic, icmp_len));      /* covers header and payload */
-
-    return o + 20 + icmp_len;
 }
 
 void net_server(void)
@@ -386,54 +313,14 @@ void net_server(void)
                       VIRTIO_S_FEATURES_OK | VIRTIO_S_DRIVER_OK);
     say("  driver ok; queues live\n");
 
-    char frame[64];
-    int len = build_arp(frame);
-    if (transmit(frame, len) < 0) {
-        say("  transmit timed out\n");
-        for (;;) _ecall1(SYS_YIELD, 0);
-    }
-    say_num("  sent an ARP request for 10.0.2.2, ", (unsigned long)len,
-            " bytes\n");
+    net_start();
 
-    /* From here on the driver is interrupt-driven: it blocks in receive(),
-       which blocks in sys_recv(), which the kernel wakes when the card fires.
-       No polling anywhere. */
-    int have_gw = 0, pinged = 0, replies = 0;
-    while (replies == 0) {
+    /* The driver's whole job from here: take frames off the card and pass
+       them up. It never looks inside one. */
+    for (;;) {
         int flen; uint16 id;
         uint8 *f = (uint8 *)receive(&flen, &id);
-        unsigned etype = ((unsigned)f[12] << 8) | f[13];
-
-        if (etype == 0x0806 && f[21] == 2 && !have_gw) {     /* ARP reply */
-            umemcpy(gw_mac, f + 22, 6);
-            have_gw = 1;
-            say("  arp: 10.0.2.2 is at ");
-            for (int i = 0; i < 6; i++) { if (i) say(":"); say_hex2(gw_mac[i]); }
-            say("\n");
-        } else if (etype == 0x0800 && f[23] == 1) {          /* IPv4 + ICMP */
-            uint8 *ic = f + 14 + 20;
-            if (ic[0] == 0) {                                /* echo reply */
-                unsigned seq = ((unsigned)ic[6] << 8) | ic[7];
-                say_num("  ping reply from 10.0.2.2, seq ",
-                        (unsigned long)seq, ", ");
-                say_num("", (unsigned long)flen, " bytes\n");
-                replies++;
-            }
-        }
-
+        net_input(f, flen);
         rx_recycle(id);
-
-        if (have_gw && !pinged) {
-            uint8 ping[64];
-            int plen = build_ping(ping, 1);
-            if (transmit((const char *)ping, plen) == 0) {
-                say_num("  sent an ICMP echo request, ", (unsigned long)plen,
-                        " bytes\n");
-                pinged = 1;
-            }
-        }
     }
-
-    for (;;)
-        _ecall1(SYS_YIELD, 0);
 }
