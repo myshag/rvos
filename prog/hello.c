@@ -24,10 +24,19 @@ static void hputs(const char *s)
 }
 
 /* Placed first by the link script; the loader jumps here via e_entry. */
-__attribute__((section(".text.start"))) void _start(void)
+__attribute__((section(".text.start"))) void _start(int argc, char **argv)
 {
-    hputs("\n  [hello] loaded from /HELLO.ELF into a fresh address space\n");
-    hputs("  [hello] nothing here was linked into the kernel\n");
+    hputs("\n  [hello] loaded from a file into a fresh address space\n");
+
+    /* argc/argv arrive in a0/a1, exactly where the calling convention puts
+       the first two parameters — the loader planted the block in our stack
+       before we ever ran. */
+    hputs("  [hello] argv:");
+    for (int i = 0; i < argc; i++) {
+        hputs(" ");
+        hputs(argv[i]);
+    }
+    hputs("\n");
 
     /* And it is a first-class citizen: the namespace and the servers work
        for it exactly as for anything else. */
@@ -51,6 +60,5 @@ __attribute__((section(".text.start"))) void _start(void)
     }
 
     hputs("  [hello] done\n");
-    for (;;)
-        _ecall1(SYS_YIELD, 0);
+    sys_exit();                 /* hand our pages back */
 }

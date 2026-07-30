@@ -67,6 +67,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/ulib.c`       | the user side's own libc (kernel's is unreachable) |
 | `src/user.c`       | user-mode demo programs |
 | `src/loader.c`     | **ELF loader** — user mode; the kernel never parses ELF |
+| `src/sh.c`         | an interactive shell — reads a line, runs what you typed |
 | `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
 | `src/kmain.c`      | boot, initial namespace, the demo shell |
 
@@ -193,8 +194,15 @@ Needs `gcc-riscv64-unknown-elf`, `qemu-system-misc`, `mtools`, `dosfstools`.
 
 ```bash
 make            # build kernel.elf
-make disk       # build the FAT16 image (build/fat16.img)
+make disk       # build the FAT16 image, including /HELLO.ELF
 make rundisk    # run headless with the disk mapped into RAM
+```
+
+The boot demo runs first; when it settles you get a prompt and can type:
+
+```
+rvos$ /HELLO.ELF one two
+rvos$ mem
 ```
 
 Exit QEMU with `Ctrl-A` then `X`.
@@ -285,6 +293,7 @@ $ read the fs server's private data region
 11. the servers themselves move to user mode; the kernel keeps only
     scheduling, IPC and page tables
 12. an ELF loader in user space, and a program loaded from the filesystem
+13. reclaiming a dead task's memory, argv, and a shell that runs what you type
 
 ## Loading a program
 
@@ -325,9 +334,43 @@ $ exec /HELLO.ELF
 The loaded program is a first-class citizen: the namespace and the servers
 work for it exactly as for anything else.
 
-The three syscalls are deliberately unguarded — any task may build another.
-That is the one place this system is obviously not production-shaped; a real
-design puts a capability in front of exactly these.
+`argv` is planted before the program runs: the loader lays out the pointer
+array and strings in a buffer, and `SYS_VMLOAD` copies it into the stack the
+kernel already mapped — the same call that loads a segment, aimed at memory
+that is mapped already, so it only copies. `SYS_START` then sets `sp`, `a0`
+and `a1`, which is where the calling convention expects `argc` and `argv`.
+
+The three task-building syscalls are deliberately unguarded — any task may
+build another. That is the one place this system is obviously not
+production-shaped; a real design puts a capability in front of exactly these.
+
+## Reclaiming memory
+
+A task that faults, or calls `sys_exit`, gives its pages back. The subtlety is
+telling apart what it owns from what it borrows: the kernel image, the UART,
+the CLINT and the disk are mapped *identically* (`pa == va`) and shared with
+every other address space, while a stack page or a loaded segment sits at a
+virtual address unrelated to its physical one. So `pa != va` is exactly the
+test for "this page is mine"; page tables are always private and always go.
+The task slot is released too, and the next `SYS_NEWTASK` reuses it.
+
+```
+rvos$ mem
+free pages: 12131
+rvos$ /HELLO.ELF a
+  [hello] argv: /HELLO.ELF a
+rvos$ /HELLO.ELF b
+  [hello] argv: /HELLO.ELF b
+rvos$ mem
+free pages: 12131
+```
+
+## The shell
+
+`sh.c` is a user program. It reads characters from the console server, splits
+the line, and calls `spawn()` — the same function the boot-time loader uses,
+living in the shared user text. Its scratch buffer is its own, because user
+programs share their code but not their writable state.
 
 ## Next steps
 

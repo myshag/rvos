@@ -72,6 +72,6 @@ void strap_handler(void)
     kprintf("       -> the MMU refused it; retiring the task\n\n");
 
     if (current)
-        current->state = T_UNUSED;
+        task_retire(current);       /* its pages go back to the allocator */
     schedule();
 }

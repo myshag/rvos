@@ -31,10 +31,28 @@ struct elf64_phdr {
     uint64 p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
 };
 
-/* Argument block for SYS_VMLOAD: one PT_LOAD segment, described exactly as
-   the program header describes it. The kernel allocates and maps memsz bytes
-   at va, copies filesz of them from the caller, and leaves the remainder
-   zero — which is where .bss comes from. */
+/* Where a new program's argument block is planted: near the top of its
+   stack, below the initial sp. The loader writes it with SYS_VMLOAD (the
+   stack pages are already mapped, so that call just copies) and hands the
+   addresses to SYS_START. */
+#define ARG_BASE  (USTACK_TOP - 1024)
+#define ARG_MAX   1024
+
+/* What a task needs to begin: where to jump, what stack to use, and the two
+   argument registers. argc/argv land in a0/a1, which is where the RISC-V
+   calling convention puts the first two parameters of main(). */
+struct startinfo {
+    uint64 entry;
+    uint64 sp;
+    uint64 a0;      /* argc */
+    uint64 a1;      /* argv */
+};
+
+/* One PT_LOAD segment, described exactly as the program header describes it.
+   The kernel allocates and maps memsz bytes at va, copies filesz of them from
+   the caller, and leaves the remainder zero — which is where .bss comes from.
+   Pointed at an already-mapped range it simply copies, which is how the
+   argument block gets into a new task's stack. */
 struct vmload {
     uint64 va;
     uint64 src;        /* address in the *caller's* space */

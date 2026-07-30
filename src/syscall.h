@@ -43,7 +43,8 @@ enum {
        systems put a capability in front of exactly these. */
     SYS_NEWTASK = 11,  /* a0 = name -> task id, or -1 */
     SYS_VMLOAD  = 12,  /* a0 = task id, a1 = struct vmload* -> 0 / -1 */
-    SYS_START   = 13,  /* a0 = task id, a1 = entry va -> 0 / -1 */
+    SYS_START   = 13,  /* a0 = task id, a1 = struct startinfo* -> 0 / -1 */
+    SYS_EXIT    = 14,  /* never returns; frees this task's memory */
 };
 
 struct taskinfo {
@@ -121,9 +122,15 @@ static inline int sys_vmload(int tid, const void *seg)
 {
     return (int)_ecall2(SYS_VMLOAD, tid, (long)seg);
 }
-static inline int sys_start(int tid, unsigned long entry)
+static inline int sys_start(int tid, const void *startinfo)
 {
-    return (int)_ecall2(SYS_START, tid, (long)entry);
+    return (int)_ecall2(SYS_START, tid, (long)startinfo);
+}
+
+static inline void sys_exit(void)
+{
+    _ecall1(SYS_EXIT, 0);
+    for (;;) ;                 /* not reached */
 }
 
 static inline int sys_route(const char *path)

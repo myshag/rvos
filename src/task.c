@@ -13,13 +13,15 @@
 
 struct task tasks[NTASK];
 struct task *current;
-static int ntasks;
+static struct task *alloc_slot(void);
 
 extern void _ret_to_task(void) __attribute__((noreturn));
 
 struct task *task_create(const char *name, void (*entry)(void))
 {
-    struct task *t = &tasks[ntasks];
+    struct task *t = alloc_slot();
+    if (!t)
+        return 0;
     for (int i = 0; i < 32; i++)
         t->ctx.x[i] = 0;
 
@@ -39,10 +41,9 @@ struct task *task_create(const char *name, void (*entry)(void))
     /* sret returns to S-mode (SPP=1) with interrupts enabled (SPIE -> SIE) */
     t->ctx.status = SSTATUS_SPP | SSTATUS_SPIE;
     t->state = T_RUNNABLE;
-    t->id    = ntasks;
+    t->id    = (int)(t - tasks);
     t->name  = name;
     t->ns    = vfs_root_ns();   /* inherit the shared view until it clones */
-    ntasks++;
     return t;
 }
 
@@ -51,11 +52,40 @@ struct task *task_create(const char *name, void (*entry)(void))
    the trap path, a private stack, and otherwise empty. It stays T_UNUSED —
    not a candidate for the scheduler — until SYS_START gives it an entry
    point. That is what lets a loader build it incrementally. */
+/* A free slot is one that was never used or has been reclaimed: state UNUSED
+   with no address space. A task under construction already has a page table,
+   so it will not be handed out twice. */
+static struct task *alloc_slot(void)
+{
+    for (int i = 0; i < NTASK; i++)
+        if (tasks[i].state == T_UNUSED && !tasks[i].pt)
+            return &tasks[i];
+    return 0;
+}
+
+/* Release a task: its private pages and page tables go back to the allocator
+   and the slot becomes available again. Anything still queued to send to it
+   is dropped — a sender blocked on a dead receiver would wait forever. */
+void task_retire(struct task *t)
+{
+    for (struct task *s = t->wait_sender; s; ) {
+        struct task *nxt = s->send_next;
+        s->ctx.x[10] = (uint64)-1;      /* its send() fails rather than hangs */
+        s->state     = T_RUNNABLE;
+        s->send_next = 0;
+        s = nxt;
+    }
+    t->wait_sender  = 0;
+    t->waiting_recv = 0;
+    vm_free_task(t);                    /* also clears t->pt */
+    t->state = T_UNUSED;
+}
+
 struct task *task_new_empty(const char *name)
 {
-    if (ntasks >= NTASK)
+    struct task *t = alloc_slot();
+    if (!t)
         return 0;
-    struct task *t = &tasks[ntasks];
 
     for (int i = 0; i < 32; i++)
         t->ctx.x[i] = 0;
@@ -68,7 +98,7 @@ struct task *task_new_empty(const char *name)
                   (uint64)p, PGSIZE, PTE_R | PTE_W | PTE_U, 0);
     }
     t->ctx.satp = MAKE_SATP(t->pt);
-    t->id       = ntasks;
+    t->id       = (int)(t - tasks);
     int k = 0;
     for (; k < 15 && name[k]; k++)
         t->namebuf[k] = name[k];
@@ -76,7 +106,6 @@ struct task *task_new_empty(const char *name)
     t->name     = t->namebuf;      /* the caller's buffer will not outlive us */
     t->ns       = vfs_root_ns();
     t->state    = T_UNUSED;            /* not runnable until started */
-    ntasks++;
     return t;
 }
 
@@ -225,6 +254,10 @@ void syscall_dispatch(uint64 num)
         current->ctx.x[10] = (uint64)(long)vfs_ns_clone();
         break;
     /* ---- building another task, one segment at a time ---------------- */
+    case SYS_EXIT:
+        task_retire(current);
+        schedule();
+        break;
     case SYS_NEWTASK: {
         char nm[16];
         copy_string_in(current->ctx.x[10], nm, sizeof(nm));
@@ -253,9 +286,14 @@ void syscall_dispatch(uint64 num)
             current->ctx.x[10] = (uint64)-1;
             break;
         }
+        struct startinfo si;
+        vm_copy_across(kernel_pagetable, (uint64)&si,
+                       current->pt, current->ctx.x[11], sizeof(si));
         struct task *t = &tasks[tid];
-        t->ctx.epc    = current->ctx.x[11];
-        t->ctx.x[2]   = USTACK_TOP;
+        t->ctx.epc    = si.entry;
+        t->ctx.x[2]   = si.sp ? si.sp : USTACK_TOP;   /* sp */
+        t->ctx.x[10]  = si.a0;                        /* argc */
+        t->ctx.x[11]  = si.a1;                        /* argv */
         t->ctx.status = SSTATUS_SPIE;      /* SPP = 0: it starts in user mode */
         t->state      = T_RUNNABLE;
         current->ctx.x[10] = 0;

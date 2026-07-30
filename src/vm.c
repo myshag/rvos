@@ -147,6 +147,41 @@ int vm_load_segment(struct task *t, pagetable_t src, const struct vmload *seg)
     return 0;
 }
 
+/* Tear an address space down. The subtlety is telling apart the pages a task
+   owns from the ones it merely borrows: the kernel image, the UART, the CLINT
+   and the disk are all mapped *identically* (pa == va) and shared with every
+   other address space, while a stack page or a loaded segment lives at a
+   virtual address that has nothing to do with its physical one. So pa != va
+   is exactly the test for "this page is mine". The page tables themselves are
+   always private and always go. */
+static void free_walk(pagetable_t pt, int level, uint64 vabase)
+{
+    for (int i = 0; i < 512; i++) {
+        pte_t pte = pt[i];
+        if (!(pte & PTE_V))
+            continue;
+        uint64 va = vabase | ((uint64)i << (PGSHIFT + 9 * level));
+        uint64 pa = PTE2PA(pte);
+
+        if (PTE_IS_LEAF(pte)) {
+            if (pa != va)
+                pmm_free((void *)pa);
+        } else {
+            free_walk((pagetable_t)pa, level - 1, va);
+            pmm_free((void *)pa);
+        }
+    }
+}
+
+void vm_free_task(struct task *t)
+{
+    if (!t->pt)
+        return;
+    free_walk(t->pt, 2, 0);
+    pmm_free(t->pt);
+    t->pt = 0;
+}
+
 /* ---- rendering a walk as text (for /proc/pagetable) ------------------ */
 
 static int put(char *o, int n, const char *s)

@@ -15,7 +15,7 @@ enum task_state { T_UNUSED = 0, T_RUNNABLE, T_RUNNING, T_BLOCKED };
 
 struct namespace;   /* opaque here; defined in vfs.c */
 
-#define NTASK   14
+#define NTASK   16
 
 /* USTACK_TOP / USTACK_PAGES live in riscv.h: every task's stack sits at the
    same virtual address but on different physical pages — which is the point:
@@ -49,6 +49,7 @@ struct task *task_create(const char *name, void (*entry)(void));
 struct task *task_create_user(const char *name, void (*entry)(void),
                               void *data_start, void *data_end);
 struct task *task_new_empty(const char *name);   /* for the ELF loader */
+void task_retire(struct task *t);   /* free its memory, release the slot */
 void schedule(void);
 void scheduler_start(void) __attribute__((noreturn));
 void yield(void);                    /* voluntary reschedule */

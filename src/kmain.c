@@ -110,6 +110,7 @@ static void shell(void)
     sys_send(USER_TASK_ID,    &m, (int)sizeof(m));
     sys_send(PEEKER_TASK_ID,  &m, (int)sizeof(m));
     sys_send(LOADER_TASK_ID,  &m, (int)sizeof(m));
+    sys_send(SH_TASK_ID,      &m, (int)sizeof(m));
 
     for (;;)
         yield();
@@ -118,6 +119,7 @@ static void shell(void)
 void user_main(void);        /* user.c — runs with the U bit set */
 void peeker_main(void);      /* user.c — probes another server's memory */
 void loader_main(void);      /* loader.c — reads an ELF and spawns it */
+void sh_main(void);          /* sh.c — reads a command line and runs it */
 
 /* Always runnable, so the scheduler never runs out of candidates — without
    it, retiring a faulting task while everyone else is blocked left nothing to
@@ -153,6 +155,7 @@ void smain(void)
     extern char __uproc_start[], __uproc_end[];
     extern char __umisc_start[], __umisc_end[];
     extern char __uload_start[], __uload_end[];
+    extern char __ush_start[], __ush_end[];
 
     /* The system services are user programs now. */
     struct task *fs =
@@ -172,7 +175,8 @@ void smain(void)
                      __umisc_start, __umisc_end);     /* 8 */
     task_create_user("loader", loader_main,
                      __uload_start, __uload_end);     /* 9 */
-    task_create("idle",    idle);                     /* 10 */
+    task_create_user("sh", sh_main, __ush_start, __ush_end);  /* 10 */
+    task_create("idle",    idle);                     /* 11 */
 
     /* Devices are handed to their driver and to nobody else — with the U bit,
        so the driver reaches them from user mode without the kernel on the

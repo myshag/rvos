@@ -31,5 +31,9 @@ struct vmload;
 struct task;
 int    vm_load_segment(struct task *t, pagetable_t src, const struct vmload *seg);
 
+/* Release everything an address space owns privately, page tables included;
+   shared identity mappings are left alone. */
+void   vm_free_task(struct task *t);
+
 int    vm_dump_walk(uint64 va, char *out, int cap);
 int    vm_dump_walk_in(pagetable_t pt, uint64 va, char *out, int cap);
