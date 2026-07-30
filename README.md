@@ -12,24 +12,32 @@ Everything runs **headless** — serial console only, no graphics.
 
 The kernel provides exactly three primitives: `send`, `recv`, `yield`.
 
-Everything else is a *task* that answers the same request struct, and paths are
-routed to tasks by a mount table that can change while the system runs. So a
-new module — a pipe, a socket, a network stack — is added without touching the
-kernel at all. The `/proc` module in the demo is bound into the namespace after
-the system is already up, and the kernel never learns it exists.
+Everything else is a *task* answering the same request struct, and paths are
+routed to tasks by a mount table. So a new module — a pipe, a socket, a
+network stack — is added without touching the kernel at all: write a task,
+bind it into the tree. The kernel never learns it exists.
+
+The mount table is per task, so a path is not a global fact. Two programs can
+run the identical call on the identical path and reach different modules,
+which is how the sandbox in the demo is silenced without knowing it.
 
 ```
-        shell
-          |  open/read/write/ioctl/close   (vfs.h — a library, not syscalls)
-          v
-      namespace (vfs.c)   "/" -> fs,  "/dev/" -> console,  "/proc/" -> proc
-          |
-          |  send/recv                     (the only kernel interface)
-          v
-   +------------+   +---------------+   +--------------+
-   |  fs task   |   | console task  |   |  proc task   |
-   |  FAT16     |   | UART          |   | task table   |
-   +------------+   +---------------+   +--------------+
+     shell (task 4)                      sandbox (task 5)
+        |                                   |
+        |  open/read/write/ioctl/close  (vfs.h — a library, not syscalls)
+        v                                   v
+   its namespace                       its own namespace
+   "/"      -> fs                      "/"            -> fs
+   "/dev/"  -> console                 "/dev/"        -> console
+   "/proc/" -> proc                    "/proc/"       -> proc
+        |                              "/dev/console" -> null   <— rebound
+        |                                   |
+        |          send/recv  (the only kernel interface)
+        v                                   v
+   +---------+  +-------------+  +------------+  +----------+
+   | fs      |  | console     |  | proc       |  | null     |
+   | FAT16   |  | UART        |  | task table |  | discards |
+   +---------+  +-------------+  +------------+  +----------+
 ```
 
 ## Layout
@@ -47,6 +55,7 @@ the system is already up, and the kernel never learns it exists.
 | `src/srv_fs.c`     | filesystem module (owns FAT16 entirely) |
 | `src/srv_console.c`| console module (owns the UART) |
 | `src/srv_proc.c`   | kernel state as files (`/proc/tasks`, `/proc/mounts`) |
+| `src/srv_null.c`   | the bit bucket, for binding over other paths |
 | `src/fat16.c`      | read-only FAT16 over a RAM-backed block device |
 | `src/uart.c`       | NS16550 driver + tiny `kprintf` |
 | `src/kmain.c`      | boot, initial namespace, the demo shell |
@@ -62,9 +71,12 @@ the system is already up, and the kernel never learns it exists.
   there so a CPU-bound task can't wedge the system.
 - **IPC** carries one machine word; larger payloads pass a pointer to a shared
   request struct (safe only because there is no address-space isolation yet).
-- **Namespace** is data, not policy: `vfs_bind(prefix, task)` at runtime,
-  longest-prefix wins. Plan 9 gives each process its own mutable namespace;
-  here there is one global table — per-task namespaces are the next step.
+- **Namespace** is data, not policy, and it belongs to a *task*:
+  `vfs_bind(prefix, task)` works on a running system, `vfs_ns_clone()` gives
+  the caller a private copy to diverge (Plan 9's `rfork(RFNAMEG)`), and
+  resolution is longest-prefix-wins. Because the namespace is the caller's,
+  a server asked to report one has to be told whose — hence
+  `vfs_dump_mounts_of(task_id, …)` behind `/proc/mounts`.
 - **Filesystem** image is loaded into guest RAM at `0x84000000` via
   `-device loader`; the driver treats that region as a flat block device.
 
@@ -82,28 +94,51 @@ Exit QEMU with `Ctrl-A` then `X`.
 
 ## What you'll see
 
+Two tasks run the *same* call against the *same* path and reach different
+modules, because one of them rebound that path in its own namespace:
+
 ```
-$ cat /                          # a directory read()s like anything else
-HELLO.TXT  (54 bytes)
-README.TXT  (105 bytes)
-DOCS/
+--- shell (task 4) ------------------------------------
+$ cat /proc/mounts          -- shell's view
+/ -> task 0
+/dev/ -> task 1
+/proc/ -> task 2
 
-$ ioctl(/README.TXT, GETSIZE) -> 105 bytes (file not read)
-$ write(/dev/console) -> these bytes came back via IPC
+$ write(/dev/console, "...")
+  visible: routed to the console module
 
-$ cat /proc/tasks        (before binding anything there)
-  -> fails: nothing serves that subtree yet
-$ bind /proc/ -> task 2      (system already running)
-$ cat /proc/tasks
+--- sandbox (task 5) ----------------------------------
+$ vfs_ns_clone()            -- take a private namespace
+$ bind /dev/console -> null (task 3)
+
+$ cat /proc/mounts          -- sandbox's own view
+/ -> task 0
+/dev/ -> task 1
+/proc/ -> task 2
+/dev/console -> task 3
+
+$ write(/dev/console, "...")  -- identical call to the shell's
+  (nothing printed: the path now reaches null)
+
+--- back in the shell ----------------------------------
+  still visible: the shell's namespace was never touched
+```
+
+Note that `/proc/mounts` is one path returning different text to different
+readers — the namespace it reports is the caller's, not a global one.
+`/proc/tasks` is likewise a live snapshot of the scheduler:
+
+```
 0  blocked  fs
 1  blocked  console
 2  running  proc  (me)
-3  blocked  shell
+3  blocked  null
+4  blocked  shell
+5  runnable sandbox
 ```
 
-That last listing is a real snapshot of the scheduler: the proc server is
-running because it is serving the request, and the shell is blocked because
-it is waiting for the reply — rendezvous IPC, visible as a file.
+The proc server is running because it is serving the request; the shell is
+blocked because it is waiting for the reply — rendezvous IPC, read as a file.
 
 ## Development stages (git history)
 
@@ -113,10 +148,10 @@ it is waiting for the reply — rendezvous IPC, visible as a file.
 4. FAT16 filesystem server + shell
 5. one interface for every module: `open/read/write/ioctl/close`
 6. dynamic namespace (`bind`) + `/proc` module
+7. per-task namespaces (`vfs_ns_clone`) + `/dev/null` module
 
 ## Next steps
 
-- per-task namespaces, so two tasks can see different things at one path
 - Sv39 paging for real isolation (and message payloads that aren't raw pointers)
 - a `virtio-blk` driver, replacing the RAM image with a real disk
 - FAT16 writes; subdirectory traversal

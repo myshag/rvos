@@ -12,6 +12,8 @@ struct context {
 
 enum task_state { T_UNUSED = 0, T_RUNNABLE, T_RUNNING, T_BLOCKED };
 
+struct namespace;   /* opaque here; defined in vfs.c */
+
 #define NTASK   8
 #define TSTACK  8192
 
@@ -21,6 +23,7 @@ struct task {
     enum task_state state;
     int    id;
     const char *name;
+    struct namespace *ns;       /* what paths mean to this task (Plan 9) */
     /* IPC (stage 3): synchronous rendezvous message passing */
     uint64  ipc_msg;            /* message a blocked sender is delivering */
     uint64 *recv_ptr;           /* where a blocked receiver wants its message */

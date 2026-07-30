@@ -5,6 +5,7 @@
 #include "task.h"
 #include "uart.h"
 #include "syscall.h"
+#include "vfs.h"
 
 struct task tasks[NTASK];
 struct task *current;
@@ -23,6 +24,7 @@ struct task *task_create(const char *name, void (*entry)(void))
     t->state = T_RUNNABLE;
     t->id    = ntasks;
     t->name  = name;
+    t->ns    = vfs_root_ns();   /* inherit the shared view until it clones */
     ntasks++;
     return t;
 }

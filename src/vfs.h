@@ -38,16 +38,25 @@ struct vfs_req {
 
 /* ---- namespace (vfs.c) ----------------------------------------------
    Paths are resolved through a mount table, not hardcoded prefixes: bind a
-   prefix to a server task at runtime and that subtree is served by it, with
-   longest-prefix wins. This is the Plan 9 idea that a namespace is data, not
-   policy baked into the kernel — /proc below is bound while the system is
-   already running, and nothing in the kernel changes. */
+   prefix to a server task and that subtree is served by it, longest-prefix
+   wins. The table is data, not policy — it can be rewritten on a running
+   system — and it belongs to a *task*, not to the system: vfs_ns_clone()
+   hands the caller a private copy it can diverge (Plan 9's rfork(RFNAMEG)),
+   so the same path in two tasks may reach two different modules.
+
+   Since the namespace is the caller's, a server asked to report one must be
+   told whose — there is no ambient "the" namespace to inspect. */
 #define VFS_PREFIX_MAX 16
 #define VFS_NMOUNT     8
+#define VFS_NNS        4        /* root + private namespaces */
 
-int vfs_bind(const char *prefix, int server_task);  /* 0 ok, -1 table full */
+struct namespace;
+
+int vfs_bind(const char *prefix, int server_task);  /* in caller's ns */
+int vfs_ns_clone(void);                             /* private copy of it */
 int vfs_route(const char *path);                    /* server id, -1 unbound */
-int vfs_dump_mounts(char *out, int cap);            /* render table as text */
+int vfs_dump_mounts_of(int task_id, char *out, int cap);
+struct namespace *vfs_root_ns(void);
 
 /* ---- client side ----------------------------------------------------
    A client fd packs which server owns it together with that server's local

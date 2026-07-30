@@ -71,7 +71,10 @@ static int proc_alloc(void)
     return -1;
 }
 
-static void proc_do_open(struct vfs_req *r)
+/* `caller` matters: a namespace belongs to a task, so "the mount table" is
+   not a thing this server can look up on its own — it must render the
+   caller's. Two tasks reading /proc/mounts legitimately get different text. */
+static void proc_do_open(struct vfs_req *r, int caller)
 {
     int fd = proc_alloc();
     if (fd < 0) { r->result = -1; return; }
@@ -81,7 +84,7 @@ static void proc_do_open(struct vfs_req *r)
     if (str_has_prefix(r->path, "/proc/tasks"))
         n = format_tasks(f->data, PROC_BUFSZ);
     else if (str_has_prefix(r->path, "/proc/mounts"))
-        n = vfs_dump_mounts(f->data, PROC_BUFSZ);
+        n = vfs_dump_mounts_of(caller, f->data, PROC_BUFSZ);
     else
         n = -1;
 
@@ -102,7 +105,7 @@ void proc_server(void)
         struct vfs_req *r = (struct vfs_req *)m;
         switch (r->op) {
         case VFS_OPEN:
-            proc_do_open(r);
+            proc_do_open(r, from);
             break;
         case VFS_READ: {
             if (r->fd < 0 || r->fd >= PROC_MAXFD || !p_tab[r->fd].used) {
