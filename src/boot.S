@@ -17,7 +17,7 @@ _start:
     j       1b
 2:
     la      sp, __stack_top       # set boot stack
-    call    kmain                 # never returns
+    call    mstart                # M-mode setup, then mret into S-mode
 
 park:
     wfi

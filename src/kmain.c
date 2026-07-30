@@ -1,18 +1,24 @@
-/* kmain.c — Stage 7: per-task namespaces.
-   Four modules answer the same open/read/write/ioctl/close interface, and
-   what a path *means* is a property of the task doing the asking. The shell
-   and the sandbox below run identical code against "/dev/console" and get
-   different modules, because the sandbox rebound that path inside its own
-   private namespace. Nothing was patched, nothing was configured in either
-   program — only the namespace changed. */
+/* kmain.c — Stage 8: Sv39 paging.
+
+   Entry is now smain(), reached by mret out of mstart(): everything below
+   this point runs in supervisor mode with translation on, because M-mode
+   ignores satp and paging simply does not exist there.
+
+   The demo shows three things the earlier stages could not: a live page-table
+   walk (/proc/pagetable), a superpage versus a 4 KiB mapping, and the MMU
+   actually refusing a write to a read-only page. */
 #include "uart.h"
 #include "task.h"
 #include "syscall.h"
 #include "vfs.h"
 #include "servers.h"
+#include "pmm.h"
+#include "vm.h"
 #include "util.h"
 
-/* Both tasks use this; it goes through the interface and nothing else. */
+/* An address nothing else uses, mapped read-only for the protection demo. */
+#define RO_DEMO_VA 0x40000000UL
+
 static void cat(const char *path, const char *label)
 {
     int fd = vfs_open(path);
@@ -20,7 +26,7 @@ static void cat(const char *path, const char *label)
         kprintf("  cat %s: no such file\n", path);
         return;
     }
-    char buf[512];
+    char buf[1024];
     int n = vfs_read(fd, buf, sizeof(buf) - 1);
     buf[n > 0 ? n : 0] = 0;
     kprintf("%s\n%s", label, buf);
@@ -38,82 +44,104 @@ static void say(const char *what)
     vfs_close(fd);
 }
 
-/* ---- the sandboxed task: same code, private namespace ---------------- */
+/* ---- namespace demo: same code, private namespace -------------------- */
 static void sandbox(void)
 {
     uint64 m;
-    sys_recv(&m);                       /* wait for the shell's go-ahead */
+    sys_recv(&m);
 
-    kprintf("\n--- sandbox (task %d) ----------------------------------\n",
+    kprintf("\n--- sandbox (task %d): its own namespace ---------------\n",
             SANDBOX_TASK_ID);
-    kprintf("$ vfs_ns_clone()            -- take a private namespace\n");
     vfs_ns_clone();
-
-    kprintf("$ bind /dev/console -> null (task %d)\n\n", NULL_TASK_ID);
     vfs_bind("/dev/console", NULL_TASK_ID);
-
-    cat("/proc/mounts", "$ cat /proc/mounts          -- sandbox's own view");
-
-    kprintf("\n$ write(/dev/console, \"...\")  -- identical call to the shell's\n");
+    kprintf("$ vfs_ns_clone(); bind /dev/console -> null\n");
+    kprintf("$ write(/dev/console, ...)   -- same call as the shell's\n");
     say("  THIS LINE SHOULD NEVER APPEAR\n");
-    kprintf("  (nothing printed: the path now reaches null)\n");
+    kprintf("  (nothing printed: that path now reaches null)\n");
 
-    sys_send(SHELL_TASK_ID, 0);         /* hand control back */
+    sys_send(SHELL_TASK_ID, 0);
     for (;;)
         yield();
 }
 
-/* ---- the shell ------------------------------------------------------- */
+/* ---- protection demo: the MMU says no -------------------------------- */
+static void faulter(void)
+{
+    uint64 m;
+    sys_recv(&m);
+
+    kprintf("\n--- faulter (task %d): page permissions ----------------\n",
+            FAULTER_TASK_ID);
+    volatile char *p = (volatile char *)RO_DEMO_VA;
+
+    kprintf("$ read  *(char*)0x%lx  -- page is mapped r--\n", RO_DEMO_VA);
+    char c = *p;
+    kprintf("  read returned 0x%x, fine\n", (int)c);
+
+    kprintf("$ write *(char*)0x%lx  -- same page, no W bit\n", RO_DEMO_VA);
+    *p = 0x42;                       /* store page fault: task is retired */
+
+    kprintf("  UNREACHABLE: the store should have faulted\n");
+    for (;;)
+        yield();
+}
+
+/* ---- shell ------------------------------------------------------------ */
 static void shell(void)
 {
-    kprintf("\n--- shell (task %d) ------------------------------------\n",
+    kprintf("\n--- shell (task %d): the filesystem --------------------\n",
             SHELL_TASK_ID);
-    cat("/", "$ cat /                     -- a directory read()s like a file");
-    cat("/proc/mounts", "\n$ cat /proc/mounts          -- shell's view");
+    cat("/", "$ cat /");
+    say("  write(/dev/console) still routed to the console module\n");
 
-    kprintf("\n$ write(/dev/console, \"...\")\n");
-    say("  visible: routed to the console module\n");
-
-    sys_send(SANDBOX_TASK_ID, 0);       /* let the sandbox run its half */
+    sys_send(SANDBOX_TASK_ID, 0);
     uint64 m;
-    sys_recv(&m);                       /* ...and wait for it to finish */
+    sys_recv(&m);
 
-    kprintf("\n--- back in the shell ----------------------------------\n");
-    kprintf("$ write(/dev/console, \"...\")  -- unchanged by the sandbox\n");
-    say("  still visible: the shell's namespace was never touched\n");
+    kprintf("\n--- shell: paging -------------------------------------\n");
+    cat("/proc/pagetable", "$ cat /proc/pagetable");
 
-    cat("/proc/tasks", "\n$ cat /proc/tasks");
+    sys_send(FAULTER_TASK_ID, 0);    /* it never replies: it gets retired */
 
-    kprintf("\n[shell] one interface, four modules, and a path that means\n"
-            "        different things to different tasks.\n");
     for (;;)
         yield();
 }
 
-void kmain(void)
+/* ---- supervisor-mode entry ------------------------------------------- */
+void smain(void)
 {
     uart_init();
     kprintf("\n=============================================\n");
     kprintf("  rvos — educational RISC-V microkernel\n");
-    kprintf("  stage 7: per-task namespaces\n");
+    kprintf("  stage 8: Sv39 paging, running in S-mode\n");
     kprintf("=============================================\n");
+
+    pmm_init();
+    kprintf("[boot] %d physical pages free\n", pmm_free_count());
+
+    vm_init();                       /* translation is live after this line */
+    kprintf("[boot] Sv39 on, satp=0x%lx\n", r_satp());
+
+    /* One read-only page, for the faulter to bounce off. */
+    void *ro = pmm_alloc();
+    vm_map_at(kernel_pagetable, RO_DEMO_VA, (uint64)ro, PGSIZE, PTE_R, 0);
+    sfence_vma();
 
     trap_init();
     timer_init();
 
-    /* Creation order defines the IDs in servers.h. */
     task_create("fs",      fs_server);        /* 0 */
     task_create("console", console_server);   /* 1 */
     task_create("proc",    proc_server);      /* 2 */
     task_create("null",    null_server);      /* 3 */
     task_create("shell",   shell);            /* 4 */
     task_create("sandbox", sandbox);          /* 5 */
+    task_create("faulter", faulter);          /* 6 */
 
-    /* The root namespace, inherited by every task until one clones it. */
     vfs_bind("/",      FS_TASK_ID);
     vfs_bind("/dev/",  CONSOLE_TASK_ID);
     vfs_bind("/proc/", PROC_TASK_ID);
 
-    kprintf("[boot] 4 servers, 2 apps; root namespace: / /dev/ /proc/\n");
+    kprintf("[boot] 4 servers, 3 apps; starting scheduler.\n");
     scheduler_start();
 }

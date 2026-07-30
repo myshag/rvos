@@ -13,9 +13,11 @@
 #include "syscall.h"
 #include "uart.h"
 #include "util.h"
+#include "vm.h"
+#include "pmm.h"
 
 #define PROC_MAXFD 2
-#define PROC_BUFSZ 512
+#define PROC_BUFSZ 1024
 
 struct proc_file {
     int  used;
@@ -63,6 +65,30 @@ static int format_tasks(char *out, int cap)
     return o;
 }
 
+/* Three translations worth seeing: an MMIO page mapped at 4 KiB (the walk
+   runs all three levels), a kernel address covered by a 2 MiB superpage (the
+   walk stops one level early), and the read-only demo page. */
+static int format_pagetable(char *out, int cap)
+{
+    int o = 0;
+    o = append(out, o, "satp mode Sv39, root table 0x");
+    o += xtoa((r_satp() & 0xfffffffffffULL) << 12, out + o);
+    out[o++] = '\n';
+    o = append(out, o, "free pages ");
+    o += utoa((unsigned long)pmm_free_count(), out + o);
+    o = append(out, o, " of ");
+    o += utoa((unsigned long)pmm_total_count(), out + o);
+    out[o++] = '\n';
+    out[o++] = '\n';
+
+    o += vm_dump_walk(UART_BASE_PA, out + o, cap - o);
+    out[o++] = '\n';
+    o += vm_dump_walk(RAM_BASE + 0x1000, out + o, cap - o);
+    out[o++] = '\n';
+    o += vm_dump_walk(0x40000000UL, out + o, cap - o);
+    return o;
+}
+
 static int proc_alloc(void)
 {
     for (int i = 0; i < PROC_MAXFD; i++)
@@ -85,6 +111,8 @@ static void proc_do_open(struct vfs_req *r, int caller)
         n = format_tasks(f->data, PROC_BUFSZ);
     else if (str_has_prefix(r->path, "/proc/mounts"))
         n = vfs_dump_mounts_of(caller, f->data, PROC_BUFSZ);
+    else if (str_has_prefix(r->path, "/proc/pagetable"))
+        n = format_pagetable(f->data, PROC_BUFSZ);
     else
         n = -1;
 

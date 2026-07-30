@@ -22,7 +22,10 @@ ELF     := $(BUILD)/kernel.elf
 # FAT16 RAM-disk image, loaded into guest memory (see fs stage).
 DISK    := $(BUILD)/fat16.img
 DISK_ADDR := 0x84000000
-QFLAGS  := -machine virt -bios none -nographic -kernel $(ELF)
+# sstc is requested explicitly because the S-mode timer depends on it: CLINT's
+# mtimecmp is machine-mode only and the machine timer interrupt is not
+# delegable, so without Sstc an S-mode kernel has no clock of its own.
+QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic -kernel $(ELF)
 
 .PHONY: all run rundisk disk clean
 all: $(ELF)

@@ -1,52 +1,77 @@
-/* trap.c — C side of machine-mode trapping: timer setup + dispatch. */
+/* trap.c — supervisor-mode trap handling: timer, syscalls, page faults.
+
+   The timer comes from Sstc (the stimecmp CSR) rather than the CLINT. That
+   is not a stylistic choice: CLINT's mtimecmp is machine-mode only and the
+   machine timer interrupt cannot be delegated, so an S-mode kernel either
+   uses Sstc or has M-mode forward every tick by hand. mstart() enables it
+   via menvcfg.STCE. */
 #include "riscv.h"
 #include "uart.h"
 #include "task.h"
 
-/* Ticks between preemptions. QEMU CLINT runs at 10 MHz, so ~0.05 s. */
+/* QEMU's time base is 10 MHz, so this preempts roughly every 50 ms. */
 #define TICK 500000UL
 
-extern void _mtrap(void);
+extern void _strap(void);
 
 static void timer_rearm(void)
 {
-    uint64 h = r_mhartid();
-    mmio_w64(CLINT_MTIMECMP(h), mmio_r64(CLINT_MTIME) + TICK);
+    w_stimecmp(r_time() + TICK);
 }
 
 void trap_init(void)
 {
-    w_mtvec((uint64)_mtrap);
+    w_stvec((uint64)_strap);
 }
 
 void timer_init(void)
 {
     timer_rearm();
-    w_mie(r_mie() | MIE_MTIE);          /* enable machine timer interrupt */
+    w_sie(r_sie() | SIE_STIE);
 }
 
-/* Called from trap.S with all state already saved into current->ctx. */
-void mtrap_handler(void)
+static const char *cause_name(uint64 c)
 {
-    uint64 mcause = r_mcause();
+    switch (c) {
+    case EXC_INST_PAGE_FAULT:  return "instruction page fault";
+    case EXC_LOAD_PAGE_FAULT:  return "load page fault";
+    case EXC_STORE_PAGE_FAULT: return "store page fault";
+    case 2:  return "illegal instruction";
+    case 5:  return "load access fault";
+    case 7:  return "store access fault";
+    default: return "exception";
+    }
+}
 
-    if (mcause & MCAUSE_INT) {
-        if ((mcause & 0xff) == IRQ_M_TIMER) {
+/* Called from entry.S with the full context already saved into current->ctx. */
+void strap_handler(void)
+{
+    uint64 scause = r_scause();
+
+    if (scause & CAUSE_INT) {
+        if ((scause & 0xff) == IRQ_S_TIMER) {
             timer_rearm();
             schedule();                 /* preempt: may switch `current` */
         }
         return;
     }
 
-    if (mcause == 11) {                 /* environment call from M-mode */
-        current->ctx.mepc += 4;         /* resume past the ecall */
+    if (scause == EXC_ECALL_S) {
+        current->ctx.epc += 4;          /* resume past the ecall */
         syscall_dispatch(current->ctx.x[17]);   /* a7 = syscall number */
         return;
     }
 
-    /* Synchronous exception — fatal in this teaching kernel. */
-    kprintf("\n[panic] exception mcause=%lx mepc=%lx mtval=%lx task=%s\n",
-            mcause, r_mepc(), r_mtval(), current ? current->name : "?");
-    for (;;)
-        __asm__ volatile("wfi");
+    /* A fault the MMU raised. Rather than panicking the whole kernel we
+       report it and retire the offending task — which is what lets the demo
+       deliberately write to a read-only page and live to describe it. */
+    kprintf("\n[trap] %s in task '%s'\n", cause_name(scause),
+            current ? current->name : "?");
+    kprintf("       scause=%ld  stval=0x%lx  sepc=0x%lx\n",
+            scause, r_stval(), current ? current->ctx.epc : 0);
+    kprintf("       -> the MMU refused it; retiring the task\n\n");
+
+    if (current)
+        current->state = T_UNUSED;
+    schedule();
 }

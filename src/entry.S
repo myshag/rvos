@@ -1,14 +1,18 @@
-# trap.S — machine-mode trap entry. mscratch holds &current->ctx while a task
-# runs. On trap we save all GPRs + mepc/mstatus into that context, switch to a
-# private trap stack, call the C handler (which may pick a new `current`), then
-# restore the (possibly different) current context and mret.
+# entry.S — supervisor-mode trap entry. sscratch holds &current->ctx while a
+# task runs. On a trap we save all GPRs plus sepc/sstatus into that context,
+# switch to a private trap stack, call the C handler (which may pick a new
+# `current`), then restore the — possibly different — context and sret.
 #
-# Context layout mirrors struct context: x[i] at i*8, mepc at 256, mstatus 264.
+# Layout mirrors struct context: x[i] at i*8, epc at 256, status at 264.
+#
+# This vector used mscratch/mepc/mstatus/mret until paging arrived: satp is
+# ignored in M-mode, so enabling Sv39 meant moving the kernel into S-mode and
+# taking the whole trap path with it.
 .section .text
 .align 4
-.global _mtrap
-_mtrap:
-    csrrw   t6, mscratch, t6        # t6 = &cur.ctx ; mscratch = original t6
+.global _strap
+_strap:
+    csrrw   t6, sscratch, t6        # t6 = &cur.ctx ; sscratch = original t6
 
     sd      x1,  8(t6)
     sd      x2,  16(t6)
@@ -40,27 +44,27 @@ _mtrap:
     sd      x28, 224(t6)
     sd      x29, 232(t6)
     sd      x30, 240(t6)
-    csrr    t5, mscratch            # original x31 (t6)
+    csrr    t5, sscratch            # original x31 (t6)
     sd      t5, 248(t6)
-    csrr    t5, mepc
+    csrr    t5, sepc
     sd      t5, 256(t6)
-    csrr    t5, mstatus
+    csrr    t5, sstatus
     sd      t5, 264(t6)
 
     la      sp, _trap_stack_top
-    call    mtrap_handler
+    call    strap_handler
     # fall through to restore whatever `current` now is
 
 .global _ret_to_task
 _ret_to_task:
     la      t6, current
     ld      t6, 0(t6)               # t6 = current == &current->ctx (offset 0)
-    csrw    mscratch, t6
+    csrw    sscratch, t6
 
     ld      t5, 264(t6)
-    csrw    mstatus, t5
+    csrw    sstatus, t5
     ld      t5, 256(t6)
-    csrw    mepc, t5
+    csrw    sepc, t5
 
     ld      x1,  8(t6)
     ld      x2,  16(t6)
@@ -93,7 +97,7 @@ _ret_to_task:
     ld      x29, 232(t6)
     ld      x30, 240(t6)
     ld      x31, 248(t6)            # t6 restored last (it is our base)
-    mret
+    sret
 
 .section .bss
 .align 16

@@ -19,8 +19,9 @@ struct task *task_create(const char *name, void (*entry)(void))
     for (int i = 0; i < 32; i++)
         t->ctx.x[i] = 0;
     t->ctx.x[2]   = (uint64)(t->stack + TSTACK);       /* sp -> stack top */
-    t->ctx.mepc   = (uint64)entry;
-    t->ctx.mstatus = MSTATUS_MPP_M | MSTATUS_MPIE;     /* mret -> M-mode, MIE=1 */
+    t->ctx.epc    = (uint64)entry;
+    /* sret returns to S-mode (SPP=1) with interrupts enabled (SPIE -> SIE) */
+    t->ctx.status = SSTATUS_SPP | SSTATUS_SPIE;
     t->state = T_RUNNABLE;
     t->id    = ntasks;
     t->name  = name;
@@ -56,7 +57,7 @@ void yield(void)
     sys_yield();        /* ecall -> _mtrap saves context -> schedule() */
 }
 
-/* Dispatched from trap.c on an M-mode ecall. mepc has already been advanced
+/* Dispatched from trap.c on an S-mode ecall. sepc has already been advanced
    past the ecall; args live in the saved context (a0=x[10], a1=x[11], ...). */
 void syscall_dispatch(uint64 num)
 {

@@ -2,12 +2,12 @@
 #include "riscv.h"
 
 /* Full integer context saved on every trap. `x` is indexed by register number
-   (x[0] unused); mepc/mstatus follow. Offsets are mirrored in trap.S — keep in
-   sync: x[i] at i*8, mepc at 256, mstatus at 264. */
+   (x[0] unused); epc/status follow. Offsets are mirrored in entry.S — keep in
+   sync: x[i] at i*8, epc at 256, status at 264. */
 struct context {
     uint64 x[32];
-    uint64 mepc;
-    uint64 mstatus;
+    uint64 epc;         /* sepc:    where the task resumes */
+    uint64 status;      /* sstatus: privilege + interrupt state on sret */
 };
 
 enum task_state { T_UNUSED = 0, T_RUNNABLE, T_RUNNING, T_BLOCKED };

@@ -8,6 +8,7 @@
 #define NULL_TASK_ID    3
 #define SHELL_TASK_ID   4
 #define SANDBOX_TASK_ID 5
+#define FAULTER_TASK_ID 6
 
 void fs_server(void);        /* srv_fs.c      — FAT16 behind the interface */
 void console_server(void);   /* srv_console.c — UART behind the interface */

@@ -10,3 +10,5 @@ char  *strcpy(char *dst, const char *src);
 int    utoa(unsigned long v, char *out);
 /* 1 if s starts with p */
 int    str_has_prefix(const char *s, const char *p);
+/* lowercase hex, no 0x prefix; returns chars written */
+int    xtoa(unsigned long v, char *out);
