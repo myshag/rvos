@@ -11,12 +11,14 @@ Everything runs **headless** — serial console only, no graphics.
 
 ## The idea
 
-The kernel provides exactly three primitives: `send`, `recv`, `yield`.
+The kernel does scheduling, message passing and page tables. That is all.
 
-Everything else is a *task* answering the same request struct, and paths are
-routed to tasks by a mount table. So a new module — a pipe, a socket, a
-network stack — is added without touching the kernel at all: write a task,
-bind it into the tree. The kernel never learns it exists.
+The filesystem, the console driver, the view of kernel state and the bit
+bucket are **user-mode programs**: unprivileged tasks that reach the machine
+only through syscalls, or through a device mapped into their own address
+space and nobody else's. Paths are routed to them by a per-task mount table.
+So a new module — a pipe, a socket, a network stack — is added without
+touching the kernel at all: write a program, bind it into the tree.
 
 The mount table is per task, so a path is not a global fact. Two programs can
 run the identical call on the identical path and reach different modules,
@@ -56,13 +58,14 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/ipc.c`        | synchronous rendezvous `send`/`recv` |
 | `src/vfs.h`        | **the one interface** + client wrappers |
 | `src/vfs.c`        | the namespace: mount table, `bind`, longest-prefix routing |
-| `src/srv_fs.c`     | filesystem module (owns FAT16 entirely) |
-| `src/srv_console.c`| console module (owns the UART) |
-| `src/srv_proc.c`   | kernel state as files (`/proc/tasks`, `/mounts`, `/pagetable`) |
-| `src/srv_null.c`   | the bit bucket, for binding over other paths |
+| `src/srv_fs.c`     | filesystem server — **user mode**, owns the disk mapping |
+| `src/srv_console.c`| console server — **user mode**, drives the UART itself |
+| `src/srv_proc.c`   | kernel state as files — **user mode**, asks via syscalls |
+| `src/srv_null.c`   | the bit bucket — **user mode** |
 | `src/fat16.c`      | read-only FAT16 over a RAM-backed block device |
 | `src/uart.c`       | NS16550 driver + tiny `kprintf` |
-| `src/user.c`       | a **user-mode** program: syscalls and nothing else |
+| `src/ulib.c`       | the user side's own libc (kernel's is unreachable) |
+| `src/user.c`       | user-mode demo programs |
 | `src/kmain.c`      | boot, initial namespace, the demo shell |
 
 ## Design notes
@@ -77,12 +80,21 @@ which is how the sandbox in the demo is silenced without knowing it.
   spaces an address means nothing on the far side, so `send`/`recv` name a
   buffer and the kernel translates both ends and moves the bytes. That is
   why `vfs_req` carries an inline data area and reads arrive in chunks.
-- **User mode.** `user.c` is linked into its own page-aligned region and
-  mapped with the U bit, so it runs unprivileged. No trampoline page is
-  needed: the kernel image stays mapped in its address space *without* U,
-  which is enough for the trap vector to run (S-mode may touch U-less pages)
-  and enough to keep the program out (U-mode may not). Servers are still
-  S-mode tasks — moving them out is the remaining step.
+- **User mode.** User code is linked into page-aligned regions and mapped
+  with the U bit. No trampoline page is needed: the kernel image stays mapped
+  in a user address space *without* U, which is enough for the trap vector to
+  run (S-mode may touch U-less pages) and enough to keep the program out
+  (U-mode may not).
+- **The servers are user programs.** They share one text region, like a C
+  library, but each one with writable state gets a private, page-aligned data
+  region mapped only into its own address space — so servers are isolated
+  from each other as well as from the kernel. The console server drives the
+  UART with ordinary loads and stores because the device is mapped into *its*
+  space alone; the filesystem server reads the disk the same way. Neither has
+  the kernel on its data path. What the kernel does mediate is the state only
+  it owns: the task table, the mount tables and the page allocator, reached
+  through `SYS_TASKINFO`, `SYS_MOUNTS`, `SYS_MEMINFO`, `SYS_BIND`,
+  `SYS_NSCLONE`, `SYS_ROUTE` and `SYS_PGDUMP`.
 - **Scheduling** is preemptive round-robin driven by the Sstc timer; `ecall`
   provides `yield`, `send`, `recv`. Since servers spend their lives blocked in
   `recv`, most switching actually happens at IPC boundaries — the timer is
@@ -231,8 +243,18 @@ $ read *(char*)0x80000000   -- kernel text, mapped but U-less
        scause=13  stval=0x80000000  sepc=0x8000128e
 ```
 
-The faulting instruction is at `0x8000128e`, inside the user region; the
-address it reached for is kernel text. Same page table, one bit apart.
+The faulting instruction is inside the user region; the address it reached
+for is kernel text. Same page table, one bit apart.
+
+Servers are isolated from each other too. They share their code, but a server
+with state gets a private data region, so reaching for another's is refused:
+
+```
+--- peeker (U-mode) ------------------------------------
+$ read the fs server's private data region
+[trap] load page fault in task 'peeker'
+       scause=13  stval=0x80003000
+```
 
 ## Development stages (git history)
 
@@ -246,11 +268,19 @@ address it reached for is kernel text. Same page table, one bit apart.
 8. Sv39 paging: M-mode handover, page allocator, page tables, `/proc/pagetable`
 9. isolation: an address space per task, copying IPC, device ownership
 10. user mode: an unprivileged program reaching the system only via syscalls
+11. the servers themselves move to user mode; the kernel keeps only
+    scheduling, IPC and page tables
 
 ## Next steps
 
-- move the servers themselves into user mode, so the kernel is left with
-  scheduling, IPC and page tables and nothing else
+- **an executable format.** There isn't one: kernel, servers and user
+  programs are all a single statically linked ELF that QEMU loads, and a
+  "program" is a function reached by `task_create_user`, separated by linker
+  sections rather than loaded from anywhere. Real programs need an ELF parser,
+  an `exec` that builds an address space from a file's segments, and either
+  relocation or position-independent code. The pieces it would build on —
+  per-task page tables, cross-space copying, a filesystem server that reads
+  files — are already here.
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
 - a `virtio-blk` driver, replacing the RAM image with a real disk
 - a `virtio-blk` driver, replacing the RAM image with a real disk

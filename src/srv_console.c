@@ -6,11 +6,35 @@
 #include "vfs.h"
 #include "servers.h"
 #include "syscall.h"
-#include "uart.h"
+#include "ulib.h"
+
+/* A user-space device driver: the UART is mapped into this address space and
+   nobody else's, so these are ordinary loads and stores from an unprivileged
+   program — no syscall, no kernel involvement on the data path. */
+#define UART ((volatile unsigned char *)0x10000000UL)
+enum { UART_RBR = 0, UART_THR = 0, UART_LSR = 5 };
+#define UART_LSR_THRE (1u << 5)
+#define UART_LSR_DR   (1u << 0)
+
+static void con_putc(char c)
+{
+    if (c == '\n')
+        con_putc('\r');
+    while (!(UART[UART_LSR] & UART_LSR_THRE))
+        ;
+    UART[UART_THR] = (unsigned char)c;
+}
+
+static int con_tryc(void)
+{
+    if (!(UART[UART_LSR] & UART_LSR_DR))
+        return -1;
+    return (int)UART[UART_RBR];
+}
 
 void console_server(void)
 {
-    kprintf("  [console] up, serving open/read/write/close over UART\n");
+    uputs("  [console] up (user mode), driving the UART directly\n");
 
     for (;;) {
         struct vfs_req req;
@@ -22,12 +46,12 @@ void console_server(void)
             break;
         case VFS_WRITE: {
             for (int i = 0; i < r->len && i < VFS_DATA_MAX; i++)
-                uart_putc(r->data[i]);
+                con_putc(r->data[i]);
             r->result = r->len;
             break;
         }
         case VFS_READ: {
-            int c = uart_tryc();                /* non-blocking */
+            int c = con_tryc();                 /* non-blocking */
             if (c < 0) {
                 r->result = 0;
             } else {

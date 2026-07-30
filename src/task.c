@@ -50,15 +50,24 @@ struct task *task_create(const char *name, void (*entry)(void))
    pages carry PTE_U, and sstatus.SPP is left clear so sret drops to user
    mode. The kernel image stays mapped — the trap vector has to be reachable
    — but without PTE_U, which is what puts the kernel out of its reach. */
-struct task *task_create_user(const char *name, void (*entry)(void))
+struct task *task_create_user(const char *name, void (*entry)(void),
+                              void *data_start, void *data_end)
 {
-    extern char __user_start[], __user_end[];
+    extern char __utext_start[], __utext_end[];
 
     struct task *t = task_create(name, entry);
 
-    vm_map_at(t->pt, (uint64)__user_start, (uint64)__user_start,
-              (uint64)(__user_end - __user_start),
-              PTE_R | PTE_W | PTE_X | PTE_U, 0);
+    /* Shared, like a C library: every user program executes the same text. */
+    vm_map_at(t->pt, (uint64)__utext_start, (uint64)__utext_start,
+              (uint64)(__utext_end - __utext_start),
+              PTE_R | PTE_X | PTE_U, 0);
+
+    /* Private: only this program's own writable state, so one server cannot
+       reach another's buffers even though they share their code. */
+    if (data_end > data_start)
+        vm_map_at(t->pt, (uint64)data_start, (uint64)data_start,
+                  (uint64)((char *)data_end - (char *)data_start),
+                  PTE_R | PTE_W | PTE_U, 0);
 
     for (int i = 0; i < USTACK_PAGES; i++) {
         uint64 va = USTACK_TOP - (uint64)(i + 1) * PGSIZE;
@@ -99,6 +108,22 @@ void yield(void)
     sys_yield();        /* ecall -> _mtrap saves context -> schedule() */
 }
 
+/* Pull a NUL-terminated string out of the caller's address space, one byte
+   at a time so we never read past the end of its buffer. */
+static void copy_string_in(uint64 va, char *dst, int cap)
+{
+    int i = 0;
+    for (; i < cap - 1; i++) {
+        uint64 pa = vm_translate_in(current->pt, va + (uint64)i);
+        if (!pa)
+            break;
+        dst[i] = *(char *)pa;
+        if (!dst[i])
+            break;
+    }
+    dst[i] = 0;
+}
+
 /* Dispatched from trap.c on an S-mode ecall. sepc has already been advanced
    past the ecall; args live in the saved context (a0=x[10], a1=x[11], ...). */
 void syscall_dispatch(uint64 num)
@@ -111,25 +136,60 @@ void syscall_dispatch(uint64 num)
         uart_putc((char)current->ctx.x[10]);
         break;
     case SYS_ROUTE: {
-        /* The path lives in the caller's address space and the mount table
-           in the kernel's, so both ends need translating. Copy the string in
-           one byte at a time to avoid reading past the end of the caller's
-           buffer. */
         char kpath[VFS_PATH_MAX];
-        uint64 va = current->ctx.x[10];
-        int i = 0;
-        for (; i < VFS_PATH_MAX - 1; i++) {
-            uint64 pa = vm_translate_in(current->pt, va + (uint64)i);
-            if (!pa)
-                break;
-            kpath[i] = *(char *)pa;
-            if (!kpath[i])
-                break;
-        }
-        kpath[i] = 0;
+        copy_string_in(current->ctx.x[10], kpath, VFS_PATH_MAX);
         current->ctx.x[10] = (uint64)(long)vfs_route(kpath);
         break;
     }
+    case SYS_TASKINFO: {
+        int idx = (int)current->ctx.x[10];
+        uint64 out = current->ctx.x[11];
+        if (idx < 0 || idx >= NTASK || tasks[idx].state == T_UNUSED) {
+            current->ctx.x[10] = (uint64)-1;
+            break;
+        }
+        struct taskinfo ti;
+        ti.id         = tasks[idx].id;
+        ti.state      = (int)tasks[idx].state;
+        ti.is_current = (&tasks[idx] == current);
+        int k = 0;
+        for (; k < 15 && tasks[idx].name[k]; k++)
+            ti.name[k] = tasks[idx].name[k];
+        ti.name[k] = 0;
+        vm_copy_across(current->pt, out, kernel_pagetable,
+                       (uint64)&ti, sizeof(ti));
+        current->ctx.x[10] = 0;
+        break;
+    }
+    case SYS_MOUNTS: {
+        static char kbuf[512];
+        int    tid = (int)current->ctx.x[10];
+        uint64 out = current->ctx.x[11];
+        int    cap = (int)current->ctx.x[12];
+        int n = vfs_dump_mounts_of(tid, kbuf, (int)sizeof(kbuf));
+        if (n > cap) n = cap;
+        if (n > 0)
+            vm_copy_across(current->pt, out, kernel_pagetable,
+                           (uint64)kbuf, (uint64)n);
+        current->ctx.x[10] = (uint64)n;
+        break;
+    }
+    case SYS_MEMINFO: {
+        int info[2] = { pmm_free_count(), pmm_total_count() };
+        vm_copy_across(current->pt, current->ctx.x[10], kernel_pagetable,
+                       (uint64)info, sizeof(info));
+        current->ctx.x[10] = 0;
+        break;
+    }
+    case SYS_BIND: {
+        char kp[VFS_PREFIX_MAX];
+        copy_string_in(current->ctx.x[10], kp, VFS_PREFIX_MAX);
+        current->ctx.x[10] = (uint64)(long)vfs_bind(kp, (int)current->ctx.x[11]);
+        break;
+    }
+    case SYS_NSCLONE:
+        current->ctx.x[10] = (uint64)(long)vfs_ns_clone();
+        break;
     case SYS_PGDUMP: {
         /* Only the kernel can do this: it runs with the kernel table
            installed, which is the one address space that still reaches the

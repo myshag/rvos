@@ -9,8 +9,7 @@
 #include "servers.h"
 #include "fat16.h"
 #include "syscall.h"
-#include "uart.h"
-#include "util.h"
+#include "ulib.h"
 
 #define FS_MAXFD  4
 #define FS_BUFSZ  700
@@ -29,15 +28,15 @@ static int fs_format_root(char *out, int cap)
     int n = fat16_list_root(ents, 16);
     int o = 0;
     for (int i = 0; i < n && o < cap - 40; i++) {
-        int l = (int)strlen(ents[i].name);
-        memcpy(out + o, ents[i].name, (size_t)l);
+        int l = (int)ustrlen(ents[i].name);
+        umemcpy(out + o, ents[i].name, (unsigned long)l);
         o += l;
         if (ents[i].is_dir) {
             out[o++] = '/';
         } else {
-            memcpy(out + o, "  (", 3); o += 3;
-            o += utoa(ents[i].size, out + o);
-            memcpy(out + o, " bytes)", 7); o += 7;
+            umemcpy(out + o, "  (", 3); o += 3;
+            o += uutoa(ents[i].size, out + o);
+            umemcpy(out + o, " bytes)", 7); o += 7;
         }
         out[o++] = '\n';
     }
@@ -78,7 +77,7 @@ static void fs_do_read(struct vfs_req *r)
     int n = (int)(f->size - f->pos);
     if (n > r->len) n = r->len;
     if (n < 0) n = 0;
-    memcpy(r->data, f->data + f->pos, (size_t)n);
+    umemcpy(r->data, f->data + f->pos, (unsigned long)n);
     f->pos += (uint32)n;
     r->result = n;
 }
@@ -95,9 +94,9 @@ static void fs_do_ioctl(struct vfs_req *r)
 void fs_server(void)
 {
     if (fat16_init() == 0)
-        kprintf("  [fs] FAT16 mounted, serving open/read/ioctl/close\n");
+        uputs("  [fs] up (user mode), FAT16 mounted from its own mapping\n");
     else
-        kprintf("  [fs] no valid FAT16 (run with 'make rundisk')\n");
+        uputs("  [fs] no valid FAT16 (run with 'make rundisk')\n");
 
     for (;;) {
         struct vfs_req req;

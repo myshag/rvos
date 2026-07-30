@@ -9,12 +9,8 @@
 */
 #include "vfs.h"
 #include "servers.h"
-#include "task.h"
 #include "syscall.h"
-#include "uart.h"
-#include "util.h"
-#include "vm.h"
-#include "pmm.h"
+#include "ulib.h"
 
 #define PROC_MAXFD 2
 #define PROC_BUFSZ 1024
@@ -27,38 +23,42 @@ struct proc_file {
 };
 static struct proc_file p_tab[PROC_MAXFD];
 
-static const char *state_name(enum task_state s)
+/* Mirrors enum task_state; the server no longer sees the kernel's header. */
+static const char *state_name(int s)
 {
     switch (s) {
-    case T_UNUSED:   return "unused";
-    case T_RUNNABLE: return "runnable";
-    case T_RUNNING:  return "running";
-    case T_BLOCKED:  return "blocked";
-    default:         return "?";
+    case 1:  return "runnable";
+    case 2:  return "running";
+    case 3:  return "blocked";
+    default: return "?";
     }
 }
 
 static int append(char *out, int o, const char *s)
 {
-    int l = (int)strlen(s);
-    memcpy(out + o, s, (size_t)l);
+    int l = (int)ustrlen(s);
+    umemcpy(out + o, s, (unsigned long)l);
     return o + l;
 }
 
+/* The task table is kernel memory, so this asks for it an entry at a time
+   rather than reading it. Formatting stays here: policy belongs in the
+   server, the kernel only hands over the facts. */
+#define PROC_NTASK 10
 static int format_tasks(char *out, int cap)
 {
     int o = 0;
-    for (int i = 0; i < NTASK && o < cap - 48; i++) {
-        if (tasks[i].state == T_UNUSED)
+    for (int i = 0; i < PROC_NTASK && o < cap - 48; i++) {
+        struct taskinfo ti;
+        if (sys_taskinfo(i, &ti) < 0)
             continue;
-        o += utoa((unsigned long)tasks[i].id, out + o);
+        o += uutoa((unsigned long)ti.id, out + o);
         o = append(out, o, "  ");
-        o = append(out, o, state_name(tasks[i].state));
-        /* pad so the names line up regardless of state word length */
-        for (int p = (int)strlen(state_name(tasks[i].state)); p < 9; p++)
+        o = append(out, o, state_name(ti.state));
+        for (int p = ustrlen(state_name(ti.state)); p < 9; p++)
             out[o++] = ' ';
-        o = append(out, o, tasks[i].name);
-        if (&tasks[i] == current)
+        o = append(out, o, ti.name);
+        if (ti.is_current)
             o = append(out, o, "  (me)");
         out[o++] = '\n';
     }
@@ -73,17 +73,16 @@ static int format_tasks(char *out, int cap)
 static int format_pagetable(int caller, char *out, int cap)
 {
     int o = 0;
+    int mem[2] = { 0, 0 };
+    sys_meminfo(mem);
 
     o = append(out, o, "task ");
-    o += utoa((unsigned long)caller, out + o);
-    o = append(out, o, " root table 0x");
-    o += xtoa((uint64)(caller >= 0 && caller < NTASK ? (uint64)tasks[caller].pt : 0),
-              out + o);
+    o += uutoa((unsigned long)caller, out + o);
     out[o++] = '\n';
     o = append(out, o, "free pages ");
-    o += utoa((unsigned long)pmm_free_count(), out + o);
+    o += uutoa((unsigned long)mem[0], out + o);
     o = append(out, o, " of ");
-    o += utoa((unsigned long)pmm_total_count(), out + o);
+    o += uutoa((unsigned long)mem[1], out + o);
     out[o++] = '\n';
     out[o++] = '\n';
 
@@ -119,11 +118,11 @@ static void proc_do_open(struct vfs_req *r, int caller)
     struct proc_file *f = &p_tab[fd];
 
     int n;
-    if (str_has_prefix(r->path, "/proc/tasks"))
+    if (ustr_has_prefix(r->path, "/proc/tasks"))
         n = format_tasks(f->data, PROC_BUFSZ);
-    else if (str_has_prefix(r->path, "/proc/mounts"))
-        n = vfs_dump_mounts_of(caller, f->data, PROC_BUFSZ);
-    else if (str_has_prefix(r->path, "/proc/pagetable"))
+    else if (ustr_has_prefix(r->path, "/proc/mounts"))
+        n = sys_mounts(caller, f->data, PROC_BUFSZ);
+    else if (ustr_has_prefix(r->path, "/proc/pagetable"))
         n = format_pagetable(caller, f->data, PROC_BUFSZ);
     else
         n = -1;
@@ -137,7 +136,7 @@ static void proc_do_open(struct vfs_req *r, int caller)
 
 void proc_server(void)
 {
-    kprintf("  [proc] up, publishing kernel state as files\n");
+    uputs("  [proc] up (user mode), publishing kernel state as files\n");
 
     for (;;) {
         struct vfs_req req;
@@ -156,7 +155,7 @@ void proc_server(void)
             int n = f->size - f->pos;
             if (n > r->len) n = r->len;
             if (n < 0) n = 0;
-            memcpy(r->data, f->data + f->pos, (size_t)n);
+            umemcpy(r->data, f->data + f->pos, (unsigned long)n);
             f->pos += n;
             r->result = n;
             break;

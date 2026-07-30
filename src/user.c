@@ -30,6 +30,28 @@ static void uputs(const char *s)
         _ecall1(SYS_PUTC, *s++);
 }
 
+/* Servers share their text but not their state. This reaches for the
+   filesystem server's private data region — its open-file cache — which is
+   mapped into that server's address space and no other. Linker symbols are
+   just addresses; resolving one costs nothing at run time and gets us
+   nowhere. */
+void peeker_main(void)
+{
+    extern char __ufs_start[];
+    unsigned long go;
+    sys_recv(&go, (int)sizeof(go));
+
+    uputs("\n--- peeker (U-mode) ------------------------------------\n");
+    uputs("$ read the fs server's private data region\n");
+    volatile char *other = (volatile char *)__ufs_start;
+    char c = *other;
+
+    uputs("  UNREACHABLE: read succeeded, servers are not isolated\n");
+    (void)c;
+    for (;;)
+        _ecall1(SYS_YIELD, 0);
+}
+
 void user_main(void)
 {
     /* Wait to be told to start, so the demo output stays in order. */

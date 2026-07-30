@@ -108,12 +108,14 @@ static void shell(void)
     /* Neither of these replies: both are about to be stopped by the MMU. */
     sys_send(SNOOPER_TASK_ID, &m, (int)sizeof(m));
     sys_send(USER_TASK_ID,    &m, (int)sizeof(m));
+    sys_send(PEEKER_TASK_ID,  &m, (int)sizeof(m));
 
     for (;;)
         yield();
 }
 
 void user_main(void);        /* user.c — runs with the U bit set */
+void peeker_main(void);      /* user.c — probes another server's memory */
 
 /* Always runnable, so the scheduler never runs out of candidates — without
    it, retiring a faulting task while everyone else is blocked left nothing to
@@ -130,12 +132,12 @@ void smain(void)
     uart_init();
     kprintf("\n=============================================\n");
     kprintf("  rvos — educational RISC-V microkernel\n");
-    kprintf("  stage 9: per-task address spaces\n");
+    kprintf("  stage 11: the servers are user programs\n");
     kprintf("=============================================\n");
 
-    /* The user region has its own bss, outside the range boot.S clears. */
-    extern char __ubss_start[], __ubss_end[];
-    memset(__ubss_start, 0, (size_t)(__ubss_end - __ubss_start));
+    /* User-space state lives outside the range boot.S clears. */
+    extern char __udata_start[], __udata_end[];
+    memset(__udata_start, 0, (size_t)(__udata_end - __udata_start));
 
     pmm_init();
     vm_init();
@@ -145,25 +147,40 @@ void smain(void)
     trap_init();
     timer_init();
 
-    struct task *fs = task_create("fs", fs_server);   /* 0 */
-    task_create("console", console_server);           /* 1 */
-    task_create("proc",    proc_server);              /* 2 */
-    task_create("null",    null_server);              /* 3 */
+    extern char __ufs_start[], __ufs_end[];
+    extern char __uproc_start[], __uproc_end[];
+    extern char __umisc_start[], __umisc_end[];
+
+    /* The system services are user programs now. */
+    struct task *fs =
+        task_create_user("fs", fs_server, __ufs_start, __ufs_end);        /* 0 */
+    struct task *con =
+        task_create_user("console", console_server,
+                         __umisc_start, __umisc_end);                     /* 1 */
+    task_create_user("proc", proc_server, __uproc_start, __uproc_end);    /* 2 */
+    task_create_user("null", null_server, __umisc_start, __umisc_end);    /* 3 */
+
     task_create("shell",   shell);                    /* 4 */
     task_create("sandbox", sandbox);                  /* 5 */
     task_create("snooper", snooper);                  /* 6 */
-    task_create_user("user", user_main);              /* 7 — U-mode */
-    task_create("idle",    idle);                     /* 8 */
+    task_create_user("user", user_main,
+                     __umisc_start, __umisc_end);     /* 7 */
+    task_create_user("peeker", peeker_main,
+                     __umisc_start, __umisc_end);     /* 8 */
+    task_create("idle",    idle);                     /* 9 */
 
-    /* The disk goes into exactly one address space. Every other task holds no
-       translation for it at all — which is what the snooper discovers. */
-    vm_map_at(fs->pt, DISK_PA, DISK_PA, DISK_SIZE, PTE_R, 1);
+    /* Devices are handed to their driver and to nobody else — with the U bit,
+       so the driver reaches them from user mode without the kernel on the
+       data path at all. */
+    vm_map_at(fs->pt,  DISK_PA, DISK_PA, DISK_SIZE, PTE_R | PTE_U, 1);
+    vm_map_at(con->pt, UART_BASE_PA, UART_BASE_PA, PGSIZE,
+              PTE_R | PTE_W | PTE_U, 0);
 
     vfs_bind("/",      FS_TASK_ID);
     vfs_bind("/dev/",  CONSOLE_TASK_ID);
     vfs_bind("/proc/", PROC_TASK_ID);
 
-    kprintf("[boot] 4 servers, 3 apps, 1 user program + idle, %d pages left.\n",
+    kprintf("[boot] 4 user servers, 3 kernel apps, 2 user programs, %d pages.\n",
             pmm_free_count());
     scheduler_start();
 }

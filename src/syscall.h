@@ -24,6 +24,22 @@ enum {
        directly, so the namespace is reached through the kernel like anything
        else. */
     SYS_ROUTE  = 5,
+    /* Kernel state a user-mode server cannot read for itself. The task table,
+       the mount tables and the page allocator all live in kernel memory, so
+       the proc server asks instead of looking. */
+    SYS_TASKINFO = 6,  /* a0 = index, a1 = struct taskinfo* -> 0 / -1 */
+    SYS_MOUNTS   = 7,  /* a0 = task id, a1 = buf, a2 = cap -> bytes */
+    SYS_MEMINFO  = 8,  /* a0 = int[2] out: {free pages, total pages} */
+    /* Namespace mutation: also kernel-side per-task state. */
+    SYS_BIND     = 9,  /* a0 = prefix, a1 = server task id */
+    SYS_NSCLONE  = 10,
+};
+
+struct taskinfo {
+    int  id;
+    int  state;          /* matches enum task_state */
+    int  is_current;
+    char name[16];
 };
 
 static inline long _ecall1(long n, long a0)
@@ -64,6 +80,27 @@ static inline long _ecall4(long n, long a0, long a1, long a2, long a3)
 }
 
 static inline void sys_yield(void) { _ecall1(SYS_YIELD, 0); }
+
+static inline int sys_taskinfo(int idx, struct taskinfo *out)
+{
+    return (int)_ecall2(SYS_TASKINFO, idx, (long)out);
+}
+static inline int sys_mounts(int task_id, char *out, int cap)
+{
+    return (int)_ecall3(SYS_MOUNTS, task_id, (long)out, cap);
+}
+static inline int sys_meminfo(int out[2])
+{
+    return (int)_ecall1(SYS_MEMINFO, (long)out);
+}
+static inline int sys_bind(const char *prefix, int server_task)
+{
+    return (int)_ecall2(SYS_BIND, (long)prefix, server_task);
+}
+static inline int sys_nsclone(void)
+{
+    return (int)_ecall1(SYS_NSCLONE, 0);
+}
 
 static inline int sys_route(const char *path)
 {

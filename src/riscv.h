@@ -79,6 +79,11 @@ typedef uint64 *pagetable_t;
 #define CLINT_MTIME       (CLINT_BASE + 0xBFF8)
 #define UART_BASE_PA      0x10000000UL
 
+/* Where every task's stack sits. Part of the ABI, not a kernel secret: a
+   user program may ask about its own stack. */
+#define USTACK_TOP   0x30000000UL
+#define USTACK_PAGES 4                       /* 16 KiB */
+
 #define RAM_BASE          0x80000000UL
 #define RAM_TOP           0x88000000UL   /* qemu virt default: 128 MiB */
 #define DISK_PA           0x84000000UL   /* FAT16 image loaded here */

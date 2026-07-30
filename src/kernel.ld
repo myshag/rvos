@@ -8,25 +8,73 @@ SECTIONS
 
     .init : { *(.text.init) }      /* _start must be first */
 
-    /* ---- user region ------------------------------------------------
-       Everything from user.o lands here, page-aligned and contiguous, so it
-       can be mapped with the U bit into a user task's address space while
-       the kernel around it stays U-less and therefore untouchable from user
-       mode. Placing these output sections *before* the kernel ones is what
-       captures user.o: ld assigns each input section to the first output
-       section that matches it. */
+    /* ---- user space --------------------------------------------------
+       Everything that runs unprivileged lives here, page-aligned, so it can
+       be mapped with the U bit while the kernel around it stays U-less and
+       therefore untouchable from user mode. Placing these output sections
+       *before* the kernel ones is what captures the objects: ld assigns each
+       input section to the first output section that matches it.
+
+       Text and rodata are shared by all user programs, like a C library.
+       Writable state is not: a server with globals gets its own page-aligned
+       region, mapped only into its own address space, so one server cannot
+       reach another's buffers. */
     . = ALIGN(4096);
-    __user_start = .;
-    .utext : { *user.o(.text .text.*) }
-    .urodata : { *user.o(.rodata .rodata.* .srodata .srodata.*) }
-    .udata : { *user.o(.data .data.* .sdata .sdata.*) }
-    . = ALIGN(8);
-    __ubss_start = .;
-    .ubss : { *user.o(.sbss .sbss.* .bss .bss.* COMMON) }
-    . = ALIGN(8);
-    __ubss_end = .;
+    __utext_start = .;
+    .utext : {
+        *ulib.o(.text .text.*)
+        *user.o(.text .text.*)
+        *srv_null.o(.text .text.*)
+        *srv_console.o(.text .text.*)
+        *srv_fs.o(.text .text.*)
+        *srv_proc.o(.text .text.*)
+        *fat16.o(.text .text.*)
+    }
+    .urodata : {
+        *ulib.o(.rodata .rodata.* .srodata .srodata.*)
+        *user.o(.rodata .rodata.* .srodata .srodata.*)
+        *srv_null.o(.rodata .rodata.* .srodata .srodata.*)
+        *srv_console.o(.rodata .rodata.* .srodata .srodata.*)
+        *srv_fs.o(.rodata .rodata.* .srodata .srodata.*)
+        *srv_proc.o(.rodata .rodata.* .srodata .srodata.*)
+        *fat16.o(.rodata .rodata.* .srodata .srodata.*)
+    }
     . = ALIGN(4096);
-    __user_end = .;
+    __utext_end = .;
+
+    /* private state: the filesystem server (its open-file cache and the
+       FAT16 driver's mounted-volume record) */
+    __ufs_start = .;
+    .ufs : {
+        *srv_fs.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+        *fat16.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(4096);
+    __ufs_end = .;
+
+    /* private state: the proc server (its rendered-file buffers) */
+    __uproc_start = .;
+    .uproc : {
+        *srv_proc.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(4096);
+    __uproc_end = .;
+
+    /* private state: everyone else (ulib, user.o) — usually empty */
+    __umisc_start = .;
+    .umisc : {
+        *ulib.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+        *user.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+        *srv_null.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+        *srv_console.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(4096);
+    __umisc_end = .;
+
+    /* All of the above is zeroed at boot: these regions hold only .bss in
+       practice, and boot.S clears the kernel's bss alone. */
+    __udata_start = __ufs_start;
+    __udata_end   = __umisc_end;
 
     /* ---- kernel ------------------------------------------------------ */
     .text : { *(.text .text.*) }

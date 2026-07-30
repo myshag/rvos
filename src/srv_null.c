@@ -6,11 +6,11 @@
 #include "vfs.h"
 #include "servers.h"
 #include "syscall.h"
-#include "uart.h"
+#include "ulib.h"
 
 void null_server(void)
 {
-    kprintf("  [null] up, discarding whatever is bound to it\n");
+    uputs("  [null] up (user mode), discarding whatever is bound to it\n");
 
     for (;;) {
         struct vfs_req req;

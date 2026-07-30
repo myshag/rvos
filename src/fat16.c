@@ -2,14 +2,14 @@
    and follows cluster chains through the FAT. Block device is a flat region of
    guest RAM at DISK_BASE (the image QEMU loaded with -device loader). */
 #include "fat16.h"
-#include "util.h"
+#include "ulib.h"
 
 #define DISK_BASE 0x84000000UL
 #define SECSZ     512
 
 static void blk_read(uint32 lba, void *buf)
 {
-    memcpy(buf, (const void *)(DISK_BASE + (uint64)lba * SECSZ), SECSZ);
+    umemcpy(buf, (const void *)(DISK_BASE + (uint64)lba * SECSZ), SECSZ);
 }
 
 static struct {
@@ -141,7 +141,7 @@ int fat16_read(const char *name, void *out, int maxlen)
                 return -1;
             if (!usable_entry(d) || (d[11] & 0x10))
                 continue;                          /* skip dirs */
-            if (memcmp(d, want, 11) != 0)
+            if (umemcmp(d, want, 11) != 0)
                 continue;
 
             uint32 size = rd32(d + 28);
@@ -156,7 +156,7 @@ int fat16_read(const char *name, void *out, int maxlen)
                     int chunk = SECSZ;
                     if (chunk > cap - got)
                         chunk = cap - got;
-                    memcpy((uint8 *)out + got, cb, chunk);
+                    umemcpy((uint8 *)out + got, cb, chunk);
                     got += chunk;
                 }
                 clus = fat_next(clus);
