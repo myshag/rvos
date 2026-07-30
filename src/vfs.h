@@ -1,7 +1,6 @@
 #pragma once
 #include "riscv.h"
 #include "syscall.h"
-#include "util.h"
 
 /* vfs.h — the ONE interface every module speaks, inside the kernel or out:
    open / read / write / ioctl / close. Plan-9 style: "everything is a file".
@@ -64,7 +63,21 @@ struct namespace *vfs_root_ns(void);
 
 /* ---- client side ----------------------------------------------------
    A client fd packs which server owns it together with that server's local
-   fd, so read/write/ioctl/close never have to re-resolve the path. */
+   fd, so read/write/ioctl/close never have to re-resolve the path.
+
+   Everything below reaches the outside world through syscalls only — no
+   kernel function is called, no kernel variable is read. That is deliberate:
+   the same header is the client library for a user-mode program, which is
+   permitted nothing else. */
+static inline void vfs__cpy(void *d, const void *s, int n)
+{
+    char *a = (char *)d; const char *b = (const char *)s;
+    while (n-- > 0) *a++ = *b++;
+}
+static inline void vfs__scpy(char *d, const char *s)
+{
+    while ((*d++ = *s++)) ;
+}
 /* Request out, reply back into the same struct: the server works on its own
    copy, so the answer has to be shipped home explicitly. */
 static inline int vfs_call(int dst, struct vfs_req *r)
@@ -76,12 +89,12 @@ static inline int vfs_call(int dst, struct vfs_req *r)
 
 static inline int vfs_open(const char *path)
 {
-    int srv = vfs_route(path);
+    int srv = sys_route(path);
     if (srv < 0)
         return -1;                      /* nothing bound over this path */
     struct vfs_req r;
     r.op = VFS_OPEN;
-    strcpy(r.path, path);
+    vfs__scpy(r.path, path);
     if (vfs_call(srv, &r) < 0)
         return -1;
     return (srv << 16) | (r.result & 0xffff);
@@ -95,7 +108,7 @@ static inline int vfs_read(int fd, void *buf, int len)
     r.op = VFS_READ; r.fd = fd & 0xffff; r.len = len;
     int n = vfs_call(fd >> 16, &r);
     if (n > 0)
-        memcpy(buf, r.data, (size_t)n);
+        vfs__cpy(buf, r.data, n);
     return n;
 }
 
@@ -105,7 +118,7 @@ static inline int vfs_write(int fd, const void *buf, int len)
     if (len > VFS_DATA_MAX)
         len = VFS_DATA_MAX;
     r.op = VFS_WRITE; r.fd = fd & 0xffff; r.len = len;
-    memcpy(r.data, buf, (size_t)len);
+    vfs__cpy(r.data, buf, len);
     return vfs_call(fd >> 16, &r);
 }
 

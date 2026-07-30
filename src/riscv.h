@@ -29,6 +29,7 @@ typedef unsigned char  uint8;
 /* ---- cause codes ----------------------------------------------------- */
 #define CAUSE_INT           (1UL << 63)
 #define IRQ_S_TIMER         5
+#define EXC_ECALL_U         8        /* environment call from U-mode */
 #define EXC_ECALL_S         9        /* environment call from S-mode */
 #define EXC_INST_PAGE_FAULT 12
 #define EXC_LOAD_PAGE_FAULT 13

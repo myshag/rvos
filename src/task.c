@@ -46,6 +46,30 @@ struct task *task_create(const char *name, void (*entry)(void))
 }
 
 /* Round-robin: from the task after `current`, pick the next RUNNABLE one. */
+/* A task that runs with the U bit set. Same machinery, two differences: its
+   pages carry PTE_U, and sstatus.SPP is left clear so sret drops to user
+   mode. The kernel image stays mapped — the trap vector has to be reachable
+   — but without PTE_U, which is what puts the kernel out of its reach. */
+struct task *task_create_user(const char *name, void (*entry)(void))
+{
+    extern char __user_start[], __user_end[];
+
+    struct task *t = task_create(name, entry);
+
+    vm_map_at(t->pt, (uint64)__user_start, (uint64)__user_start,
+              (uint64)(__user_end - __user_start),
+              PTE_R | PTE_W | PTE_X | PTE_U, 0);
+
+    for (int i = 0; i < USTACK_PAGES; i++) {
+        uint64 va = USTACK_TOP - (uint64)(i + 1) * PGSIZE;
+        uint64 pa = vm_translate_in(t->pt, va);
+        vm_map_at(t->pt, va, pa, PGSIZE, PTE_R | PTE_W | PTE_U, 0);
+    }
+
+    t->ctx.status = SSTATUS_SPIE;      /* SPP = 0: sret lands in U-mode */
+    return t;
+}
+
 void schedule(void)
 {
     int start = current ? current->id : -1;
@@ -86,6 +110,26 @@ void syscall_dispatch(uint64 num)
     case SYS_PUTC:
         uart_putc((char)current->ctx.x[10]);
         break;
+    case SYS_ROUTE: {
+        /* The path lives in the caller's address space and the mount table
+           in the kernel's, so both ends need translating. Copy the string in
+           one byte at a time to avoid reading past the end of the caller's
+           buffer. */
+        char kpath[VFS_PATH_MAX];
+        uint64 va = current->ctx.x[10];
+        int i = 0;
+        for (; i < VFS_PATH_MAX - 1; i++) {
+            uint64 pa = vm_translate_in(current->pt, va + (uint64)i);
+            if (!pa)
+                break;
+            kpath[i] = *(char *)pa;
+            if (!kpath[i])
+                break;
+        }
+        kpath[i] = 0;
+        current->ctx.x[10] = (uint64)(long)vfs_route(kpath);
+        break;
+    }
     case SYS_PGDUMP: {
         /* Only the kernel can do this: it runs with the kernel table
            installed, which is the one address space that still reaches the

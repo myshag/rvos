@@ -15,7 +15,7 @@ enum task_state { T_UNUSED = 0, T_RUNNABLE, T_RUNNING, T_BLOCKED };
 
 struct namespace;   /* opaque here; defined in vfs.c */
 
-#define NTASK   8
+#define NTASK   10
 
 /* Every task's stack sits at the same virtual address but on different
    physical pages — which is the point: task A simply has no mapping for
@@ -47,6 +47,7 @@ extern struct task *current;
 extern struct task tasks[NTASK];   /* the table itself, so /proc can read it */
 
 struct task *task_create(const char *name, void (*entry)(void));
+struct task *task_create_user(const char *name, void (*entry)(void));
 void schedule(void);
 void scheduler_start(void) __attribute__((noreturn));
 void yield(void);                    /* voluntary reschedule */

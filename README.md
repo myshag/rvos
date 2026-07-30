@@ -62,6 +62,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/srv_null.c`   | the bit bucket, for binding over other paths |
 | `src/fat16.c`      | read-only FAT16 over a RAM-backed block device |
 | `src/uart.c`       | NS16550 driver + tiny `kprintf` |
+| `src/user.c`       | a **user-mode** program: syscalls and nothing else |
 | `src/kmain.c`      | boot, initial namespace, the demo shell |
 
 ## Design notes
@@ -76,6 +77,12 @@ which is how the sandbox in the demo is silenced without knowing it.
   spaces an address means nothing on the far side, so `send`/`recv` name a
   buffer and the kernel translates both ends and moves the bytes. That is
   why `vfs_req` carries an inline data area and reads arrive in chunks.
+- **User mode.** `user.c` is linked into its own page-aligned region and
+  mapped with the U bit, so it runs unprivileged. No trampoline page is
+  needed: the kernel image stays mapped in its address space *without* U,
+  which is enough for the trap vector to run (S-mode may touch U-less pages)
+  and enough to keep the program out (U-mode may not). Servers are still
+  S-mode tasks — moving them out is the remaining step.
 - **Scheduling** is preemptive round-robin driven by the Sstc timer; `ecall`
   provides `yield`, `send`, `recv`. Since servers spend their lives blocked in
   `recv`, most switching actually happens at IPC boundaries — the timer is
@@ -205,6 +212,28 @@ $ read *(char*)0x84000000  -- FAT16 image, mapped only into fs
 and `/proc/pagetable` still answer differently depending on who reads them —
 now for two independent reasons, the caller's namespace and its address space.
 
+Finally, a program running in user mode reaches the whole system through
+syscalls alone — and stops at the kernel's edge:
+
+```
+--- user program (U-mode) ------------------------------
+$ write(/dev/console)   -- namespace + IPC, all via syscalls
+  printed by the console server on our behalf
+
+$ cat /proc/tasks
+0  blocked  fs
+2  running  proc  (me)
+7  blocked  user
+...
+
+$ read *(char*)0x80000000   -- kernel text, mapped but U-less
+[trap] load page fault in task 'user'
+       scause=13  stval=0x80000000  sepc=0x8000128e
+```
+
+The faulting instruction is at `0x8000128e`, inside the user region; the
+address it reached for is kernel text. Same page table, one bit apart.
+
 ## Development stages (git history)
 
 1. boot + UART console
@@ -216,13 +245,14 @@ now for two independent reasons, the caller's namespace and its address space.
 7. per-task namespaces (`vfs_ns_clone`) + `/dev/null` module
 8. Sv39 paging: M-mode handover, page allocator, page tables, `/proc/pagetable`
 9. isolation: an address space per task, copying IPC, device ownership
+10. user mode: an unprivileged program reaching the system only via syscalls
 
 ## Next steps
 
-- user mode (U-bit mappings), so tasks cannot reach kernel pages either —
-  which means the servers stop being kernel C functions and become real
-  programs, reaching everything through syscalls
+- move the servers themselves into user mode, so the kernel is left with
+  scheduling, IPC and page tables and nothing else
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
+- a `virtio-blk` driver, replacing the RAM image with a real disk
 - a `virtio-blk` driver, replacing the RAM image with a real disk
 - FAT16 writes; subdirectory traversal
 - run under OpenSBI in supervisor mode

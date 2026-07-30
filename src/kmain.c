@@ -105,11 +105,15 @@ static void shell(void)
     sys_send(SANDBOX_TASK_ID, &m, (int)sizeof(m));
     sys_recv(&m, (int)sizeof(m));
 
-    sys_send(SNOOPER_TASK_ID, &m, (int)sizeof(m));   /* it never replies */
+    /* Neither of these replies: both are about to be stopped by the MMU. */
+    sys_send(SNOOPER_TASK_ID, &m, (int)sizeof(m));
+    sys_send(USER_TASK_ID,    &m, (int)sizeof(m));
 
     for (;;)
         yield();
 }
+
+void user_main(void);        /* user.c — runs with the U bit set */
 
 /* Always runnable, so the scheduler never runs out of candidates — without
    it, retiring a faulting task while everyone else is blocked left nothing to
@@ -129,6 +133,10 @@ void smain(void)
     kprintf("  stage 9: per-task address spaces\n");
     kprintf("=============================================\n");
 
+    /* The user region has its own bss, outside the range boot.S clears. */
+    extern char __ubss_start[], __ubss_end[];
+    memset(__ubss_start, 0, (size_t)(__ubss_end - __ubss_start));
+
     pmm_init();
     vm_init();
     kprintf("[boot] Sv39 on, kernel satp=0x%lx, %d pages free\n",
@@ -144,7 +152,8 @@ void smain(void)
     task_create("shell",   shell);                    /* 4 */
     task_create("sandbox", sandbox);                  /* 5 */
     task_create("snooper", snooper);                  /* 6 */
-    task_create("idle",    idle);                     /* 7 */
+    task_create_user("user", user_main);              /* 7 — U-mode */
+    task_create("idle",    idle);                     /* 8 */
 
     /* The disk goes into exactly one address space. Every other task holds no
        translation for it at all — which is what the snooper discovers. */
@@ -154,7 +163,7 @@ void smain(void)
     vfs_bind("/dev/",  CONSOLE_TASK_ID);
     vfs_bind("/proc/", PROC_TASK_ID);
 
-    kprintf("[boot] 4 servers, 3 apps + idle, %d pages left; scheduling.\n",
+    kprintf("[boot] 4 servers, 3 apps, 1 user program + idle, %d pages left.\n",
             pmm_free_count());
     scheduler_start();
 }

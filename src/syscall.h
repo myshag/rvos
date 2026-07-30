@@ -19,6 +19,11 @@ enum {
        no task maps those any more — so introspection had to become a kernel
        service the moment address spaces were separated. */
     SYS_PGDUMP = 4,
+    /* a0 = path -> server task id. Path resolution reads the caller's mount
+       table, which lives in kernel memory; a user-mode task cannot look at it
+       directly, so the namespace is reached through the kernel like anything
+       else. */
+    SYS_ROUTE  = 5,
 };
 
 static inline long _ecall1(long n, long a0)
@@ -59,6 +64,11 @@ static inline long _ecall4(long n, long a0, long a1, long a2, long a3)
 }
 
 static inline void sys_yield(void) { _ecall1(SYS_YIELD, 0); }
+
+static inline int sys_route(const char *path)
+{
+    return (int)_ecall1(SYS_ROUTE, (long)path);
+}
 
 /* Render one task's translation of `va` as text into our own buffer. */
 static inline int sys_pgdump(int task_id, unsigned long va, void *out, int cap)

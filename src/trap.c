@@ -56,7 +56,7 @@ void strap_handler(void)
         return;
     }
 
-    if (scause == EXC_ECALL_S) {
+    if (scause == EXC_ECALL_S || scause == EXC_ECALL_U) {
         current->ctx.epc += 4;          /* resume past the ecall */
         syscall_dispatch(current->ctx.x[17]);   /* a7 = syscall number */
         return;
