@@ -381,3 +381,7 @@ programs share their code but not their writable state.
 - a `virtio-blk` driver, replacing the RAM image with a real disk
 - FAT16 writes; subdirectory traversal
 - run under OpenSBI in supervisor mode
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).
