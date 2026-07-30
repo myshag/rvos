@@ -28,6 +28,7 @@ SECTIONS
         *srv_console.o(.text .text.*)
         *srv_fs.o(.text .text.*)
         *srv_proc.o(.text .text.*)
+        *loader.o(.text .text.*)
         *fat16.o(.text .text.*)
     }
     .urodata : {
@@ -37,6 +38,7 @@ SECTIONS
         *srv_console.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_fs.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_proc.o(.rodata .rodata.* .srodata .srodata.*)
+        *loader.o(.rodata .rodata.* .srodata .srodata.*)
         *fat16.o(.rodata .rodata.* .srodata .srodata.*)
     }
     . = ALIGN(4096);
@@ -59,6 +61,14 @@ SECTIONS
     }
     . = ALIGN(4096);
     __uproc_end = .;
+
+    /* private state: the ELF loader (its file buffer) */
+    __uload_start = .;
+    .uload : {
+        *loader.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(4096);
+    __uload_end = .;
 
     /* private state: everyone else (ulib, user.o) — usually empty */
     __umisc_start = .;

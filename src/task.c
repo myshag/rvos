@@ -9,6 +9,7 @@
 #include "vfs.h"
 #include "vm.h"
 #include "pmm.h"
+#include "elf.h"
 
 struct task tasks[NTASK];
 struct task *current;
@@ -46,6 +47,39 @@ struct task *task_create(const char *name, void (*entry)(void))
 }
 
 /* Round-robin: from the task after `current`, pick the next RUNNABLE one. */
+/* An address space with no program in it yet: kernel image mapped U-less for
+   the trap path, a private stack, and otherwise empty. It stays T_UNUSED —
+   not a candidate for the scheduler — until SYS_START gives it an entry
+   point. That is what lets a loader build it incrementally. */
+struct task *task_new_empty(const char *name)
+{
+    if (ntasks >= NTASK)
+        return 0;
+    struct task *t = &tasks[ntasks];
+
+    for (int i = 0; i < 32; i++)
+        t->ctx.x[i] = 0;
+    t->pt = vm_create_task_pt();
+    if (!t->pt)
+        return 0;
+    for (int i = 0; i < USTACK_PAGES; i++) {
+        void *p = pmm_alloc();
+        vm_map_at(t->pt, USTACK_TOP - (uint64)(i + 1) * PGSIZE,
+                  (uint64)p, PGSIZE, PTE_R | PTE_W | PTE_U, 0);
+    }
+    t->ctx.satp = MAKE_SATP(t->pt);
+    t->id       = ntasks;
+    int k = 0;
+    for (; k < 15 && name[k]; k++)
+        t->namebuf[k] = name[k];
+    t->namebuf[k] = 0;
+    t->name     = t->namebuf;      /* the caller's buffer will not outlive us */
+    t->ns       = vfs_root_ns();
+    t->state    = T_UNUSED;            /* not runnable until started */
+    ntasks++;
+    return t;
+}
+
 /* A task that runs with the U bit set. Same machinery, two differences: its
    pages carry PTE_U, and sstatus.SPP is left clear so sret drops to user
    mode. The kernel image stays mapped — the trap vector has to be reachable
@@ -190,6 +224,43 @@ void syscall_dispatch(uint64 num)
     case SYS_NSCLONE:
         current->ctx.x[10] = (uint64)(long)vfs_ns_clone();
         break;
+    /* ---- building another task, one segment at a time ---------------- */
+    case SYS_NEWTASK: {
+        char nm[16];
+        copy_string_in(current->ctx.x[10], nm, sizeof(nm));
+        struct task *t = task_new_empty(nm);
+        current->ctx.x[10] = t ? (uint64)t->id : (uint64)-1;
+        break;
+    }
+    case SYS_VMLOAD: {
+        int tid = (int)current->ctx.x[10];
+        struct vmload seg;
+        if (tid <= 0 || tid >= NTASK || tasks[tid].state != T_UNUSED ||
+            !tasks[tid].pt) {
+            current->ctx.x[10] = (uint64)-1;
+            break;
+        }
+        vm_copy_across(kernel_pagetable, (uint64)&seg,
+                       current->pt, current->ctx.x[11], sizeof(seg));
+        current->ctx.x[10] =
+            (uint64)(long)vm_load_segment(&tasks[tid], current->pt, &seg);
+        break;
+    }
+    case SYS_START: {
+        int tid = (int)current->ctx.x[10];
+        if (tid <= 0 || tid >= NTASK || tasks[tid].state != T_UNUSED ||
+            !tasks[tid].pt) {
+            current->ctx.x[10] = (uint64)-1;
+            break;
+        }
+        struct task *t = &tasks[tid];
+        t->ctx.epc    = current->ctx.x[11];
+        t->ctx.x[2]   = USTACK_TOP;
+        t->ctx.status = SSTATUS_SPIE;      /* SPP = 0: it starts in user mode */
+        t->state      = T_RUNNABLE;
+        current->ctx.x[10] = 0;
+        break;
+    }
     case SYS_PGDUMP: {
         /* Only the kernel can do this: it runs with the kernel table
            installed, which is the one address space that still reaches the

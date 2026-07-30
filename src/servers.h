@@ -11,7 +11,8 @@
 #define SNOOPER_TASK_ID 6
 #define USER_TASK_ID    7
 #define PEEKER_TASK_ID  8
-#define IDLE_TASK_ID    9
+#define LOADER_TASK_ID  9
+#define IDLE_TASK_ID    10
 
 void fs_server(void);        /* srv_fs.c      — FAT16 behind the interface */
 void console_server(void);   /* srv_console.c — UART behind the interface */

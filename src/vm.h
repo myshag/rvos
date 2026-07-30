@@ -23,5 +23,13 @@ uint64 vm_translate_in(pagetable_t pt, uint64 va);    /* in any table */
 int    vm_copy_across(pagetable_t dpt, uint64 dva,
                       pagetable_t spt, uint64 sva, uint64 len);
 
+/* Realise one program segment inside another task's address space: allocate
+   and map memsz bytes at va, copy filesz of them from the loader, leave the
+   rest zero. The kernel does not parse the file — it is handed the numbers
+   an ELF program header already contains. */
+struct vmload;
+struct task;
+int    vm_load_segment(struct task *t, pagetable_t src, const struct vmload *seg);
+
 int    vm_dump_walk(uint64 va, char *out, int cap);
 int    vm_dump_walk_in(pagetable_t pt, uint64 va, char *out, int cap);

@@ -18,6 +18,8 @@
 #include "pmm.h"
 #include "util.h"
 #include "uart.h"
+#include "elf.h"
+#include "task.h"
 
 pagetable_t kernel_pagetable;
 uint64      kernel_satp;
@@ -114,6 +116,34 @@ int vm_copy_across(pagetable_t dpt, uint64 dva,
         dva += n;
         len -= n;
     }
+    return 0;
+}
+
+int vm_load_segment(struct task *t, pagetable_t src, const struct vmload *seg)
+{
+    uint64 start = PGROUNDDOWN(seg->va);
+    uint64 end   = PGROUNDUP(seg->va + seg->memsz);
+    uint64 perm  = seg->perm & (PTE_R | PTE_W | PTE_X);
+    if (!perm)
+        perm = PTE_R;
+
+    for (uint64 a = start; a < end; a += PGSIZE) {
+        if (vm_translate_in(t->pt, a))
+            continue;                 /* adjacent segments may share a page */
+        void *p = pmm_alloc();        /* arrives zeroed, which is where .bss
+                                         comes from: memsz beyond filesz is
+                                         simply never written */
+        if (!p)
+            return -1;
+        if (vm_map_at(t->pt, a, (uint64)p, PGSIZE, perm | PTE_U, 0) < 0)
+            return -1;
+    }
+
+    /* The copy goes through physical addresses, so a read-only text segment
+       is writable at this moment and not afterwards. */
+    if (seg->filesz &&
+        vm_copy_across(t->pt, seg->va, src, seg->src, seg->filesz) < 0)
+        return -1;
     return 0;
 }
 

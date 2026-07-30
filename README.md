@@ -66,6 +66,8 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/uart.c`       | NS16550 driver + tiny `kprintf` |
 | `src/ulib.c`       | the user side's own libc (kernel's is unreachable) |
 | `src/user.c`       | user-mode demo programs |
+| `src/loader.c`     | **ELF loader** — user mode; the kernel never parses ELF |
+| `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
 | `src/kmain.c`      | boot, initial namespace, the demo shell |
 
 ## Design notes
@@ -145,6 +147,18 @@ at level 1 covers 2 MiB and one at level 2 covers 1 GiB, the unused VPN bits
 simply folding into the offset. Superpages are not a separate feature, just an
 early exit — `vm.c` uses 2 MiB leaves to cover RAM in 64 entries while mapping
 the UART with a 4 KiB leaf so one path exercises all three levels.
+
+### Two bugs worth keeping
+
+The second one cost the most time. `struct task` gained a field, and
+`make` rebuilt only the files that were edited — because the Makefile had no
+header dependencies. One stale object file went on believing the old layout,
+so it read `ns` where `namebuf` now lived. Every task's `namebuf` happened to
+be zeroed, and a null namespace fell back to the root one, so the system
+behaved perfectly — until a task was created whose name was not empty and the
+letters of `"hello"` became a pointer. The fix is `-MMD -MP`; the lesson is
+that a build that silently under-rebuilds produces bugs that look like memory
+corruption.
 
 ### A bug worth keeping
 
@@ -270,19 +284,57 @@ $ read the fs server's private data region
 10. user mode: an unprivileged program reaching the system only via syscalls
 11. the servers themselves move to user mode; the kernel keeps only
     scheduling, IPC and page tables
+12. an ELF loader in user space, and a program loaded from the filesystem
+
+## Loading a program
+
+`prog/hello.c` is compiled and linked on its own, at a fixed address, and
+copied onto the FAT16 volume as `/HELLO.ELF`. Nothing about it is known when
+the kernel is built.
+
+The loader is a user program. It reads the file through the ordinary
+filesystem interface, parses the program headers itself, and then asks the
+kernel for the three things it cannot do unprivileged:
+
+| syscall | what it does |
+|---------|--------------|
+| `SYS_NEWTASK` | an empty address space — kernel image for the trap path, a stack, nothing else |
+| `SYS_VMLOAD`  | one `PT_LOAD` segment: map `memsz` bytes at `p_vaddr`, copy `filesz` of them, leave the rest zero |
+| `SYS_START`   | set the entry point and make it runnable |
+
+The kernel is never told what ELF is; it is handed the numbers a program
+header already contains. `.bss` costs nothing to implement — pages arrive
+zeroed from the allocator, so `memsz` beyond `filesz` is simply never written.
+The fixed link address means no relocation and no position-independent code.
+
+```
+$ exec /HELLO.ELF
+  read 5320 bytes from the fs server
+  entry 0x20000000, program headers: 2
+  new address space for task 11
+  segment -> 0x20000000 filesz 784 memsz 784 r-x
+  started
+
+  [hello] loaded from /HELLO.ELF into a fresh address space
+  [hello] nothing here was linked into the kernel
+  [hello] talking to the console server over IPC
+  [hello] first bytes of /README.TXT via the fs server:
+    rvos readme ...
+```
+
+The loaded program is a first-class citizen: the namespace and the servers
+work for it exactly as for anything else.
+
+The three syscalls are deliberately unguarded — any task may build another.
+That is the one place this system is obviously not production-shaped; a real
+design puts a capability in front of exactly these.
 
 ## Next steps
 
-- **an executable format.** There isn't one: kernel, servers and user
-  programs are all a single statically linked ELF that QEMU loads, and a
-  "program" is a function reached by `task_create_user`, separated by linker
-  sections rather than loaded from anywhere. Real programs need an ELF parser,
-  an `exec` that builds an address space from a file's segments, and either
-  relocation or position-independent code. The pieces it would build on —
-  per-task page tables, cross-space copying, a filesystem server that reads
-  files — are already here.
+- capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
 - a `virtio-blk` driver, replacing the RAM image with a real disk
+- `argv`/`envp`, and a shell that execs what you type
 - a `virtio-blk` driver, replacing the RAM image with a real disk
 - FAT16 writes; subdirectory traversal
 - run under OpenSBI in supervisor mode

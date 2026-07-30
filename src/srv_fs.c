@@ -11,8 +11,9 @@
 #include "syscall.h"
 #include "ulib.h"
 
-#define FS_MAXFD  4
-#define FS_BUFSZ  700
+#define FS_MAXFD  3
+/* Large enough for a small executable: the loader reads whole ELF files. */
+#define FS_BUFSZ  8192
 
 struct fs_file {
     int    used;

@@ -33,6 +33,17 @@ enum {
     /* Namespace mutation: also kernel-side per-task state. */
     SYS_BIND     = 9,  /* a0 = prefix, a1 = server task id */
     SYS_NSCLONE  = 10,
+    /* Loading a program. Three primitives, matched to what an ELF program
+       header actually says, so the loader can live in user space and the
+       kernel need never learn what ELF is:
+         NEWTASK  make an empty address space              -> task id
+         VMLOAD   turn one PT_LOAD segment into pages
+         START    set the entry point and let it run
+       They are deliberately unguarded — any task may build another. Real
+       systems put a capability in front of exactly these. */
+    SYS_NEWTASK = 11,  /* a0 = name -> task id, or -1 */
+    SYS_VMLOAD  = 12,  /* a0 = task id, a1 = struct vmload* -> 0 / -1 */
+    SYS_START   = 13,  /* a0 = task id, a1 = entry va -> 0 / -1 */
 };
 
 struct taskinfo {
@@ -100,6 +111,19 @@ static inline int sys_bind(const char *prefix, int server_task)
 static inline int sys_nsclone(void)
 {
     return (int)_ecall1(SYS_NSCLONE, 0);
+}
+
+static inline int sys_newtask(const char *name)
+{
+    return (int)_ecall1(SYS_NEWTASK, (long)name);
+}
+static inline int sys_vmload(int tid, const void *seg)
+{
+    return (int)_ecall2(SYS_VMLOAD, tid, (long)seg);
+}
+static inline int sys_start(int tid, unsigned long entry)
+{
+    return (int)_ecall2(SYS_START, tid, (long)entry);
 }
 
 static inline int sys_route(const char *path)
