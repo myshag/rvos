@@ -34,6 +34,13 @@ void uart_puts(const char *s)
         uart_putc(*s++);
 }
 
+int uart_tryc(void)
+{
+    if (!(REG(LSR) & LSR_DR))
+        return -1;
+    return (unsigned char)REG(RBR);
+}
+
 static void print_uint(unsigned long v, unsigned base, int width_neg)
 {
     char buf[32];
