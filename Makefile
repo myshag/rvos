@@ -21,7 +21,7 @@ ELF     := $(BUILD)/kernel.elf
 
 # FAT16 RAM-disk image, loaded into guest memory (see fs stage).
 DISK    := $(BUILD)/fat16.img
-DISK_ADDR := 0x88000000
+DISK_ADDR := 0x84000000
 QFLAGS  := -machine virt -bios none -nographic -kernel $(ELF)
 
 .PHONY: all run rundisk disk clean
