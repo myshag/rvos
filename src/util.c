@@ -45,3 +45,28 @@ char *strcpy(char *dst, const char *src)
         ;
     return r;
 }
+
+int utoa(unsigned long v, char *out)
+{
+    char tmp[24];
+    int n = 0;
+    if (v == 0)
+        tmp[n++] = '0';
+    while (v) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    for (int i = 0; i < n; i++)
+        out[i] = tmp[n - 1 - i];
+    return n;
+}
+
+int str_has_prefix(const char *s, const char *p)
+{
+    while (*p) {
+        if (*s != *p)
+            return 0;
+        s++; p++;
+    }
+    return 1;
+}

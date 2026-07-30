@@ -30,6 +30,7 @@ struct task {
 };
 
 extern struct task *current;
+extern struct task tasks[NTASK];   /* the table itself, so /proc can read it */
 
 struct task *task_create(const char *name, void (*entry)(void));
 void schedule(void);

@@ -10,17 +10,17 @@
 
    Crucially this is NOT a kernel syscall set — the kernel only provides
    send/recv/yield (see syscall.h). open/read/write/ioctl/close is a userspace
-   *protocol*: a shared struct + a routing convention that any two tasks can
-   speak on top of that raw IPC. That's the microkernel discipline: the kernel
-   stays minimal; the interface is a library, not a privileged primitive.
-   Adding a new module (a pipe, a network socket, a /proc) never touches the
-   kernel — it's just another task that answers vfs_req the same way. */
+   *protocol*: a shared struct plus a namespace, which any two tasks can speak
+   on top of that raw IPC. That's the microkernel discipline: the kernel stays
+   minimal; the interface is a library, not a privileged primitive. Adding a
+   module (a pipe, a socket, /proc) never touches the kernel — it's just
+   another task answering vfs_req, bound into the namespace at runtime. */
 
 enum { VFS_OPEN = 1, VFS_READ, VFS_WRITE, VFS_IOCTL, VFS_CLOSE };
 
-/* One generic ioctl so far: read a file's size without slurping its bytes.
-   arg is a uint32* the server writes into. More commands (seek, stat, tty
-   settings, ...) plug into the same op without changing the transport. */
+/* Generic ioctls. IOCTL_GETSIZE reads a file's size without slurping bytes;
+   arg is a uint32* the server writes into. New commands plug in here without
+   changing the transport. */
 enum { IOCTL_GETSIZE = 1 };
 
 #define VFS_PATH_MAX 32
@@ -36,26 +36,22 @@ struct vfs_req {
     int    result;              /* OUT: bytes moved / local fd / 0 / -1 */
 };
 
-/* ---- static namespace: which server task owns which path prefix ----
-   A real Plan 9 gives each process its own dynamically bound namespace
-   (bind/mount); this teaching kernel has exactly two servers, so a fixed
-   prefix table is enough. Growing this into per-task, mutable bindings is
-   the natural next step once there's more than one filesystem. */
-#define FS_TASK_ID      0
-#define CONSOLE_TASK_ID 1
+/* ---- namespace (vfs.c) ----------------------------------------------
+   Paths are resolved through a mount table, not hardcoded prefixes: bind a
+   prefix to a server task at runtime and that subtree is served by it, with
+   longest-prefix wins. This is the Plan 9 idea that a namespace is data, not
+   policy baked into the kernel — /proc below is bound while the system is
+   already running, and nothing in the kernel changes. */
+#define VFS_PREFIX_MAX 16
+#define VFS_NMOUNT     8
 
-static inline int vfs_route(const char *path)
-{
-    static const char dev[] = "/dev/";
-    int i = 0;
-    for (; dev[i]; i++)
-        if (path[i] != dev[i])
-            return FS_TASK_ID;
-    return CONSOLE_TASK_ID;
-}
+int vfs_bind(const char *prefix, int server_task);  /* 0 ok, -1 table full */
+int vfs_route(const char *path);                    /* server id, -1 unbound */
+int vfs_dump_mounts(char *out, int cap);            /* render table as text */
 
-/* Client-visible fd packs which server owns it with that server's local fd,
-   so read/write/ioctl/close never need to re-resolve the path. */
+/* ---- client side ----------------------------------------------------
+   A client fd packs which server owns it together with that server's local
+   fd, so read/write/ioctl/close never have to re-resolve the path. */
 static inline int vfs_call(int dst, struct vfs_req *r)
 {
     uint64 ack;
@@ -67,6 +63,8 @@ static inline int vfs_call(int dst, struct vfs_req *r)
 static inline int vfs_open(const char *path)
 {
     int srv = vfs_route(path);
+    if (srv < 0)
+        return -1;                      /* nothing bound over this path */
     struct vfs_req r;
     r.op = VFS_OPEN;
     strcpy(r.path, path);
