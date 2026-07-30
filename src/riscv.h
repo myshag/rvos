@@ -29,6 +29,7 @@ typedef unsigned char  uint8;
 /* ---- cause codes ----------------------------------------------------- */
 #define CAUSE_INT           (1UL << 63)
 #define IRQ_S_TIMER         5
+#define IRQ_S_EXTERNAL      9        /* a device, routed through the PLIC */
 #define EXC_ECALL_U         8        /* environment call from U-mode */
 #define EXC_ECALL_S         9        /* environment call from S-mode */
 #define EXC_INST_PAGE_FAULT 12
@@ -78,6 +79,10 @@ typedef uint64 *pagetable_t;
 #define CLINT_MTIMECMP(h) (CLINT_BASE + 0x4000 + 8 * (h))
 #define CLINT_MTIME       (CLINT_BASE + 0xBFF8)
 #define UART_BASE_PA      0x10000000UL
+#define PLIC_BASE_PA      0x0c000000UL
+#define PLIC_SIZE         0x400000UL
+#define UART0_IRQ         10         /* fixed by the 'virt' board */
+#define VIRTIO_IRQ_BASE   1          /* virtio-mmio slots use 1..8 */
 
 /* Where every task's stack sits. Part of the ABI, not a kernel secret: a
    user program may ask about its own stack. */

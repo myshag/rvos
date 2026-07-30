@@ -276,6 +276,10 @@ void vm_init(void)
     vm_map_at(kernel_pagetable, CLINT_BASE, CLINT_BASE, 0x10000,
               PTE_R | PTE_W, 0);
 
+    /* PLIC: the kernel claims and completes here on every device interrupt. */
+    vm_map_at(kernel_pagetable, PLIC_BASE_PA, PLIC_BASE_PA, PLIC_SIZE,
+              PTE_R | PTE_W, 0);
+
     kernel_satp = MAKE_SATP(kernel_pagetable);
     w_satp(kernel_satp);
     sfence_vma();               /* from here on every address is translated */
@@ -305,5 +309,8 @@ pagetable_t vm_create_task_pt(void)
               PTE_R | PTE_W | PTE_X, 0);
     vm_map_at(pt, UART_BASE_PA, UART_BASE_PA, PGSIZE, PTE_R | PTE_W, 0);
     vm_map_at(pt, CLINT_BASE, CLINT_BASE, 0x10000, PTE_R | PTE_W, 0);
+    /* U-less, like the rest of the kernel's world: the trap handler reaches
+       the PLIC while running in this address space, the task never can. */
+    vm_map_at(pt, PLIC_BASE_PA, PLIC_BASE_PA, PLIC_SIZE, PTE_R | PTE_W, 0);
     return pt;
 }

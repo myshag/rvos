@@ -53,7 +53,8 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/vm.c`         | **Sv39**: the three-level walk, mapping, superpages, per-task spaces |
 | `src/entry.S`      | supervisor-mode trap save/restore (full integer context) |
 | `src/kernel.ld`    | link at `0x80000000`, boot stack |
-| `src/trap.c`       | timer setup, trap/`ecall` dispatch |
+| `src/trap.c`       | timer setup, trap/`ecall` dispatch, interrupt ownership |
+| `src/plic.c`       | the interrupt controller — how a device reaches the kernel |
 | `src/task.c`       | task table, preemptive round-robin scheduler, syscalls |
 | `src/ipc.c`        | synchronous rendezvous `send`/`recv` |
 | `src/vfs.h`        | **the one interface** + client wrappers |
@@ -294,6 +295,7 @@ $ read the fs server's private data region
     scheduling, IPC and page tables
 12. an ELF loader in user space, and a program loaded from the filesystem
 13. reclaiming a dead task's memory, argv, and a shell that runs what you type
+14. the PLIC, and interrupts delivered to a user-mode driver
 
 ## Loading a program
 
@@ -372,8 +374,33 @@ the line, and calls `spawn()` — the same function the boot-time loader uses,
 living in the shared user text. Its scratch buffer is its own, because user
 programs share their code but not their writable state.
 
+## Interrupts
+
+Only the kernel can take a trap, but the drivers live in user space, so an
+interrupt has to be handed across that boundary. The split is:
+
+- the kernel claims the interrupt from the PLIC and looks up whoever
+  registered for it (`SYS_IRQ_REG`). It does **not** touch the device — it has
+  no idea what the device is;
+- it leaves the source masked, which is the back-pressure that stops an
+  interrupt storm while a user-mode driver is merely *runnable*;
+- the driver learns of it through its ordinary `sys_recv` loop: the kernel
+  reports `IRQ_SENDER` instead of a task id, so one blocking primitive serves
+  both messages and interrupts;
+- the driver reads the device itself and calls `SYS_IRQ_ACK`, which completes
+  at the PLIC and unmasks.
+
+The console server uses this: keystrokes arrive on IRQ 10, are drained into a
+ring buffer, and `read()` serves from there. The PLIC's register map is
+per *context* — a (hart, privilege) pair, where hart 0 supervisor mode is
+context 1 — and using the machine-mode context by mistake yields a controller
+that looks configured and delivers nothing.
+
 ## Next steps
 
+- a blocking `read()` on the console, so the shell stops polling the driver
+  (the driver is interrupt-driven now; its client is not)
+- a virtio-net driver, which is what the interrupt and DMA work is for
 - capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
 - a `virtio-blk` driver, replacing the RAM image with a real disk

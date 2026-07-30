@@ -38,6 +38,7 @@ struct task {
     uint64 recv_va;             /* blocked receiver: where it wants one */
     int    recv_len;
     int    waiting_recv;        /* 1 => blocked in recv (vs. blocked in send) */
+    int    irq_pending;         /* a device it drives fired while it was busy */
     struct task *wait_sender;   /* head of senders blocked on us as receiver */
     struct task *send_next;     /* intrusive link within that sender queue */
 };
@@ -54,6 +55,10 @@ void schedule(void);
 void scheduler_start(void) __attribute__((noreturn));
 void yield(void);                    /* voluntary reschedule */
 void syscall_dispatch(uint64 num);   /* called from trap.c on ecall */
+
+/* interrupt ownership (trap.c) */
+int irq_register(int irq, struct task *t);
+int irq_ack(int irq);
 
 /* trap / timer bring-up (trap.c) */
 void trap_init(void);

@@ -16,6 +16,7 @@
 #include "servers.h"
 #include "pmm.h"
 #include "vm.h"
+#include "plic.h"
 #include "util.h"
 
 /* Read a whole file through the interface. It arrives in VFS_DATA_MAX-sized
@@ -150,6 +151,9 @@ void smain(void)
 
     trap_init();
     timer_init();
+    plic_init();
+    plic_init_hart();
+    kprintf("[boot] PLIC up; UART irq %d routed to S-mode\n", UART0_IRQ);
 
     extern char __ufs_start[], __ufs_end[];
     extern char __uproc_start[], __uproc_end[];

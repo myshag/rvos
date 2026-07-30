@@ -45,7 +45,18 @@ enum {
     SYS_VMLOAD  = 12,  /* a0 = task id, a1 = struct vmload* -> 0 / -1 */
     SYS_START   = 13,  /* a0 = task id, a1 = struct startinfo* -> 0 / -1 */
     SYS_EXIT    = 14,  /* never returns; frees this task's memory */
+    /* Interrupt handling for user-mode drivers. The kernel is the only thing
+       that can take a trap, so it claims the interrupt, leaves the source
+       masked and tells the owner; the driver touches the device itself and
+       acks, which unmasks. The kernel never learns what the device is. */
+    SYS_IRQ_REG = 15,  /* a0 = irq — this task becomes its driver */
+    SYS_IRQ_ACK = 16,  /* a0 = irq — handled; let it fire again */
 };
+
+/* sys_recv() returns this instead of a task id when what arrived was an
+   interrupt rather than a message. A driver's receive loop then handles both
+   without needing a second blocking primitive. */
+#define IRQ_SENDER (-2)
 
 struct taskinfo {
     int  id;
@@ -125,6 +136,15 @@ static inline int sys_vmload(int tid, const void *seg)
 static inline int sys_start(int tid, const void *startinfo)
 {
     return (int)_ecall2(SYS_START, tid, (long)startinfo);
+}
+
+static inline int sys_irq_register(int irq)
+{
+    return (int)_ecall1(SYS_IRQ_REG, irq);
+}
+static inline int sys_irq_ack(int irq)
+{
+    return (int)_ecall1(SYS_IRQ_ACK, irq);
 }
 
 static inline void sys_exit(void)

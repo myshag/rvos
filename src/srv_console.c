@@ -32,13 +32,50 @@ static int con_tryc(void)
     return (int)UART[UART_RBR];
 }
 
+/* Keystrokes arrive on an interrupt and are parked here until somebody
+   read()s them. Without this the data would be lost: the interrupt must be
+   serviced promptly, but the reader may not have asked yet. */
+#define RING 256
+static char ring[RING];
+static int  rhead, rtail;
+
+static void ring_put(char c)
+{
+    int next = (rhead + 1) % RING;
+    if (next != rtail) {          /* drop on overflow rather than overwrite */
+        ring[rhead] = c;
+        rhead = next;
+    }
+}
+
+static int ring_get(void)
+{
+    if (rtail == rhead)
+        return -1;
+    int c = (unsigned char)ring[rtail];
+    rtail = (rtail + 1) % RING;
+    return c;
+}
+
 void console_server(void)
 {
-    uputs("  [console] up (user mode), driving the UART directly\n");
+    uputs("  [console] up (user mode), UART driven by interrupts\n");
+    sys_irq_register(UART0_IRQ);
 
     for (;;) {
         struct vfs_req req;
         int from = sys_recv(&req, (int)sizeof(req));
+
+        /* The same receive loop takes both client requests and interrupts;
+           the kernel distinguishes them by the sender it reports. */
+        if (from == IRQ_SENDER) {
+            int c;
+            while ((c = con_tryc()) >= 0)   /* drain: the FIFO may hold several */
+                ring_put((char)c);
+            sys_irq_ack(UART0_IRQ);
+            continue;
+        }
+
         struct vfs_req *r = &req;
         switch (r->op) {
         case VFS_OPEN:
@@ -51,7 +88,7 @@ void console_server(void)
             break;
         }
         case VFS_READ: {
-            int c = con_tryc();                 /* non-blocking */
+            int c = ring_get();                 /* non-blocking */
             if (c < 0) {
                 r->result = 0;
             } else {

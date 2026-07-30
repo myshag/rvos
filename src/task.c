@@ -254,6 +254,13 @@ void syscall_dispatch(uint64 num)
         current->ctx.x[10] = (uint64)(long)vfs_ns_clone();
         break;
     /* ---- building another task, one segment at a time ---------------- */
+    case SYS_IRQ_REG:
+        current->ctx.x[10] =
+            (uint64)(long)irq_register((int)current->ctx.x[10], current);
+        break;
+    case SYS_IRQ_ACK:
+        current->ctx.x[10] = (uint64)(long)irq_ack((int)current->ctx.x[10]);
+        break;
     case SYS_EXIT:
         task_retire(current);
         schedule();

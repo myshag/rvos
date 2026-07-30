@@ -93,6 +93,14 @@ static void ipc_recv(void)
     uint64 rva  = A0(current);
     int    rlen = (int)A1(current);
 
+    /* An interrupt that arrived while we were busy outranks queued messages:
+       the device is masked until it is acked. */
+    if (current->irq_pending) {
+        current->irq_pending = 0;
+        A0(current) = (uint64)(long)IRQ_SENDER;
+        return;
+    }
+
     struct task *s = dequeue_sender(current);
     if (s) {
         /* A sender was already parked: complete the rendezvous now. */

@@ -14,7 +14,7 @@ enum {
 
 void uart_init(void)
 {
-    REG(IER) = 0x00;         /* no interrupts (polled) */
+    REG(IER) = 0x01;         /* interrupt when a byte arrives (TX stays polled) */
     REG(LCR) = 0x03;         /* 8N1 */
     REG(FCR) = 0x01;         /* enable FIFO */
 }
