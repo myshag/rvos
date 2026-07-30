@@ -18,22 +18,26 @@
 
 enum { VFS_OPEN = 1, VFS_READ, VFS_WRITE, VFS_IOCTL, VFS_CLOSE };
 
-/* Generic ioctls. IOCTL_GETSIZE reads a file's size without slurping bytes;
-   arg is a uint32* the server writes into. New commands plug in here without
-   changing the transport. */
-enum { IOCTL_GETSIZE = 1 };
+/* Generic ioctls. IOCTL_GETSIZE reports a file's size without slurping its
+   bytes. New commands plug in here without changing the transport. */
+enum { IOCTL_GETSIZE = 1 };   /* answer comes back in `result` */
 
 #define VFS_PATH_MAX 32
+#define VFS_DATA_MAX 512
 
+/* The whole request travels by value. It used to carry a `void *buf` into
+   the caller's memory, which worked only while every task shared one address
+   space; with per-task page tables that pointer is meaningless on the far
+   side, so payloads now ride inline and the kernel copies the struct across.
+   The cost of isolation, made visible: reads are chunked to VFS_DATA_MAX. */
 struct vfs_req {
     int    op;
     int    fd;                  /* IN: server-local fd, for read/write/ioctl/close */
     char   path[VFS_PATH_MAX];  /* IN: for open */
-    void  *buf;                 /* IN: read dest / write src */
-    int    len;                 /* IN: requested length */
+    int    len;                 /* IN: bytes requested / supplied */
     unsigned long ioctl_cmd;
-    unsigned long ioctl_arg;    /* meaning depends on ioctl_cmd */
-    int    result;              /* OUT: bytes moved / local fd / 0 / -1 */
+    int    result;              /* OUT: bytes moved / local fd / size / -1 */
+    char   data[VFS_DATA_MAX];  /* IN for write, OUT for read */
 };
 
 /* ---- namespace (vfs.c) ----------------------------------------------
@@ -61,11 +65,12 @@ struct namespace *vfs_root_ns(void);
 /* ---- client side ----------------------------------------------------
    A client fd packs which server owns it together with that server's local
    fd, so read/write/ioctl/close never have to re-resolve the path. */
+/* Request out, reply back into the same struct: the server works on its own
+   copy, so the answer has to be shipped home explicitly. */
 static inline int vfs_call(int dst, struct vfs_req *r)
 {
-    uint64 ack;
-    sys_send(dst, (uint64)r);
-    sys_recv(&ack);
+    sys_send(dst, r, (int)sizeof(*r));
+    sys_recv(r, (int)sizeof(*r));
     return r->result;
 }
 
@@ -85,21 +90,31 @@ static inline int vfs_open(const char *path)
 static inline int vfs_read(int fd, void *buf, int len)
 {
     struct vfs_req r;
-    r.op = VFS_READ; r.fd = fd & 0xffff; r.buf = buf; r.len = len;
-    return vfs_call(fd >> 16, &r);
+    if (len > VFS_DATA_MAX)
+        len = VFS_DATA_MAX;
+    r.op = VFS_READ; r.fd = fd & 0xffff; r.len = len;
+    int n = vfs_call(fd >> 16, &r);
+    if (n > 0)
+        memcpy(buf, r.data, (size_t)n);
+    return n;
 }
 
 static inline int vfs_write(int fd, const void *buf, int len)
 {
     struct vfs_req r;
-    r.op = VFS_WRITE; r.fd = fd & 0xffff; r.buf = (void *)buf; r.len = len;
+    if (len > VFS_DATA_MAX)
+        len = VFS_DATA_MAX;
+    r.op = VFS_WRITE; r.fd = fd & 0xffff; r.len = len;
+    memcpy(r.data, buf, (size_t)len);
     return vfs_call(fd >> 16, &r);
 }
 
-static inline int vfs_ioctl(int fd, unsigned long cmd, unsigned long arg)
+/* No out-pointer any more: whatever the command yields comes home in
+   `result`, because an address would not survive the trip. */
+static inline int vfs_ioctl(int fd, unsigned long cmd)
 {
     struct vfs_req r;
-    r.op = VFS_IOCTL; r.fd = fd & 0xffff; r.ioctl_cmd = cmd; r.ioctl_arg = arg;
+    r.op = VFS_IOCTL; r.fd = fd & 0xffff; r.ioctl_cmd = cmd;
     return vfs_call(fd >> 16, &r);
 }
 

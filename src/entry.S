@@ -52,6 +52,15 @@ _strap:
     sd      t5, 264(t6)
 
     la      sp, _trap_stack_top
+
+    # Install the kernel address space. The handler has to reach physical
+    # memory belonging to *other* tasks (to copy IPC payloads across), and
+    # the task's own table deliberately maps none of it.
+    la      t0, kernel_satp
+    ld      t0, 0(t0)
+    csrw    satp, t0
+    sfence.vma zero, zero
+
     call    strap_handler
     # fall through to restore whatever `current` now is
 
@@ -59,6 +68,13 @@ _strap:
 _ret_to_task:
     la      t6, current
     ld      t6, 0(t6)               # t6 = current == &current->ctx (offset 0)
+
+    # Switch into the task's address space. Safe to keep executing: kernel
+    # text and the task table itself are mapped in every task's space.
+    ld      t5, 272(t6)             # ctx.satp
+    csrw    satp, t5
+    sfence.vma zero, zero
+
     csrw    sscratch, t6
 
     ld      t5, 264(t6)

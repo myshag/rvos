@@ -11,12 +11,17 @@ SECTIONS
         *(.text .text.*)
     }
 
-    .rodata : { *(.rodata .rodata.*) }
-    .data   : { *(.data .data.*) }
+    /* The small-data sections matter: RISC-V GCC puts small objects in
+       .sdata/.sbss, and if they are not collected here they land past _end —
+       outside the kernel range each task's page table maps, which faults the
+       moment a trap touches one. */
+    .rodata : { *(.rodata .rodata.*) *(.srodata .srodata.*) }
+    .data   : { *(.data .data.*) *(.sdata .sdata.*) }
 
     . = ALIGN(8);
     .bss : {
         __bss_start = .;
+        *(.sbss .sbss.*)
         *(.bss .bss.*)
         *(COMMON)
         . = ALIGN(8);

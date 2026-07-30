@@ -48,7 +48,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/boot.S`       | reset entry: park secondary harts, clear bss, call `mstart` |
 | `src/mstart.c`     | the only M-mode code: delegation, PMP, Sstc, `mret` to S-mode |
 | `src/pmm.c`        | physical page allocator (free list threaded through the pages) |
-| `src/vm.c`         | **Sv39**: the three-level walk, mapping, superpages |
+| `src/vm.c`         | **Sv39**: the three-level walk, mapping, superpages, per-task spaces |
 | `src/entry.S`      | supervisor-mode trap save/restore (full integer context) |
 | `src/kernel.ld`    | link at `0x80000000`, boot stack |
 | `src/trap.c`       | timer setup, trap/`ecall` dispatch |
@@ -66,17 +66,20 @@ which is how the sandbox in the demo is silenced without knowing it.
 
 ## Design notes
 
-- **Supervisor mode with Sv39 paging.** The kernel identity-maps itself, so
-  tasks still share one address space and cooperate by message passing; this
-  is *microkernel-style* in structure, and paging currently buys protection
-  (page permissions are enforced) rather than isolation. Giving each task its
-  own page table is the next step, and it forces the IPC redesign noted below.
+- **One address space per task.** Each task owns an Sv39 page table holding
+  the kernel image and the console — kernel code has to run when a trap lands
+  — plus a private stack, and nothing else. The free-page arena is mapped
+  nowhere, so no task holds a translation for another's memory. The FAT16
+  image is mapped into the filesystem server alone, which turns "only fs
+  touches the disk" from a convention into something the MMU enforces.
+- **IPC copies.** A message used to be a pointer; with separate address
+  spaces an address means nothing on the far side, so `send`/`recv` name a
+  buffer and the kernel translates both ends and moves the bytes. That is
+  why `vfs_req` carries an inline data area and reads arrive in chunks.
 - **Scheduling** is preemptive round-robin driven by the Sstc timer; `ecall`
   provides `yield`, `send`, `recv`. Since servers spend their lives blocked in
   `recv`, most switching actually happens at IPC boundaries — the timer is
   there so a CPU-bound task can't wedge the system.
-- **IPC** carries one machine word; larger payloads pass a pointer to a shared
-  request struct (safe only because there is no address-space isolation yet).
 - **Namespace** is data, not policy, and it belongs to a *task*:
   `vfs_bind(prefix, task)` works on a running system, `vfs_ns_clone()` gives
   the caller a private copy to diverge (Plan 9's `rfork(RFNAMEG)`), and
@@ -124,6 +127,16 @@ simply folding into the offset. Superpages are not a separate feature, just an
 early exit — `vm.c` uses 2 MiB leaves to cover RAM in 64 entries while mapping
 the UART with a 4 KiB leaf so one path exercises all three levels.
 
+### A bug worth keeping
+
+Isolation immediately exposed a latent linker-script bug. RISC-V GCC puts
+small objects in `.sdata`/`.sbss`, and the script collected only `.bss` and
+`COMMON` — so `.sbss` (holding `current`, among others) landed *past* `_end`.
+While all of RAM was identity-mapped that was invisible. The moment a task's
+page table stopped at `PGROUNDUP(_end)`, the first trap tried to load
+`current`, faulted, and refaulted forever. Narrowing what is mapped is what
+made the mistake observable.
+
 ### Why this forced the kernel into S-mode
 
 Paging does not exist in machine mode: `satp` is ignored there and every
@@ -155,74 +168,42 @@ Exit QEMU with `Ctrl-A` then `X`.
 
 ## What you'll see
 
-Two tasks run the *same* call against the *same* path and reach different
-modules, because one of them rebound that path in its own namespace:
+Two tasks run the *same* call on the *same* path and reach different modules,
+because one rebound that path in its own namespace; and the identical stack
+address in each resolves to a different physical page, because each has its
+own address space.
 
 ```
---- shell (task 4) ------------------------------------
-$ cat /proc/mounts          -- shell's view
-/ -> task 0
-/dev/ -> task 1
-/proc/ -> task 2
+$ cat /proc/pagetable  -- shell's own space          $ ... -- sandbox's
+task 4 root table 0x82fce000                         task 5 root table 0x82fc3000
 
-$ write(/dev/console, "...")
-  visible: routed to the console module
-
---- sandbox (task 5) ----------------------------------
-$ vfs_ns_clone()            -- take a private namespace
-$ bind /dev/console -> null (task 3)
-
-$ cat /proc/mounts          -- sandbox's own view
-/ -> task 0
-/dev/ -> task 1
-/proc/ -> task 2
-/dev/console -> task 3
-
-$ write(/dev/console, "...")  -- identical call to the shell's
-  (nothing printed: the path now reaches null)
-
---- back in the shell ----------------------------------
-  still visible: the shell's namespace was never touched
+its stack:                                           its stack:
+va 0x2ffff000                                        va 0x2ffff000
+  L2 idx 0   -> table 0x82fcb000                       L2 idx 0   -> table 0x82fc0000
+  L1 idx 383 -> table 0x82fc7000                       L1 idx 383 -> table 0x82fbc000
+  L0 idx 511 leaf rw-- pa 0x82fc8000                   L0 idx 511 leaf rw-- pa 0x82fbd000
 ```
 
-Note that `/proc/mounts` is one path returning different text to different
-readers — the namespace it reports is the caller's, not a global one.
-`/proc/tasks` is likewise a live snapshot of the scheduler:
+Same virtual address, different physical page. And a module's memory really
+does belong to it — the FAT16 image is mapped only into the filesystem
+server, so anyone else reaching for it is stopped by the hardware:
 
 ```
-0  blocked  fs
-1  blocked  console
-2  running  proc  (me)
-3  blocked  null
-4  blocked  shell
-5  runnable sandbox
+the FAT16 image:
+va 0x84000000
+  L2 idx 2   pte 0x20bf3401  -> table 0x82fcd000
+  L1 idx 32  pte 0x0  invalid -> unmapped
+
+--- snooper (task 6) ----------------------------------
+$ read *(char*)0x84000000  -- FAT16 image, mapped only into fs
+[trap] load page fault in task 'snooper'
+       scause=13  stval=0x84000000  sepc=0x80000764
+       -> the MMU refused it; retiring the task
 ```
 
-The proc server is running because it is serving the request; the shell is
-blocked because it is waiting for the reply — rendezvous IPC, read as a file.
-
-`/proc/pagetable` walks live translations. The UART takes all three levels;
-a kernel address stops at level 1 because a 2 MiB superpage covers it:
-
-```
-va 0x10000000
-  L2 idx 0   pte 0x20bff401  -> table 0x82ffd000
-  L1 idx 128 pte 0x20bff001  -> table 0x82ffc000
-  L0 idx 0   pte 0x40000c7   leaf rw-- pa 0x10000000 (4KiB)
-
-va 0x80001000
-  L2 idx 2   pte 0x20bff801  -> table 0x82ffe000
-  L1 idx 0   pte 0x200000cf  leaf rwx- pa 0x80001000 (2MiB superpage)
-```
-
-And the permissions are real, not decorative — a task that writes to a page
-mapped `r--` is stopped by the MMU and retired:
-
-```
-$ write *(char*)0x40000000  -- same page, no W bit
-[trap] store page fault in task 'faulter'
-       scause=15  stval=0x40000000  sepc=0x80000718
-```
+`/proc/tasks` is still a live snapshot of the scheduler, and `/proc/mounts`
+and `/proc/pagetable` still answer differently depending on who reads them —
+now for two independent reasons, the caller's namespace and its address space.
 
 ## Development stages (git history)
 
@@ -234,12 +215,14 @@ $ write *(char*)0x40000000  -- same page, no W bit
 6. dynamic namespace (`bind`) + `/proc` module
 7. per-task namespaces (`vfs_ns_clone`) + `/dev/null` module
 8. Sv39 paging: M-mode handover, page allocator, page tables, `/proc/pagetable`
+9. isolation: an address space per task, copying IPC, device ownership
 
 ## Next steps
 
-- a page table per task, for real isolation — which also means IPC can no
-  longer hand a raw pointer across tasks and needs the kernel to copy payloads
-- user mode (U-bit mappings), so tasks cannot touch kernel pages at all
+- user mode (U-bit mappings), so tasks cannot reach kernel pages either —
+  which means the servers stop being kernel C functions and become real
+  programs, reaching everything through syscalls
+- freeing a retired task's pages and page table (nothing is reclaimed yet)
 - a `virtio-blk` driver, replacing the RAM image with a real disk
 - FAT16 writes; subdirectory traversal
 - run under OpenSBI in supervisor mode

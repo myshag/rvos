@@ -20,6 +20,7 @@
 #include "uart.h"
 
 pagetable_t kernel_pagetable;
+uint64      kernel_satp;
 
 extern char _end[];
 
@@ -70,10 +71,8 @@ int vm_map_at(pagetable_t pt, uint64 va, uint64 pa, uint64 size,
     return 0;
 }
 
-uint64 vm_translate(uint64 va)
+uint64 vm_translate_in(pagetable_t pt, uint64 va)
 {
-    pagetable_t pt = kernel_pagetable;
-
     for (int level = 2; level >= 0; level--) {
         pte_t *pte = &pt[PX(level, va)];
         if (!(*pte & PTE_V))
@@ -83,6 +82,37 @@ uint64 vm_translate(uint64 va)
             return PTE2PA(*pte) | (va & (psz - 1));
         }
         pt = (pagetable_t)PTE2PA(*pte);
+    }
+    return 0;
+}
+
+uint64 vm_translate(uint64 va)
+{
+    return vm_translate_in(kernel_pagetable, va);
+}
+
+/* Copy across address spaces one page-fragment at a time. The kernel table
+   is installed while this runs, so a physical address doubles as a usable
+   pointer — that identity map is precisely what lets the kernel act as the
+   middleman two isolated tasks now require. */
+int vm_copy_across(pagetable_t dpt, uint64 dva,
+                   pagetable_t spt, uint64 sva, uint64 len)
+{
+    while (len) {
+        uint64 spa = vm_translate_in(spt, sva);
+        uint64 dpa = vm_translate_in(dpt, dva);
+        if (!spa || !dpa)
+            return -1;                       /* unmapped on one side */
+
+        uint64 n = PGSIZE - (sva % PGSIZE);
+        uint64 m = PGSIZE - (dva % PGSIZE);
+        if (m < n) n = m;
+        if (n > len) n = len;
+
+        memcpy((void *)dpa, (const void *)spa, (size_t)n);
+        sva += n;
+        dva += n;
+        len -= n;
     }
     return 0;
 }
@@ -113,6 +143,11 @@ static int put_perm(char *o, int n, pte_t pte)
 
 int vm_dump_walk(uint64 va, char *out, int cap)
 {
+    return vm_dump_walk_in(kernel_pagetable, va, out, cap);
+}
+
+int vm_dump_walk_in(pagetable_t pt, uint64 va, char *out, int cap)
+{
     int n = 0;
     if (cap < 400)
         return 0;
@@ -121,7 +156,6 @@ int vm_dump_walk(uint64 va, char *out, int cap)
     n = put_hex(out, n, va);
     n = put(out, n, "\n");
 
-    pagetable_t pt = kernel_pagetable;
     for (int level = 2; level >= 0; level--) {
         pte_t *pte = &pt[PX(level, va)];
 
@@ -177,6 +211,34 @@ void vm_init(void)
     vm_map_at(kernel_pagetable, CLINT_BASE, CLINT_BASE, 0x10000,
               PTE_R | PTE_W, 0);
 
-    w_satp(MAKE_SATP(kernel_pagetable));
+    kernel_satp = MAKE_SATP(kernel_pagetable);
+    w_satp(kernel_satp);
     sfence_vma();               /* from here on every address is translated */
+}
+
+/* An address space containing only what a task legitimately needs:
+
+     - the kernel image (text, rodata, data, bss), because kernel code and
+       its data structures must stay reachable when a trap lands before the
+       handler has switched to the kernel table;
+     - the UART and CLINT.
+
+   Deliberately absent is the free-page arena, which is where every task's
+   stack is allocated from. That omission is the isolation: task A holds no
+   translation for task B's stack, so the MMU refuses the access outright.
+   The kernel image is mapped with 4 KiB pages rather than a superpage for
+   exactly this reason — a 2 MiB leaf would spill past _end and hand over
+   the start of the arena with it. */
+pagetable_t vm_create_task_pt(void)
+{
+    pagetable_t pt = pmm_alloc();
+    if (!pt)
+        return 0;
+
+    uint64 kend = PGROUNDUP((uint64)_end);
+    vm_map_at(pt, RAM_BASE, RAM_BASE, kend - RAM_BASE,
+              PTE_R | PTE_W | PTE_X, 0);
+    vm_map_at(pt, UART_BASE_PA, UART_BASE_PA, PGSIZE, PTE_R | PTE_W, 0);
+    vm_map_at(pt, CLINT_BASE, CLINT_BASE, 0x10000, PTE_R | PTE_W, 0);
+    return pt;
 }

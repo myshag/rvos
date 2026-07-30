@@ -13,17 +13,16 @@ void console_server(void)
     kprintf("  [console] up, serving open/read/write/close over UART\n");
 
     for (;;) {
-        uint64 m;
-        int from = sys_recv(&m);
-        struct vfs_req *r = (struct vfs_req *)m;
+        struct vfs_req req;
+        int from = sys_recv(&req, (int)sizeof(req));
+        struct vfs_req *r = &req;
         switch (r->op) {
         case VFS_OPEN:
             r->result = 0;                      /* one stream, local fd 0 */
             break;
         case VFS_WRITE: {
-            const char *p = (const char *)r->buf;
-            for (int i = 0; i < r->len; i++)
-                uart_putc(p[i]);
+            for (int i = 0; i < r->len && i < VFS_DATA_MAX; i++)
+                uart_putc(r->data[i]);
             r->result = r->len;
             break;
         }
@@ -32,7 +31,7 @@ void console_server(void)
             if (c < 0) {
                 r->result = 0;
             } else {
-                ((char *)r->buf)[0] = (char)c;
+                r->data[0] = (char)c;
                 r->result = 1;
             }
             break;
@@ -41,6 +40,6 @@ void console_server(void)
         case VFS_CLOSE: r->result = 0;  break;
         default:        r->result = -1; break;
         }
-        sys_send(from, 0);
+        sys_send(from, r, (int)sizeof(*r));
     }
 }

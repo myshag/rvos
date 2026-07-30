@@ -1,16 +1,21 @@
-/* ipc.c — synchronous rendezvous IPC, the microkernel's core primitive.
-   send(dst, msg) blocks until dst receives; recv(&msg) blocks until someone
-   sends. One machine word is transferred; larger payloads pass a pointer to a
-   shared request struct (rvos has no per-task isolation yet). */
+/* ipc.c — synchronous rendezvous IPC across isolated address spaces.
+
+   send(dst, buf, len) blocks until dst receives; recv(buf, len) blocks until
+   someone sends. The rendezvous itself is unchanged from the shared-memory
+   version; what changed is that a message is now copied. Each task has its
+   own page table, so the sender's address means nothing in the receiver's
+   space — the kernel translates both sides and moves the bytes. That is the
+   price of isolation, and it is why the vfs protocol had to grow an inline
+   data area instead of handing over a pointer to a buffer. */
 #include "task.h"
 #include "syscall.h"
 #include "uart.h"
-
-extern struct task tasks[NTASK];
+#include "vm.h"
 
 /* Registers in the saved context we read/write to shuttle syscall args/rets. */
 #define A0(t) ((t)->ctx.x[10])
 #define A1(t) ((t)->ctx.x[11])
+#define A2(t) ((t)->ctx.x[12])
 
 static void enqueue_sender(struct task *recv, struct task *snd)
 {
@@ -33,55 +38,78 @@ static struct task *dequeue_sender(struct task *recv)
     return s;
 }
 
-/* SYS_SEND: a0 = dest id, a1 = message word. */
+/* Move a message from one address space to the other, truncating to whatever
+   the receiver was willing to accept. */
+static int deliver(struct task *snd, uint64 sva, int slen,
+                   struct task *rcv, uint64 rva, int rlen)
+{
+    int n = slen < rlen ? slen : rlen;
+    if (n <= 0)
+        return 0;
+    if (vm_copy_across(rcv->pt, rva, snd->pt, sva, (uint64)n) < 0)
+        return -1;
+    return n;
+}
+
+/* SYS_SEND: a0 = dest id, a1 = message address, a2 = length. */
 static void ipc_send(void)
 {
-    int dst_id  = (int)A0(current);
-    uint64 msg  = A1(current);
+    int    dst_id = (int)A0(current);
+    uint64 sva    = A1(current);
+    int    slen   = (int)A2(current);
 
     if (dst_id < 0 || dst_id >= NTASK || tasks[dst_id].state == T_UNUSED) {
-        A0(current) = -1;               /* bad destination */
+        A0(current) = -1;
         return;
     }
     struct task *dst = &tasks[dst_id];
 
     if (dst->state == T_BLOCKED && dst->waiting_recv) {
-        /* Receiver is waiting: deliver now, both stay/become runnable. */
-        *dst->recv_ptr   = msg;
-        A0(dst)          = current->id;     /* recv() returns sender id */
+        /* Receiver is parked in recv(): copy straight across and free both. */
+        if (deliver(current, sva, slen, dst, dst->recv_va, dst->recv_len) < 0) {
+            A0(current) = -1;
+            return;
+        }
+        A0(dst)           = current->id;    /* recv() returns the sender id */
         dst->waiting_recv = 0;
-        dst->state       = T_RUNNABLE;
-        A0(current)      = 0;               /* send() returns 0 */
+        dst->state        = T_RUNNABLE;
+        A0(current)       = 0;
         return;
     }
 
-    /* Receiver not ready: block the sender on the receiver's queue. */
-    current->ipc_msg = msg;
-    enqueue_sender(dst, current);
+    /* Nobody waiting: park, remembering where our message lives. It stays in
+       our address space untouched until a receiver shows up to copy it. */
+    current->send_va      = sva;
+    current->send_len     = slen;
     current->waiting_recv = 0;
+    enqueue_sender(dst, current);
     current->state = T_BLOCKED;
-    schedule();                              /* run someone else */
+    schedule();
 }
 
-/* SYS_RECV: a0 = uint64* out. Returns sender id in a0; message written to *out. */
+/* SYS_RECV: a0 = buffer address, a1 = capacity. Returns sender id in a0. */
 static void ipc_recv(void)
 {
-    uint64 *out = (uint64 *)A0(current);
-    struct task *s = dequeue_sender(current);
+    uint64 rva  = A0(current);
+    int    rlen = (int)A1(current);
 
+    struct task *s = dequeue_sender(current);
     if (s) {
-        /* A sender was already waiting: complete the rendezvous immediately. */
-        *out        = s->ipc_msg;
-        A0(current) = s->id;                 /* recv() returns sender id */
-        A0(s)       = 0;                     /* that sender's send() returns 0 */
+        /* A sender was already parked: complete the rendezvous now. */
+        if (deliver(s, s->send_va, s->send_len, current, rva, rlen) < 0) {
+            A0(current) = -1;
+            return;
+        }
+        A0(current) = s->id;
+        A0(s)       = 0;                    /* that sender's send() returns 0 */
         s->state    = T_RUNNABLE;
         return;
     }
 
-    /* No sender yet: block until one arrives. */
-    current->recv_ptr    = out;
+    current->recv_va      = rva;
+    current->recv_len     = rlen;
     current->waiting_recv = 1;
-    current->state       = T_BLOCKED;
+    current->state        = T_BLOCKED;
     schedule();
 }
 

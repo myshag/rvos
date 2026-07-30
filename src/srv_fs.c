@@ -78,7 +78,7 @@ static void fs_do_read(struct vfs_req *r)
     int n = (int)(f->size - f->pos);
     if (n > r->len) n = r->len;
     if (n < 0) n = 0;
-    memcpy(r->buf, f->data + f->pos, (size_t)n);
+    memcpy(r->data, f->data + f->pos, (size_t)n);
     f->pos += (uint32)n;
     r->result = n;
 }
@@ -86,12 +86,10 @@ static void fs_do_read(struct vfs_req *r)
 static void fs_do_ioctl(struct vfs_req *r)
 {
     if (r->fd < 0 || r->fd >= FS_MAXFD || !fs_tab[r->fd].used) { r->result = -1; return; }
-    if (r->ioctl_cmd == IOCTL_GETSIZE) {
-        *(uint32 *)r->ioctl_arg = fs_tab[r->fd].size;
-        r->result = 0;
-    } else {
+    if (r->ioctl_cmd == IOCTL_GETSIZE)
+        r->result = (int)fs_tab[r->fd].size;   /* the answer rides home */
+    else
         r->result = -1;
-    }
 }
 
 void fs_server(void)
@@ -102,9 +100,9 @@ void fs_server(void)
         kprintf("  [fs] no valid FAT16 (run with 'make rundisk')\n");
 
     for (;;) {
-        uint64 m;
-        int from = sys_recv(&m);
-        struct vfs_req *r = (struct vfs_req *)m;
+        struct vfs_req req;
+        int from = sys_recv(&req, (int)sizeof(req));
+        struct vfs_req *r = &req;          /* our own copy, not the client's */
         switch (r->op) {
         case VFS_OPEN:  fs_do_open(r);  break;
         case VFS_READ:  fs_do_read(r);  break;
@@ -117,6 +115,6 @@ void fs_server(void)
             break;
         default: r->result = -1; break;
         }
-        sys_send(from, 0);
+        sys_send(from, r, (int)sizeof(*r));   /* ship the answer back */
     }
 }

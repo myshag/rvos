@@ -13,9 +13,9 @@ void null_server(void)
     kprintf("  [null] up, discarding whatever is bound to it\n");
 
     for (;;) {
-        uint64 m;
-        int from = sys_recv(&m);
-        struct vfs_req *r = (struct vfs_req *)m;
+        struct vfs_req req;
+        int from = sys_recv(&req, (int)sizeof(req));
+        struct vfs_req *r = &req;
         switch (r->op) {
         case VFS_OPEN:  r->result = 0;        break;
         case VFS_WRITE: r->result = r->len;   break;   /* accepted, dropped */
@@ -23,6 +23,6 @@ void null_server(void)
         case VFS_CLOSE: r->result = 0;        break;
         default:        r->result = -1;       break;
         }
-        sys_send(from, 0);
+        sys_send(from, r, (int)sizeof(*r));
     }
 }
