@@ -17,6 +17,7 @@
 #include "pmm.h"
 #include "vm.h"
 #include "plic.h"
+#include "virtio.h"
 #include "util.h"
 
 /* Read a whole file through the interface. It arrives in VFS_DATA_MAX-sized
@@ -112,6 +113,7 @@ static void shell(void)
     sys_send(PEEKER_TASK_ID,  &m, (int)sizeof(m));
     sys_send(LOADER_TASK_ID,  &m, (int)sizeof(m));
     sys_send(SH_TASK_ID,      &m, (int)sizeof(m));
+    sys_send(NET_TASK_ID,     &m, (int)sizeof(m));
 
     for (;;)
         yield();
@@ -121,6 +123,7 @@ void user_main(void);        /* user.c — runs with the U bit set */
 void peeker_main(void);      /* user.c — probes another server's memory */
 void loader_main(void);      /* loader.c — reads an ELF and spawns it */
 void sh_main(void);          /* sh.c — reads a command line and runs it */
+void net_server(void);       /* srv_net.c — virtio-net, in user mode */
 
 /* Always runnable, so the scheduler never runs out of candidates — without
    it, retiring a faulting task while everyone else is blocked left nothing to
@@ -160,6 +163,7 @@ void smain(void)
     extern char __umisc_start[], __umisc_end[];
     extern char __uload_start[], __uload_end[];
     extern char __ush_start[], __ush_end[];
+    extern char __unet_start[], __unet_end[];
 
     /* The system services are user programs now. */
     struct task *fs =
@@ -180,7 +184,9 @@ void smain(void)
     task_create_user("loader", loader_main,
                      __uload_start, __uload_end);     /* 9 */
     task_create_user("sh", sh_main, __ush_start, __ush_end);  /* 10 */
-    task_create("idle",    idle);                     /* 11 */
+    struct task *net =
+        task_create_user("net", net_server, __unet_start, __unet_end); /* 11 */
+    task_create("idle",    idle);                     /* 12 */
 
     /* Devices are handed to their driver and to nobody else — with the U bit,
        so the driver reaches them from user mode without the kernel on the
@@ -188,6 +194,9 @@ void smain(void)
     vm_map_at(fs->pt,  DISK_PA, DISK_PA, DISK_SIZE, PTE_R | PTE_U, 1);
     vm_map_at(con->pt, UART_BASE_PA, UART_BASE_PA, PGSIZE,
               PTE_R | PTE_W | PTE_U, 0);
+    /* The virtio transports go to the network driver alone. */
+    vm_map_at(net->pt, VIRTIO_MMIO_BASE, VIRTIO_MMIO_BASE,
+              VIRTIO_MMIO_STRIDE * VIRTIO_MMIO_SLOTS, PTE_R | PTE_W | PTE_U, 0);
 
     vfs_bind("/",      FS_TASK_ID);
     vfs_bind("/dev/",  CONSOLE_TASK_ID);

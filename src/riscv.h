@@ -86,6 +86,12 @@ typedef uint64 *pagetable_t;
 
 /* Where every task's stack sits. Part of the ABI, not a kernel secret: a
    user program may ask about its own stack. */
+/* Where DMA pages are handed to a driver. A device reads and writes these by
+   *physical* address, so the allocator has to report both halves of the
+   mapping — the only place in the system where a user program legitimately
+   needs to know a physical address. */
+#define DMA_BASE     0x40000000UL
+
 #define USTACK_TOP   0x30000000UL
 #define USTACK_PAGES 4                       /* 16 KiB */
 

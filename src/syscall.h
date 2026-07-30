@@ -51,12 +51,25 @@ enum {
        acks, which unmasks. The kernel never learns what the device is. */
     SYS_IRQ_REG = 15,  /* a0 = irq — this task becomes its driver */
     SYS_IRQ_ACK = 16,  /* a0 = irq — handled; let it fire again */
+    /* One zeroed page, mapped into the caller and reported with both its
+       virtual and its physical address. Devices are programmed with the
+       latter; nothing else in the system is allowed to care. */
+    SYS_DMA_ALLOC = 17,   /* a0 = struct dmapage* -> 0 / -1 */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
    interrupt rather than a message. A driver's receive loop then handles both
    without needing a second blocking primitive. */
 #define IRQ_SENDER (-2)
+
+/* Both halves of a DMA mapping. One page: the split virtqueues we drive keep
+   each ring area and each packet buffer inside a single page, so nothing here
+   needs physically contiguous runs — which is fortunate, because the page
+   allocator is a free list and cannot promise them. */
+struct dmapage {
+    uint64 va;
+    uint64 pa;
+};
 
 struct taskinfo {
     int  id;
@@ -136,6 +149,11 @@ static inline int sys_vmload(int tid, const void *seg)
 static inline int sys_start(int tid, const void *startinfo)
 {
     return (int)_ecall2(SYS_START, tid, (long)startinfo);
+}
+
+static inline int sys_dma_alloc(struct dmapage *out)
+{
+    return (int)_ecall1(SYS_DMA_ALLOC, (long)out);
 }
 
 static inline int sys_irq_register(int irq)

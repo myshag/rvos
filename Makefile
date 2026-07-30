@@ -32,9 +32,14 @@ DISK_ADDR := 0x84000000
 # sstc is requested explicitly because the S-mode timer depends on it: CLINT's
 # mtimecmp is machine-mode only and the machine timer interrupt is not
 # delegable, so without Sstc an S-mode kernel has no clock of its own.
-QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic -kernel $(ELF)
+# force-legacy=false matters: QEMU presents virtio-mmio as a *legacy* (version
+# 1) transport by default, whose queue registers are laid out differently. The
+# driver speaks virtio 1.x, so the transport has to be the modern one.
+QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic \
+           -global virtio-mmio.force-legacy=false -kernel $(ELF) \
+           -netdev user,id=n0 -device virtio-net-device,netdev=n0
 
-.PHONY: all run rundisk disk prog clean
+.PHONY: all run rundisk runpcap disk prog clean
 all: $(ELF)
 
 # -MMD -MP writes a .d file per object listing the headers it used, so editing
@@ -74,6 +79,12 @@ run: $(ELF)
 # Run with the FAT16 image mapped into RAM at $(DISK_ADDR).
 rundisk: $(ELF) $(DISK)
 	$(QEMU) $(QFLAGS) -device loader,file=$(DISK),addr=$(DISK_ADDR),force-raw=on
+
+# Same, but every frame is written to build/net.pcap for inspection on the
+# host — the way to check a network driver without trusting its own output.
+runpcap: $(ELF) $(DISK)
+	$(QEMU) $(QFLAGS) -device loader,file=$(DISK),addr=$(DISK_ADDR),force-raw=on \
+	  -object filter-dump,id=f0,netdev=n0,file=$(BUILD)/net.pcap
 
 clean:
 	rm -rf $(BUILD)

@@ -15,7 +15,7 @@ enum task_state { T_UNUSED = 0, T_RUNNABLE, T_RUNNING, T_BLOCKED };
 
 struct namespace;   /* opaque here; defined in vfs.c */
 
-#define NTASK   16
+#define NTASK   18
 
 /* USTACK_TOP / USTACK_PAGES live in riscv.h: every task's stack sits at the
    same virtual address but on different physical pages — which is the point:
@@ -39,6 +39,7 @@ struct task {
     int    recv_len;
     int    waiting_recv;        /* 1 => blocked in recv (vs. blocked in send) */
     int    irq_pending;         /* a device it drives fired while it was busy */
+    uint64 dma_next;            /* next free VA in its DMA window */
     struct task *wait_sender;   /* head of senders blocked on us as receiver */
     struct task *send_next;     /* intrusive link within that sender queue */
 };

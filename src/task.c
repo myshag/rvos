@@ -254,6 +254,26 @@ void syscall_dispatch(uint64 num)
         current->ctx.x[10] = (uint64)(long)vfs_ns_clone();
         break;
     /* ---- building another task, one segment at a time ---------------- */
+    case SYS_DMA_ALLOC: {
+        void *p = pmm_alloc();
+        if (!p) {
+            current->ctx.x[10] = (uint64)-1;
+            break;
+        }
+        if (!current->dma_next)
+            current->dma_next = DMA_BASE;
+        struct dmapage d;
+        d.va = current->dma_next;
+        d.pa = (uint64)p;
+        vm_map_at(current->pt, d.va, d.pa, PGSIZE,
+                  PTE_R | PTE_W | PTE_U, 0);
+        current->dma_next += PGSIZE;
+        sfence_vma();                  /* the mapping must be visible at once */
+        vm_copy_across(current->pt, current->ctx.x[10],
+                       kernel_pagetable, (uint64)&d, sizeof(d));
+        current->ctx.x[10] = 0;
+        break;
+    }
     case SYS_IRQ_REG:
         current->ctx.x[10] =
             (uint64)(long)irq_register((int)current->ctx.x[10], current);

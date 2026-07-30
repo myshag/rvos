@@ -55,6 +55,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/kernel.ld`    | link at `0x80000000`, boot stack |
 | `src/trap.c`       | timer setup, trap/`ecall` dispatch, interrupt ownership |
 | `src/plic.c`       | the interrupt controller — how a device reaches the kernel |
+| `src/srv_net.c`    | **virtio-net driver** — user mode, owns the card |
 | `src/task.c`       | task table, preemptive round-robin scheduler, syscalls |
 | `src/ipc.c`        | synchronous rendezvous `send`/`recv` |
 | `src/vfs.h`        | **the one interface** + client wrappers |
@@ -296,6 +297,7 @@ $ read the fs server's private data region
 12. an ELF loader in user space, and a program loaded from the filesystem
 13. reclaiming a dead task's memory, argv, and a shell that runs what you type
 14. the PLIC, and interrupts delivered to a user-mode driver
+15. DMA memory, and a virtio-net driver that sends and receives
 
 ## Loading a program
 
@@ -396,11 +398,51 @@ per *context* — a (hart, privilege) pair, where hart 0 supervisor mode is
 context 1 — and using the machine-mode context by mistake yields a controller
 that looks configured and delivers nothing.
 
+## The network driver
+
+`srv_net.c` is an unprivileged program that owns the card: the virtio-mmio
+window is mapped into its address space alone, so register access is ordinary
+loads and stores with no syscall on the data path.
+
+What it cannot arrange for itself is memory the *device* can reach. A device
+is programmed with physical addresses, and a user program has no business
+knowing one — except here. `SYS_DMA_ALLOC` hands back a zeroed page together
+with both halves of its mapping, and that is the only place in the system
+where a physical address crosses into user space.
+
+The split virtqueue is three shared arrays: descriptors saying where the
+buffers are, an available ring that is the driver's outbox, a used ring that
+is the device's. `VQ_SIZE` is 8, so all three areas of a queue fit inside one
+page at aligned offsets — which is fortunate, because the page allocator is a
+free list and cannot promise physically contiguous runs. `fence` instructions
+separate writing a descriptor from publishing it and publishing it from
+ringing the doorbell; without them the device can read a half-built ring.
+
+```
+--- net (U-mode virtio-net driver) ---------------------
+  found virtio-net in mmio slot 7, version 2
+  mac 52:54:00:12:34:56
+  driver ok; queues live
+  sent an ARP request for 10.0.2.2, 42 bytes
+  received 76 bytes from 52:55:0a:00:02:02 — an ARP reply: 10.0.2.2 is at 52:55:0a:00:02:02
+```
+
+Two things worth knowing. QEMU presents virtio-mmio as a **legacy** transport
+unless told otherwise, and its queue registers are laid out differently; the
+driver speaks virtio 1.x, so `-global virtio-mmio.force-legacy=false` is not
+optional. And receive buffers must be published before the device is told to
+run, or the first frames arrive with nowhere to go.
+
+`make runpcap` writes every frame to `build/net.pcap`, which is how to check
+the driver without trusting its own report of what it did.
+
 ## Next steps
 
 - a blocking `read()` on the console, so the shell stops polling the driver
   (the driver is interrupt-driven now; its client is not)
-- a virtio-net driver, which is what the interrupt and DMA work is for
+- move the driver from polling the used ring to its interrupt (IRQ 8), which
+  the kernel already knows how to deliver
+- ARP and ICMP replies, so the host can ping it
 - capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
 - a `virtio-blk` driver, replacing the RAM image with a real disk
