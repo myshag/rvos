@@ -152,7 +152,15 @@ simply folding into the offset. Superpages are not a separate feature, just an
 early exit — `vm.c` uses 2 MiB leaves to cover RAM in 64 entries while mapping
 the UART with a 4 KiB leaf so one path exercises all three levels.
 
-### Two bugs worth keeping
+### Three bugs worth keeping
+
+Adding initialised data to a user program broke it, and the cause was in the
+linker script. Each program's writable state was one region, cleared wholesale
+at boot to zero its `.bss` — which also reset every `.data` initialiser. It
+stayed invisible for seven stages because no user program had one, and
+surfaced as a test hook that refused to fire. `.data` and `.bss` are now
+separate spans and only the second is cleared.
+
 
 The second one cost the most time. `struct task` gained a field, and
 `make` rebuilt only the files that were edited — because the Makefile had no
@@ -301,6 +309,7 @@ $ read the fs server's private data region
 15. DMA memory, and a virtio-net driver that sends and receives
 16. interrupt-driven networking, and a ping that gets an answer
 17. UDP, and enough TCP to open a connection, talk and close it
+18. alarms in the kernel, and TCP retransmission that survives a lost segment
 
 ## Loading a program
 
@@ -463,9 +472,9 @@ here. The checksum covers a *pseudo-header* that never goes on the wire — the
 two addresses, the protocol and the length — which is what makes a datagram
 delivered to the wrong host fail rather than be accepted.
 
-**TCP is not complete, and it is worth being exact about what is missing.**
-What works is a client that opens a connection, sends, receives and closes in
-order:
+**TCP is still not complete, and it is worth being exact about what is
+missing.** What works is a client that opens a connection, sends, receives,
+closes in order, and *retransmits what goes unacknowledged*:
 
 ```
 tcp: SYN -> 10.0.2.2:9998
@@ -476,13 +485,30 @@ tcp: closing
 tcp: closed
 ```
 
-What is absent is everything that makes TCP reliable rather than merely
-correct on a perfect link: no retransmission, no timers, no out-of-order
-reassembly, no window management beyond a fixed advertised window, no
-congestion control, and a fixed initial sequence number instead of a random
-one. Over a virtual link that never drops a packet none of this shows —
-which is the reason to write it down. **This implementation would hang on the
-first lost segment.**
+What is still absent: out-of-order reassembly, window management beyond a
+fixed advertised window, congestion control, and a fixed initial sequence
+number instead of a random one.
+
+Retransmission needed something the system did not have — a way for a task to
+act on the passage of time. `SYS_ALARM` wakes a task after a delay, and it
+arrives the same way everything else does: `sys_recv` reports `TIMER_SENDER`
+instead of a task id. Three kinds of event — a message, an interrupt, a
+timeout — and still one blocking call.
+
+On a virtual link nothing is ever lost, so the retransmit path would never run
+and its correctness would be a matter of opinion. `net_ip.c` therefore drops
+exactly one segment on purpose, and the connection only completes because the
+timer recovers it:
+
+```
+tcp: [test] dropping this segment before it reaches the card
+tcp: SYN -> 10.0.2.2:9998
+tcp: timeout, retransmitting (attempt 1)
+tcp: SYN-ACK received, connection established
+```
+
+The retransmitted segment is the *stored bytes*, not a rebuilt one: it has to
+carry the same sequence number it carried the first time.
 
 Both are verified from the far side rather than from the driver's own
 account: `nc -u -l 9999` and `nc -l 9998` on the host receive what the guest
@@ -492,8 +518,6 @@ claims to have sent, and the host's reply arrives back in the guest.
 
 - a blocking `read()` on the console, so the shell stops polling the driver
   (the driver is interrupt-driven now; its client is not)
-- retransmission and timers, without which the TCP above is a demonstration
-  rather than a transport
 - a network *server*: bind the stack at `/net/` so programs reach it through
   the same open/read/write interface as everything else
 - answering ARP and ICMP rather than only initiating them

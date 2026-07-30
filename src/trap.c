@@ -32,6 +32,27 @@ void timer_init(void)
     w_sie(r_sie() | SIE_STIE);
 }
 
+/* Every timer tick, see whose alarm has come due. Waking a task looks exactly
+   like delivering a message to it, which is what lets one blocking call serve
+   messages, interrupts and timeouts alike. */
+static void alarms_check(void)
+{
+    uint64 now = r_time();
+    for (int i = 0; i < NTASK; i++) {
+        struct task *t = &tasks[i];
+        if (t->state == T_UNUSED || !t->alarm_at || now < t->alarm_at)
+            continue;
+        t->alarm_at = 0;
+        if (t->state == T_BLOCKED && t->waiting_recv) {
+            t->ctx.x[10]    = (uint64)(long)TIMER_SENDER;
+            t->waiting_recv = 0;
+            t->state        = T_RUNNABLE;
+        } else {
+            t->timer_pending = 1;
+        }
+    }
+}
+
 /* Which task drives which interrupt. Nothing here knows what the devices
    are — only who asked for them. */
 #define NIRQ 32
@@ -103,6 +124,7 @@ void strap_handler(void)
     if (scause & CAUSE_INT) {
         if ((scause & 0xff) == IRQ_S_TIMER) {
             timer_rearm();
+            alarms_check();
             schedule();                 /* preempt: may switch `current` */
         } else if ((scause & 0xff) == IRQ_S_EXTERNAL) {
             device_interrupt();

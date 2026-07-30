@@ -254,6 +254,14 @@ void syscall_dispatch(uint64 num)
         current->ctx.x[10] = (uint64)(long)vfs_ns_clone();
         break;
     /* ---- building another task, one segment at a time ---------------- */
+    case SYS_ALARM: {
+        int ms = (int)current->ctx.x[10];
+        /* QEMU's time base is 10 MHz, so a millisecond is 10000 ticks. The
+           timer interrupt runs at ~50 ms, which bounds the resolution. */
+        current->alarm_at = ms > 0 ? r_time() + (uint64)ms * 10000UL : 0;
+        current->ctx.x[10] = 0;
+        break;
+    }
     case SYS_DMA_ALLOC: {
         void *p = pmm_alloc();
         if (!p) {

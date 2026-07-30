@@ -143,9 +143,26 @@ void smain(void)
     kprintf("  stage 11: the servers are user programs\n");
     kprintf("=============================================\n");
 
-    /* User-space state lives outside the range boot.S clears. */
-    extern char __udata_start[], __udata_end[];
-    memset(__udata_start, 0, (size_t)(__udata_end - __udata_start));
+    /* Clear each user program's .bss, and only its .bss: boot.S knows about
+       the kernel's alone, and the .data next door arrives initialised. */
+    {
+        extern char __ufs_bss_start[],   __ufs_bss_end[];
+        extern char __uproc_bss_start[], __uproc_bss_end[];
+        extern char __uload_bss_start[], __uload_bss_end[];
+        extern char __ush_bss_start[],   __ush_bss_end[];
+        extern char __unet_bss_start[],  __unet_bss_end[];
+        extern char __umisc_bss_start[], __umisc_bss_end[];
+        char *bss[][2] = {
+            { __ufs_bss_start,   __ufs_bss_end   },
+            { __uproc_bss_start, __uproc_bss_end },
+            { __uload_bss_start, __uload_bss_end },
+            { __ush_bss_start,   __ush_bss_end   },
+            { __unet_bss_start,  __unet_bss_end  },
+            { __umisc_bss_start, __umisc_bss_end },
+        };
+        for (unsigned i = 0; i < sizeof(bss) / sizeof(bss[0]); i++)
+            memset(bss[i][0], 0, (size_t)(bss[i][1] - bss[i][0]));
+    }
 
     pmm_init();
     vm_init();

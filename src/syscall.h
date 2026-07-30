@@ -55,12 +55,19 @@ enum {
        virtual and its physical address. Devices are programmed with the
        latter; nothing else in the system is allowed to care. */
     SYS_DMA_ALLOC = 17,   /* a0 = struct dmapage* -> 0 / -1 */
+    /* Wake me later. The only way a task can act on the passage of time:
+       without it a driver that blocks waiting for a reply waits forever, and
+       nothing built on top can ever decide that something was lost. */
+    SYS_ALARM   = 18,     /* a0 = milliseconds, 0 cancels */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
    interrupt rather than a message. A driver's receive loop then handles both
    without needing a second blocking primitive. */
-#define IRQ_SENDER (-2)
+#define IRQ_SENDER   (-2)
+/* ...and this when the alarm went off. Three kinds of event, one blocking
+   call: a driver needs no separate mechanism for any of them. */
+#define TIMER_SENDER (-3)
 
 /* Both halves of a DMA mapping. One page: the split virtqueues we drive keep
    each ring area and each packet buffer inside a single page, so nothing here
@@ -149,6 +156,11 @@ static inline int sys_vmload(int tid, const void *seg)
 static inline int sys_start(int tid, const void *startinfo)
 {
     return (int)_ecall2(SYS_START, tid, (long)startinfo);
+}
+
+static inline int sys_alarm(int ms)
+{
+    return (int)_ecall1(SYS_ALARM, ms);
 }
 
 static inline int sys_dma_alloc(struct dmapage *out)

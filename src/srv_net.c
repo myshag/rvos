@@ -208,20 +208,31 @@ static void wait_irq(void)
     }
 }
 
-/* Wait for the next received frame. Returns its length and, through `id`, the
-   descriptor to hand back once the caller is finished with the bytes. */
-static char *receive(int *len, uint16 *id)
+/* Wait for whichever comes first: a frame or the alarm. Both arrive through
+   sys_recv, so there is still only one place the driver ever blocks. */
+enum { EV_FRAME, EV_TIMEOUT };
+
+static int net_wait(uint8 **frame, int *len, uint16 *id)
 {
     for (;;) {
         fence();
         if (rx_used->idx != rx_last) {
             struct virtq_used_elem *e = &rx_used->ring[rx_last % VQ_SIZE];
-            *id  = (uint16)e->id;
-            *len = (int)e->len - (int)sizeof(struct virtio_net_hdr);
+            *id    = (uint16)e->id;
+            *len   = (int)e->len - (int)sizeof(struct virtio_net_hdr);
+            *frame = (uint8 *)rx_buf[*id] + sizeof(struct virtio_net_hdr);
             rx_last++;
-            return rx_buf[*id] + sizeof(struct virtio_net_hdr);
+            return EV_FRAME;
         }
-        wait_irq();
+
+        unsigned long m;
+        int from = sys_recv(&m, (int)sizeof(m));
+        if (from == IRQ_SENDER) {
+            wr(VIRTIO_INT_ACK, rd(VIRTIO_INT_STATUS));
+            sys_irq_ack(net_irq);
+        } else if (from == TIMER_SENDER) {
+            return EV_TIMEOUT;
+        }
     }
 }
 
@@ -253,7 +264,7 @@ int net_transmit(const void *vframe, int len)
             break;
         wait_irq();
     }
-    return 0;
+    return 0;   /* an alarm during this wait stays pending; the loop sees it */
 }
 
 void net_server(void)
@@ -318,8 +329,11 @@ void net_server(void)
     /* The driver's whole job from here: take frames off the card and pass
        them up. It never looks inside one. */
     for (;;) {
-        int flen; uint16 id;
-        uint8 *f = (uint8 *)receive(&flen, &id);
+        uint8 *f; int flen; uint16 id;
+        if (net_wait(&f, &flen, &id) == EV_TIMEOUT) {
+            net_timeout();
+            continue;
+        }
         net_input(f, flen);
         rx_recycle(id);
     }

@@ -50,64 +50,112 @@ SECTIONS
     . = ALIGN(4096);
     __utext_end = .;
 
-    /* private state: the filesystem server (its open-file cache and the
-       FAT16 driver's mounted-volume record) */
+    /* Each program's writable state, page-aligned and private to it.
+
+       Initialised data and zero-initialised data are kept apart on purpose:
+       .data arrives with its values already in the image and must be left
+       alone, while .bss has to be cleared at boot. Zeroing the pair together
+       silently resets every initialiser — a bug that stays invisible until
+       some program actually has one. */
+    /* the filesystem server (open-file cache, FAT16 volume record) */
     __ufs_start = .;
-    .ufs : {
-        *srv_fs.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
-        *fat16.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    .ufs_data : {
+        *srv_fs.o(.data .data.* .sdata .sdata.*)
+        *fat16.o(.data .data.* .sdata .sdata.*)
     }
+    . = ALIGN(8);
+    __ufs_bss_start = .;
+    .ufs_bss : {
+        *srv_fs.o(.sbss .sbss.* .bss .bss.* COMMON)
+        *fat16.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __ufs_bss_end = .;
     . = ALIGN(4096);
     __ufs_end = .;
 
-    /* private state: the proc server (its rendered-file buffers) */
+    /* the proc server (its rendered-file buffers) */
     __uproc_start = .;
-    .uproc : {
-        *srv_proc.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    .uproc_data : {
+        *srv_proc.o(.data .data.* .sdata .sdata.*)
     }
+    . = ALIGN(8);
+    __uproc_bss_start = .;
+    .uproc_bss : {
+        *srv_proc.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __uproc_bss_end = .;
     . = ALIGN(4096);
     __uproc_end = .;
 
-    /* private state: the ELF loader (its file buffer) */
+    /* the ELF loader (its file buffer) */
     __uload_start = .;
-    .uload : {
-        *loader.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    .uload_data : {
+        *loader.o(.data .data.* .sdata .sdata.*)
     }
+    . = ALIGN(8);
+    __uload_bss_start = .;
+    .uload_bss : {
+        *loader.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __uload_bss_end = .;
     . = ALIGN(4096);
     __uload_end = .;
 
-    /* private state: the shell (its line buffer and its own ELF scratch) */
+    /* the shell (line buffer and ELF scratch) */
     __ush_start = .;
-    .ush : {
-        *sh.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    .ush_data : {
+        *sh.o(.data .data.* .sdata .sdata.*)
     }
+    . = ALIGN(8);
+    __ush_bss_start = .;
+    .ush_bss : {
+        *sh.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __ush_bss_end = .;
     . = ALIGN(4096);
     __ush_end = .;
 
-    /* private state: the network driver (its ring and buffer pointers) */
+    /* the network driver and protocol layer */
     __unet_start = .;
-    .unet : {
-        *srv_net.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
-        *net_ip.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    .unet_data : {
+        *srv_net.o(.data .data.* .sdata .sdata.*)
+        *net_ip.o(.data .data.* .sdata .sdata.*)
     }
+    . = ALIGN(8);
+    __unet_bss_start = .;
+    .unet_bss : {
+        *srv_net.o(.sbss .sbss.* .bss .bss.* COMMON)
+        *net_ip.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __unet_bss_end = .;
     . = ALIGN(4096);
     __unet_end = .;
 
-    /* private state: everyone else (ulib, user.o) — usually empty */
+    /* everyone else (ulib, user.o, console, null) */
     __umisc_start = .;
-    .umisc : {
-        *ulib.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
-        *user.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
-        *srv_null.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
-        *srv_console.o(.data .data.* .sdata .sdata.* .sbss .sbss.* .bss .bss.* COMMON)
+    .umisc_data : {
+        *ulib.o(.data .data.* .sdata .sdata.*)
+        *user.o(.data .data.* .sdata .sdata.*)
+        *srv_null.o(.data .data.* .sdata .sdata.*)
+        *srv_console.o(.data .data.* .sdata .sdata.*)
     }
+    . = ALIGN(8);
+    __umisc_bss_start = .;
+    .umisc_bss : {
+        *ulib.o(.sbss .sbss.* .bss .bss.* COMMON)
+        *user.o(.sbss .sbss.* .bss .bss.* COMMON)
+        *srv_null.o(.sbss .sbss.* .bss .bss.* COMMON)
+        *srv_console.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __umisc_bss_end = .;
     . = ALIGN(4096);
     __umisc_end = .;
-
-    /* All of the above is zeroed at boot: these regions hold only .bss in
-       practice, and boot.S clears the kernel's bss alone. */
-    __udata_start = __ufs_start;
-    __udata_end   = __umisc_end;
 
     /* ---- kernel ------------------------------------------------------ */
     .text : { *(.text .text.*) }

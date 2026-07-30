@@ -100,6 +100,11 @@ static void ipc_recv(void)
         A0(current) = (uint64)(long)IRQ_SENDER;
         return;
     }
+    if (current->timer_pending) {
+        current->timer_pending = 0;
+        A0(current) = (uint64)(long)TIMER_SENDER;
+        return;
+    }
 
     struct task *s = dequeue_sender(current);
     if (s) {

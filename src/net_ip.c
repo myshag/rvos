@@ -3,13 +3,12 @@
    Scope, stated plainly. UDP here is complete: an 8-byte header and a
    checksum over the pseudo-header, which is all UDP is. TCP is not. What is
    implemented is a client that opens a connection, sends, receives and closes
-   in order; what is missing is everything that makes TCP reliable on a real
-   network — retransmission, timers, out-of-order reassembly, window and
-   congestion control. Over a virtual link that never drops a packet the
-   difference does not show, which is exactly why it is worth writing down:
-   this would hang on the first loss. */
+   in order, and retransmits what goes unacknowledged. What is still missing
+   is out-of-order reassembly, window management beyond a fixed advertised
+   window, congestion control, and a random initial sequence number. */
 #include "netif.h"
 #include "ulib.h"
+#include "syscall.h"
 
 #define ETH_ARP   0x0806
 #define ETH_IPV4  0x0800
@@ -145,6 +144,20 @@ static int    tcp_state;
 static uint32 snd_nxt, rcv_nxt;
 static int    sent_payload;
 
+/* The last segment that consumed sequence space, kept until it is
+   acknowledged. Retransmission is the whole of TCP's reliability: a segment
+   is not "sent", it is "sent and not yet given up on". */
+static uint8  rt_frame[1600];
+static int    rt_len;                   /* 0 = nothing outstanding */
+static uint32 rt_seq_end;               /* the ack that would retire it */
+static int    rt_tries;
+static int    rt_rto = 300;             /* milliseconds, doubled on each loss */
+
+/* A test hook. On a virtual link nothing is ever lost, so the retransmit path
+   would never run and its correctness would be a matter of opinion. This
+   drops exactly one segment on the floor after it is built. */
+static int    drop_next = 1;
+
 static void tcp_send(unsigned flags, const char *data, int dlen)
 {
     int o = ip_hdr(out, IP_TCP, 20 + dlen);
@@ -161,13 +174,59 @@ static void tcp_send(unsigned flags, const char *data, int dlen)
     if (dlen)
         umemcpy(t + 20, data, (unsigned long)dlen);
     put16(t + 16, l4_checksum(IP_TCP, me_ip, gw_ip, t, 20 + dlen));
-    net_transmit(out, o + 20 + dlen);
+
+    int flen = o + 20 + dlen;
 
     /* SYN and FIN each consume a sequence number, which is why a handshake
        advances the stream without carrying any data. */
-    if (flags & (TCP_SYN | TCP_FIN))
-        snd_nxt++;
-    snd_nxt += (uint32)dlen;
+    uint32 consumed = (uint32)dlen + ((flags & (TCP_SYN | TCP_FIN)) ? 1 : 0);
+
+    if (consumed) {
+        /* Keep the bytes, not the intent: a retransmission must be the same
+           segment, down to the sequence number it carried. */
+        umemcpy(rt_frame, out, (unsigned long)flen);
+        rt_len     = flen;
+        rt_seq_end = snd_nxt + consumed;
+        rt_tries   = 0;
+        rt_rto     = 300;
+        sys_alarm(rt_rto);
+    }
+
+    if (drop_next && consumed) {
+        drop_next = 0;
+        net_puts("  tcp: [test] dropping this segment before it reaches the card\n");
+    } else {
+        net_transmit(out, flen);
+    }
+
+    snd_nxt += consumed;
+}
+
+/* Called when the alarm fires with a segment still outstanding. */
+void net_timeout(void)
+{
+    if (!rt_len)
+        return;
+    if (++rt_tries > 5) {
+        net_puts("  tcp: giving up after 5 retransmissions\n");
+        rt_len = 0;
+        tcp_state = T_DONE;
+        return;
+    }
+    net_putn("  tcp: timeout, retransmitting (attempt ",
+             (unsigned long)rt_tries, ")\n");
+    net_transmit(rt_frame, rt_len);
+    rt_rto *= 2;                        /* exponential backoff */
+    sys_alarm(rt_rto);
+}
+
+/* An acknowledgement retires the outstanding segment. */
+static void tcp_acked(uint32 ack)
+{
+    if (rt_len && (int32)(ack - rt_seq_end) >= 0) {
+        rt_len = 0;
+        sys_alarm(0);                   /* cancel the timer */
+    }
 }
 
 static void tcp_open(void)
@@ -191,6 +250,9 @@ static void tcp_input(const uint8 *t, int seglen)
         tcp_state = T_DONE;
         return;
     }
+
+    if (flags & TCP_ACK)
+        tcp_acked(get32(t + 8));
 
     if (tcp_state == T_SYN_SENT && (flags & TCP_SYN) && (flags & TCP_ACK)) {
         rcv_nxt = seq + 1;                      /* their SYN counts as one */
