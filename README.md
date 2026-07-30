@@ -310,6 +310,7 @@ $ read the fs server's private data region
 16. interrupt-driven networking, and a ping that gets an answer
 17. UDP, and enough TCP to open a connection, talk and close it
 18. alarms in the kernel, and TCP retransmission that survives a lost segment
+19. the network bound into the namespace: `/net/status`, `/net/tcp`
 
 ## Loading a program
 
@@ -514,12 +515,48 @@ Both are verified from the far side rather than from the driver's own
 account: `nc -u -l 9999` and `nc -l 9998` on the host receive what the guest
 claims to have sent, and the host's reply arrives back in the guest.
 
+## The network as files
+
+The stack is a server now, bound at `/net/`, and that closes the circle the
+project has been drawing since stage 5. Two names:
+
+| path | read | write |
+|------|------|-------|
+| `/net/status` | interface, gateway, connection state, bytes queued | — |
+| `/net/tcp` | bytes received on the connection | send bytes on it |
+
+Nothing new was needed to make this work. The network task already blocked in
+`sys_recv`, and the kernel already reported who woke it — a device
+(`IRQ_SENDER`), the clock (`TIMER_SENDER`), or a task. Serving clients was a
+third case in a loop that already had two.
+
+`prog/hello.c`, an ELF loaded off the FAT16 volume at run time, uses it:
+
+```
+[hello] cat /net/status:
+mac      52:54:00:12:34:56
+address  10.0.2.15
+gateway  10.0.2.2 (resolved)
+tcp      established -> 10.0.2.2:9998
+[hello] wrote to /net/tcp
+[hello] read back from /net/tcp: from-host
+```
+
+That program contains no notion of ethernet, virtqueues or TCP. It calls
+`open`, `write`, `read`, `close` — the same four calls it uses for a file and
+the console — and the host on the other side receives the bytes.
+
+One change was needed inside the driver: transmit no longer waits for the
+card to return the descriptor. That wait sat inside `sys_recv`, and would have
+swallowed whatever a client happened to send at that moment. Eight transmit
+buffers used round-robin remove the wait entirely.
+
 ## Next steps
 
 - a blocking `read()` on the console, so the shell stops polling the driver
   (the driver is interrupt-driven now; its client is not)
-- a network *server*: bind the stack at `/net/` so programs reach it through
-  the same open/read/write interface as everything else
+- more than one TCP connection: the interface is a file, but there is still
+  exactly one connection behind it
 - answering ARP and ICMP rather than only initiating them
 - capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)

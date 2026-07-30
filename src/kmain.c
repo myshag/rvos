@@ -218,6 +218,7 @@ void smain(void)
     vfs_bind("/",      FS_TASK_ID);
     vfs_bind("/dev/",  CONSOLE_TASK_ID);
     vfs_bind("/proc/", PROC_TASK_ID);
+    vfs_bind("/net/",  NET_TASK_ID);
 
     kprintf("[boot] 4 user servers, 3 kernel apps, 2 user programs, %d pages.\n",
             pmm_free_count());

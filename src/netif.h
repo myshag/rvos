@@ -16,3 +16,6 @@ void net_putn(const char *label, unsigned long v, const char *tail);
 void net_start(void);                            /* net_ip.c: begin the demo */
 void net_input(uint8 *frame, int len);           /* net_ip.c: a frame arrived */
 void net_timeout(void);                          /* net_ip.c: the alarm fired */
+
+struct vfs_req;
+void net_vfs(struct vfs_req *r);                 /* net_ip.c: serve a client */

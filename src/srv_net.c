@@ -14,6 +14,7 @@
 #include "ulib.h"
 #include "virtio.h"
 #include "netif.h"
+#include "vfs.h"
 
 static volatile uint32 *dev;          /* MMIO base of the device we found */
 
@@ -51,8 +52,13 @@ static struct virtq_avail *tx_avail;
 static struct virtq_used  *tx_used;
 static uint64 tx_desc_pa, tx_avail_pa, tx_used_pa;
 
-static char  *tx_buf;
-static uint64 tx_buf_pa;
+/* Several transmit buffers used round-robin. One would have to be waited on
+   before reuse, and that wait would sit inside sys_recv — swallowing whatever
+   a client happened to send at that moment. */
+#define NTX 8
+static char  *tx_buf[NTX];
+static uint64 tx_buf_pa[NTX];
+static uint16 tx_next;
 
 uint8 net_mac[6];        /* the protocol layer reads this */
 #define mac net_mac
@@ -65,7 +71,6 @@ static struct virtq_used  *rx_used;
 static uint64 rx_buf_pa[NRX];
 static char  *rx_buf[NRX];
 static uint16 rx_last;          /* how much of the used ring we have consumed */
-static uint16 tx_seen;          /* likewise for transmit completions */
 static int    net_irq;          /* mmio slot N is wired to interrupt N+1 */
 
 /* Locate a virtio-mmio slot presenting the network device. */
@@ -194,77 +199,43 @@ static void rx_recycle(uint16 id)
     wr(VIRTIO_QUEUE_NOTIFY, 0);
 }
 
-/* Block until the card says something happened. The device has its own
-   interrupt-status register on top of the PLIC's masking, and both have to be
-   cleared: VIRTIO_INT_ACK tells the card, SYS_IRQ_ACK tells the controller.
-   Miss either and this is the last interrupt we ever see. */
-static void wait_irq(void)
-{
-    unsigned long m;
-    int from = sys_recv(&m, (int)sizeof(m));
-    if (from == IRQ_SENDER) {
-        wr(VIRTIO_INT_ACK, rd(VIRTIO_INT_STATUS));
-        sys_irq_ack(net_irq);
-    }
-}
-
-/* Wait for whichever comes first: a frame or the alarm. Both arrive through
-   sys_recv, so there is still only one place the driver ever blocks. */
-enum { EV_FRAME, EV_TIMEOUT };
-
-static int net_wait(uint8 **frame, int *len, uint16 *id)
+/* Take every frame the card has left for us and pass each one up. */
+static void drain_rx(void)
 {
     for (;;) {
         fence();
-        if (rx_used->idx != rx_last) {
-            struct virtq_used_elem *e = &rx_used->ring[rx_last % VQ_SIZE];
-            *id    = (uint16)e->id;
-            *len   = (int)e->len - (int)sizeof(struct virtio_net_hdr);
-            *frame = (uint8 *)rx_buf[*id] + sizeof(struct virtio_net_hdr);
-            rx_last++;
-            return EV_FRAME;
-        }
-
-        unsigned long m;
-        int from = sys_recv(&m, (int)sizeof(m));
-        if (from == IRQ_SENDER) {
-            wr(VIRTIO_INT_ACK, rd(VIRTIO_INT_STATUS));
-            sys_irq_ack(net_irq);
-        } else if (from == TIMER_SENDER) {
-            return EV_TIMEOUT;
-        }
+        if (rx_used->idx == rx_last)
+            return;
+        struct virtq_used_elem *e = &rx_used->ring[rx_last % VQ_SIZE];
+        uint16 id  = (uint16)e->id;
+        int    len = (int)e->len - (int)sizeof(struct virtio_net_hdr);
+        rx_last++;
+        net_input((uint8 *)rx_buf[id] + sizeof(struct virtio_net_hdr), len);
+        rx_recycle(id);
     }
 }
 
 
 int net_transmit(const void *vframe, int len)
 {
-    struct virtio_net_hdr *h = (struct virtio_net_hdr *)tx_buf;
+    uint16 i = tx_next++ % NTX;
+
+    struct virtio_net_hdr *h = (struct virtio_net_hdr *)tx_buf[i];
     umemset(h, 0, sizeof(*h));                 /* no offloads, no segmentation */
-    umemcpy(tx_buf + sizeof(*h), vframe, (unsigned long)len);
+    umemcpy(tx_buf[i] + sizeof(*h), vframe, (unsigned long)len);
 
-    tx_desc[0].addr  = tx_buf_pa;
-    tx_desc[0].len   = (uint32)(sizeof(*h) + len);
-    tx_desc[0].flags = 0;                      /* device reads it */
-    tx_desc[0].next  = 0;
+    tx_desc[i].addr  = tx_buf_pa[i];
+    tx_desc[i].len   = (uint32)(sizeof(*h) + len);
+    tx_desc[i].flags = 0;                      /* device reads it */
+    tx_desc[i].next  = 0;
 
-    tx_avail->ring[tx_avail->idx % VQ_SIZE] = 0;
+    tx_avail->ring[tx_avail->idx % VQ_SIZE] = i;
     fence();                                   /* ring entry before the index */
     tx_avail->idx++;
     fence();                                   /* index before the doorbell */
 
     wr(VIRTIO_QUEUE_NOTIFY, 1);
-
-    /* The single descriptor is reused, so the device must be finished with it
-       before the next frame overwrites it. */
-    tx_seen++;
-    while (tx_used->idx != tx_seen) {
-        fence();
-        if (tx_used->idx == tx_seen)
-            break;
-        wait_irq();
-    }
-    return 0;   /* an alarm during this wait stays pending; the loop sees it */
+    return 0;                                  /* fire and forget */
 }
 
 void net_server(void)
@@ -312,13 +283,15 @@ void net_server(void)
         sys_exit();
     }
 
-    struct dmapage buf;
-    if (sys_dma_alloc(&buf) < 0) {
-        say("  no dma page for the buffer\n");
-        sys_exit();
+    for (int i = 0; i < NTX; i++) {
+        struct dmapage buf;
+        if (sys_dma_alloc(&buf) < 0) {
+            say("  no dma page for a transmit buffer\n");
+            sys_exit();
+        }
+        tx_buf[i]    = (char *)buf.va;
+        tx_buf_pa[i] = buf.pa;
     }
-    tx_buf = (char *)buf.va;
-    tx_buf_pa = buf.pa;
 
     wr(VIRTIO_STATUS, VIRTIO_S_ACKNOWLEDGE | VIRTIO_S_DRIVER |
                       VIRTIO_S_FEATURES_OK | VIRTIO_S_DRIVER_OK);
@@ -326,15 +299,25 @@ void net_server(void)
 
     net_start();
 
-    /* The driver's whole job from here: take frames off the card and pass
-       them up. It never looks inside one. */
+    /* One blocking call, three kinds of caller: the card, the clock, and now
+       programs asking for the network through the ordinary file interface.
+       The kernel distinguishes them by the sender it reports. */
     for (;;) {
-        uint8 *f; int flen; uint16 id;
-        if (net_wait(&f, &flen, &id) == EV_TIMEOUT) {
+        struct vfs_req req;
+        int from = sys_recv(&req, (int)sizeof(req));
+
+        if (from == IRQ_SENDER) {
+            wr(VIRTIO_INT_ACK, rd(VIRTIO_INT_STATUS));
+            drain_rx();
+            sys_irq_ack(net_irq);
+            continue;
+        }
+        if (from == TIMER_SENDER) {
             net_timeout();
             continue;
         }
-        net_input(f, flen);
-        rx_recycle(id);
+
+        net_vfs(&req);                 /* a client */
+        sys_send(from, &req, (int)sizeof(req));
     }
 }

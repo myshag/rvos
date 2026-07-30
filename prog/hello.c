@@ -59,6 +59,52 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
         vfs_close(fd);
     }
 
+    /* The network, reached exactly like a file — this program contains no
+       notion of ethernet, virtqueues or TCP. */
+    fd = vfs_open("/net/status");
+    if (fd >= 0) {
+        char buf[VFS_DATA_MAX + 1];
+        int n = vfs_read(fd, buf, VFS_DATA_MAX);
+        if (n > 0) {
+            buf[n] = 0;
+            hputs("  [hello] cat /net/status:\n");
+            hputs(buf);
+        }
+        vfs_close(fd);
+    }
+
+    /* The connection may still be coming up — a segment was deliberately
+       lost and the stack is waiting on its retransmit timer. A program that
+       wants the network waits for it, exactly as it would anywhere else. */
+    fd = vfs_open("/net/tcp");
+    if (fd >= 0) {
+        const char *m = "hello from a loaded program\n";
+        int ok = 0;
+        for (int try = 0; try < 4000 && !ok; try++) {
+            if (vfs_write(fd, m, hlen(m)) > 0)
+                ok = 1;
+            else
+                _ecall1(SYS_YIELD, 0);
+        }
+        hputs(ok ? "  [hello] wrote to /net/tcp\n"
+                 : "  [hello] /net/tcp never came up\n");
+
+        if (ok) {
+            char buf[VFS_DATA_MAX + 1];
+            for (int try = 0; try < 4000; try++) {
+                int n = vfs_read(fd, buf, VFS_DATA_MAX);
+                if (n > 0) {
+                    buf[n] = 0;
+                    hputs("  [hello] read back from /net/tcp: ");
+                    hputs(buf);
+                    break;
+                }
+                _ecall1(SYS_YIELD, 0);
+            }
+        }
+        vfs_close(fd);
+    }
+
     hputs("  [hello] done\n");
     sys_exit();                 /* hand our pages back */
 }

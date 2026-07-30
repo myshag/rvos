@@ -9,6 +9,7 @@
 #include "netif.h"
 #include "ulib.h"
 #include "syscall.h"
+#include "vfs.h"
 
 #define ETH_ARP   0x0806
 #define ETH_IPV4  0x0800
@@ -142,7 +143,6 @@ static void udp_send(unsigned dport, const char *msg)
 enum { T_CLOSED, T_SYN_SENT, T_ESTABLISHED, T_FIN_SENT, T_DONE };
 static int    tcp_state;
 static uint32 snd_nxt, rcv_nxt;
-static int    sent_payload;
 
 /* The last segment that consumed sequence space, kept until it is
    acknowledged. Retransmission is the whole of TCP's reliability: a segment
@@ -157,6 +157,12 @@ static int    rt_rto = 300;             /* milliseconds, doubled on each loss */
    would never run and its correctness would be a matter of opinion. This
    drops exactly one segment on the floor after it is built. */
 static int    drop_next = 1;
+
+/* What a reader of /net/tcp gets. The stack keeps received bytes here rather
+   than printing them: it has a client now, and the client decides. */
+#define RXQ 512
+static char rxq[RXQ];
+static int  rxq_len;
 
 static void tcp_send(unsigned flags, const char *data, int dlen)
 {
@@ -258,27 +264,19 @@ static void tcp_input(const uint8 *t, int seglen)
         rcv_nxt = seq + 1;                      /* their SYN counts as one */
         tcp_state = T_ESTABLISHED;
         tcp_send(TCP_ACK, 0, 0);
-        net_puts("  tcp: SYN-ACK received, connection established\n");
-
-        const char *msg = "hello from rvos\n";
-        tcp_send(TCP_ACK | TCP_PSH, msg, ustrlen(msg));
-        sent_payload = 1;
-        net_puts("  tcp: sent 16 bytes\n");
+        net_puts("  tcp: connection established; /net/tcp is open for business\n");
         return;
     }
 
     if (tcp_state == T_ESTABLISHED) {
         if (dlen > 0 && seq == rcv_nxt) {
             rcv_nxt += (uint32)dlen;
-            net_putn("  tcp: received ", (unsigned long)dlen, " bytes: \"");
-            char buf[128];
-            int n = dlen < 120 ? dlen : 120;
-            umemcpy(buf, t + hlen, (unsigned long)n);
-            while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
-                n--;
-            buf[n] = 0;
-            net_puts(buf);
-            net_puts("\"\n");
+            int room = RXQ - rxq_len;
+            int n = dlen < room ? dlen : room;
+            umemcpy(rxq + rxq_len, t + hlen, (unsigned long)n);
+            rxq_len += n;
+            net_putn("  tcp: received ", (unsigned long)dlen,
+                     " bytes, queued for readers\n");
             tcp_send(TCP_ACK, 0, 0);
         }
         if (flags & TCP_FIN) {
@@ -286,10 +284,6 @@ static void tcp_input(const uint8 *t, int seglen)
             tcp_send(TCP_ACK | TCP_FIN, 0, 0);
             tcp_state = T_FIN_SENT;
             net_puts("  tcp: peer closed; sent FIN\n");
-        } else if (sent_payload && dlen > 0) {
-            tcp_send(TCP_ACK | TCP_FIN, 0, 0);
-            tcp_state = T_FIN_SENT;
-            net_puts("  tcp: closing\n");
         }
         return;
     }
@@ -297,6 +291,107 @@ static void tcp_input(const uint8 *t, int seglen)
     if (tcp_state == T_FIN_SENT && (flags & TCP_ACK)) {
         tcp_state = T_DONE;
         net_puts("  tcp: closed\n");
+    }
+}
+
+/* ---- the network as files ---------------------------------------------
+   Two names, reached like any other path through the namespace:
+
+     /net/status   read: a line of text about the interface and connection
+     /net/tcp      write: send on the connection; read: what came back
+
+   The stack knows nothing about who is asking; the caller knows nothing about
+   virtqueues. That is the same bargain the filesystem and console servers
+   made, applied to a network. */
+
+static const char *state_name(void)
+{
+    switch (tcp_state) {
+    case T_CLOSED:      return "closed";
+    case T_SYN_SENT:    return "syn-sent";
+    case T_ESTABLISHED: return "established";
+    case T_FIN_SENT:    return "fin-sent";
+    default:            return "done";
+    }
+}
+
+static int append(char *o, int n, const char *s)
+{
+    int l = ustrlen(s);
+    umemcpy(o + n, s, (unsigned long)l);
+    return n + l;
+}
+
+static int net_status(char *o, int cap)
+{
+    (void)cap;
+    int n = 0;
+    n = append(o, n, "mac      ");
+    for (int i = 0; i < 6; i++) {
+        const char *d = "0123456789abcdef";
+        if (i) o[n++] = ':';
+        o[n++] = d[net_mac[i] >> 4];
+        o[n++] = d[net_mac[i] & 15];
+    }
+    n = append(o, n, "\naddress  10.0.2.15\ngateway  10.0.2.2 ");
+    n = append(o, n, have_gw ? "(resolved)" : "(unresolved)");
+    n = append(o, n, "\ntcp      ");
+    n = append(o, n, state_name());
+    n = append(o, n, " -> 10.0.2.2:9998\nqueued   ");
+    n += uutoa((unsigned long)rxq_len, o + n);
+    n = append(o, n, " bytes waiting to be read\n");
+    return n;
+}
+
+/* Handle one request. Files here are opened by name and answered by number;
+   there is no seek and no state beyond the connection itself. */
+enum { FD_STATUS = 1, FD_TCP = 2 };
+
+void net_vfs(struct vfs_req *r)
+{
+    switch (r->op) {
+    case VFS_OPEN:
+        if (ustr_has_prefix(r->path, "/net/status"))
+            r->result = FD_STATUS;
+        else if (ustr_has_prefix(r->path, "/net/tcp"))
+            r->result = FD_TCP;
+        else
+            r->result = -1;
+        break;
+
+    case VFS_READ:
+        if (r->fd == FD_STATUS) {
+            r->result = net_status(r->data, VFS_DATA_MAX);
+        } else if (r->fd == FD_TCP) {
+            int n = rxq_len < r->len ? rxq_len : r->len;
+            umemcpy(r->data, rxq, (unsigned long)n);
+            rxq_len -= n;
+            for (int i = 0; i < rxq_len; i++)      /* shift the remainder down */
+                rxq[i] = rxq[i + n];
+            r->result = n;
+        } else {
+            r->result = -1;
+        }
+        break;
+
+    case VFS_WRITE:
+        if (r->fd == FD_TCP && tcp_state == T_ESTABLISHED) {
+            tcp_send(TCP_ACK | TCP_PSH, r->data, r->len);
+            net_putn("  tcp: sent ", (unsigned long)r->len,
+                     " bytes on behalf of a program\n");
+            r->result = r->len;
+        } else {
+            r->result = -1;                       /* not connected */
+        }
+        break;
+
+    case VFS_CLOSE:
+        r->result = 0;
+        break;
+
+    default:
+        r->result = -1;
+        break;
     }
 }
 
