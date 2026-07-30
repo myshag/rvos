@@ -298,6 +298,7 @@ $ read the fs server's private data region
 13. reclaiming a dead task's memory, argv, and a shell that runs what you type
 14. the PLIC, and interrupts delivered to a user-mode driver
 15. DMA memory, and a virtio-net driver that sends and receives
+16. interrupt-driven networking, and a ping that gets an answer
 
 ## Loading a program
 
@@ -424,8 +425,20 @@ ringing the doorbell; without them the device can read a half-built ring.
   mac 52:54:00:12:34:56
   driver ok; queues live
   sent an ARP request for 10.0.2.2, 42 bytes
-  received 76 bytes from 52:55:0a:00:02:02 — an ARP reply: 10.0.2.2 is at 52:55:0a:00:02:02
+  arp: 10.0.2.2 is at 52:55:0a:00:02:02
+  sent an ICMP echo request, 50 bytes
+  ping reply from 10.0.2.2, seq 1, 50 bytes
 ```
+
+The driver does not poll. It blocks in `sys_recv`, the card's interrupt (mmio
+slot *N* is wired to line *N+1*) wakes it, and both acknowledgements have to
+happen: `VIRTIO_INT_ACK` tells the card, `SYS_IRQ_ACK` tells the PLIC. Miss
+either and that is the last interrupt the system ever sees.
+
+Checking it honestly means not believing the driver's own account of what it
+did. `make runpcap` writes every frame to `build/net.pcap`; decoding that
+capture confirms the request left, the reply arrived, and — recomputed from
+the bytes rather than taken on trust — the IPv4 and ICMP checksums are right.
 
 Two things worth knowing. QEMU presents virtio-mmio as a **legacy** transport
 unless told otherwise, and its queue registers are laid out differently; the
@@ -440,9 +453,9 @@ the driver without trusting its own report of what it did.
 
 - a blocking `read()` on the console, so the shell stops polling the driver
   (the driver is interrupt-driven now; its client is not)
-- move the driver from polling the used ring to its interrupt (IRQ 8), which
-  the kernel already knows how to deliver
-- ARP and ICMP replies, so the host can ping it
+- a network *server*: bind the driver at `/net/` so programs reach it through
+  the same open/read/write interface as everything else
+- answering ARP and ICMP rather than only initiating them
 - capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
 - a `virtio-blk` driver, replacing the RAM image with a real disk

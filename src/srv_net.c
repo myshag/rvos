@@ -59,6 +59,8 @@ static struct virtq_used  *rx_used;
 static uint64 rx_buf_pa[NRX];
 static char  *rx_buf[NRX];
 static uint16 rx_last;          /* how much of the used ring we have consumed */
+static uint16 tx_seen;          /* likewise for transmit completions */
+static int    net_irq;          /* mmio slot N is wired to interrupt N+1 */
 
 /* Locate a virtio-mmio slot presenting the network device. */
 static int find_device(void)
@@ -210,6 +212,37 @@ static int build_arp(char *p)
     return o;                                  /* 42 bytes */
 }
 
+/* Block until the card says something happened. The device has its own
+   interrupt-status register on top of the PLIC's masking, and both have to be
+   cleared: VIRTIO_INT_ACK tells the card, SYS_IRQ_ACK tells the controller.
+   Miss either and this is the last interrupt we ever see. */
+static void wait_irq(void)
+{
+    unsigned long m;
+    int from = sys_recv(&m, (int)sizeof(m));
+    if (from == IRQ_SENDER) {
+        wr(VIRTIO_INT_ACK, rd(VIRTIO_INT_STATUS));
+        sys_irq_ack(net_irq);
+    }
+}
+
+/* Wait for the next received frame. Returns its length and, through `id`, the
+   descriptor to hand back once the caller is finished with the bytes. */
+static char *receive(int *len, uint16 *id)
+{
+    for (;;) {
+        fence();
+        if (rx_used->idx != rx_last) {
+            struct virtq_used_elem *e = &rx_used->ring[rx_last % VQ_SIZE];
+            *id  = (uint16)e->id;
+            *len = (int)e->len - (int)sizeof(struct virtio_net_hdr);
+            rx_last++;
+            return rx_buf[*id] + sizeof(struct virtio_net_hdr);
+        }
+        wait_irq();
+    }
+}
+
 static int transmit(const char *frame, int len)
 {
     struct virtio_net_hdr *h = (struct virtio_net_hdr *)tx_buf;
@@ -228,14 +261,72 @@ static int transmit(const char *frame, int len)
 
     wr(VIRTIO_QUEUE_NOTIFY, 1);
 
-    /* Wait for the device to hand the descriptor back. */
-    for (int spin = 0; spin < 100000; spin++) {
+    /* The single descriptor is reused, so the device must be finished with it
+       before the next frame overwrites it. */
+    tx_seen++;
+    while (tx_used->idx != tx_seen) {
         fence();
-        if (tx_used->idx != 0)
-            return 0;
-        _ecall1(SYS_YIELD, 0);
+        if (tx_used->idx == tx_seen)
+            break;
+        wait_irq();
     }
-    return -1;
+    return 0;
+}
+
+/* The one's-complement sum both IPv4 and ICMP use. Folding the carries back
+   in is what makes it end-around; leaving that out gives a checksum that is
+   right for small packets and wrong for large ones. */
+static uint16 checksum(const uint8 *p, int len)
+{
+    uint32 sum = 0;
+    for (int i = 0; i + 1 < len; i += 2)
+        sum += ((uint32)p[i] << 8) | p[i + 1];
+    if (len & 1)
+        sum += (uint32)p[len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16)(~sum & 0xffff);
+}
+
+static void put16(uint8 *p, unsigned v) { p[0] = (uint8)(v >> 8); p[1] = (uint8)v; }
+
+static const uint8 me_ip[4] = { 10, 0, 2, 15 };
+static const uint8 gw_ip[4] = { 10, 0, 2, 2 };
+static uint8 gw_mac[6];
+
+/* An ICMP echo request to the gateway, wrapped in IPv4 and ethernet. */
+static int build_ping(uint8 *p, uint16 seq)
+{
+    int o = 0;
+    umemcpy(p + o, gw_mac, 6); o += 6;
+    umemcpy(p + o, mac, 6);    o += 6;
+    put16(p + o, 0x0800);      o += 2;          /* ethertype: IPv4 */
+
+    uint8 *ip = p + o;
+    int icmp_len = 8 + 8;                       /* header + payload */
+    ip[0] = 0x45;                               /* IPv4, 5-word header */
+    ip[1] = 0;
+    put16(ip + 2, (unsigned)(20 + icmp_len));   /* total length */
+    put16(ip + 4, 0x1234);                      /* identification */
+    put16(ip + 6, 0);                           /* no fragmentation */
+    ip[8]  = 64;                                /* ttl */
+    ip[9]  = 1;                                 /* protocol: ICMP */
+    put16(ip + 10, 0);                          /* checksum, filled below */
+    umemcpy(ip + 12, me_ip, 4);
+    umemcpy(ip + 16, gw_ip, 4);
+    put16(ip + 10, checksum(ip, 20));           /* header only, by definition */
+
+    uint8 *ic = ip + 20;
+    ic[0] = 8;                                  /* echo request */
+    ic[1] = 0;
+    put16(ic + 2, 0);                           /* checksum, filled below */
+    put16(ic + 4, 0xabcd);                      /* identifier */
+    put16(ic + 6, seq);
+    for (int i = 0; i < 8; i++)
+        ic[8 + i] = (uint8)('a' + i);
+    put16(ic + 2, checksum(ic, icmp_len));      /* covers header and payload */
+
+    return o + 20 + icmp_len;
 }
 
 void net_server(void)
@@ -250,6 +341,8 @@ void net_server(void)
         say("  no virtio-net device found\n");
         sys_exit();
     }
+    net_irq = slot + 1;               /* the 'virt' board wires them in order */
+    sys_irq_register(net_irq);
     say_num("  found virtio-net in mmio slot ", (unsigned long)slot, "");
     say_num(", version ", (unsigned long)rd(VIRTIO_VERSION), "\n");
 
@@ -302,38 +395,43 @@ void net_server(void)
     say_num("  sent an ARP request for 10.0.2.2, ", (unsigned long)len,
             " bytes\n");
 
-    /* Listen for the answer. */
-    for (int spin = 0; spin < 200000; spin++) {
-        fence();
-        if (rx_used->idx == rx_last) {
-            _ecall1(SYS_YIELD, 0);
-            continue;
-        }
-        struct virtq_used_elem *e = &rx_used->ring[rx_last % VQ_SIZE];
-        uint16 id  = (uint16)e->id;
-        uint32 got = e->len;
-        rx_last++;
-
-        /* The frame starts after the 12-byte virtio header. */
-        const uint8 *f = (const uint8 *)rx_buf[id] + sizeof(struct virtio_net_hdr);
+    /* From here on the driver is interrupt-driven: it blocks in receive(),
+       which blocks in sys_recv(), which the kernel wakes when the card fires.
+       No polling anywhere. */
+    int have_gw = 0, pinged = 0, replies = 0;
+    while (replies == 0) {
+        int flen; uint16 id;
+        uint8 *f = (uint8 *)receive(&flen, &id);
         unsigned etype = ((unsigned)f[12] << 8) | f[13];
 
-        say_num("  received ", (unsigned long)got, " bytes from ");
-        for (int i = 0; i < 6; i++) {
-            if (i) say(":");
-            say_hex2(f[6 + i]);
-        }
-        if (etype == 0x0806 && f[21] == 2) {
-            say(" — an ARP reply: 10.0.2.2 is at ");
-            for (int i = 0; i < 6; i++) {
-                if (i) say(":");
-                say_hex2(f[22 + i]);
+        if (etype == 0x0806 && f[21] == 2 && !have_gw) {     /* ARP reply */
+            umemcpy(gw_mac, f + 22, 6);
+            have_gw = 1;
+            say("  arp: 10.0.2.2 is at ");
+            for (int i = 0; i < 6; i++) { if (i) say(":"); say_hex2(gw_mac[i]); }
+            say("\n");
+        } else if (etype == 0x0800 && f[23] == 1) {          /* IPv4 + ICMP */
+            uint8 *ic = f + 14 + 20;
+            if (ic[0] == 0) {                                /* echo reply */
+                unsigned seq = ((unsigned)ic[6] << 8) | ic[7];
+                say_num("  ping reply from 10.0.2.2, seq ",
+                        (unsigned long)seq, ", ");
+                say_num("", (unsigned long)flen, " bytes\n");
+                replies++;
             }
         }
-        say("\n");
 
         rx_recycle(id);
-        break;
+
+        if (have_gw && !pinged) {
+            uint8 ping[64];
+            int plen = build_ping(ping, 1);
+            if (transmit((const char *)ping, plen) == 0) {
+                say_num("  sent an ICMP echo request, ", (unsigned long)plen,
+                        " bytes\n");
+                pinged = 1;
+            }
+        }
     }
 
     for (;;)
