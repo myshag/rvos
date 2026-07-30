@@ -1,30 +1,37 @@
-/* kmain.c — Stage 2: bring up traps + timer, create two tasks, and hand off to
-   the preemptive scheduler. Interleaved A/B output proves timer preemption. */
+/* kmain.c — Stage 3: synchronous IPC. A server task blocks in recv(); two
+   client tasks send it numbered messages. Ordering proves the rendezvous
+   (senders block until the server picks them up). */
 #include "uart.h"
 #include "task.h"
 #include "syscall.h"
 
-static void spin(volatile unsigned long n)
-{
-    while (n--)
-        __asm__ volatile("nop");
-}
+#define SERVER_ID 0
 
-static void task_a(void)
+static void spin(volatile unsigned long n) { while (n--) __asm__ volatile("nop"); }
+
+static void server(void)
 {
-    for (unsigned long i = 0;; i++) {
-        kprintf("  [A] step %lu\n", i);
-        spin(2000000);
-        if ((i & 3) == 3)
-            yield();            /* also exercise the voluntary path */
+    kprintf("  [server] up, waiting for messages\n");
+    for (;;) {
+        uint64 msg;
+        int from = sys_recv(&msg);
+        kprintf("  [server] got 0x%lx from task %d\n", msg, from);
     }
 }
 
-static void task_b(void)
+static void client1(void)
 {
-    for (unsigned long i = 0;; i++) {
-        kprintf("  [B] step %lu\n", i);
-        spin(3000000);
+    for (uint64 i = 0;; i++) {
+        sys_send(SERVER_ID, 0x1000 + i);     /* blocks until server recvs */
+        spin(4000000);
+    }
+}
+
+static void client2(void)
+{
+    for (uint64 i = 0;; i++) {
+        sys_send(SERVER_ID, 0x2000 + i);
+        spin(6000000);
     }
 }
 
@@ -33,15 +40,16 @@ void kmain(void)
     uart_init();
     kprintf("\n=============================================\n");
     kprintf("  rvos — educational RISC-V microkernel\n");
-    kprintf("  stage 2: traps + timer + preemptive RR\n");
+    kprintf("  stage 3: synchronous IPC (send/recv)\n");
     kprintf("=============================================\n");
 
     trap_init();
     timer_init();
 
-    task_create("A", task_a);
-    task_create("B", task_b);
-    kprintf("[boot] 2 tasks created; starting scheduler.\n");
+    task_create("server", server);          /* id 0 */
+    task_create("client1", client1);        /* id 1 */
+    task_create("client2", client2);        /* id 2 */
+    kprintf("[boot] server + 2 clients; starting scheduler.\n");
 
-    scheduler_start();          /* never returns */
+    scheduler_start();
 }

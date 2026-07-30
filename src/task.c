@@ -66,7 +66,8 @@ void syscall_dispatch(uint64 num)
         uart_putc((char)current->ctx.x[10]);
         break;
     default:
-        kprintf("[warn] task %s: bad syscall %ld\n", current->name, num);
+        if (!ipc_syscall(num))
+            kprintf("[warn] task %s: bad syscall %ld\n", current->name, num);
         break;
     }
 }

@@ -21,11 +21,12 @@ struct task {
     enum task_state state;
     int    id;
     const char *name;
-    /* IPC (stage 3) */
-    struct task *ipc_from;      /* who we are blocked receiving/sending to */
-    uint64 ipc_msg;             /* transferred message word */
-    struct task *wait_sender;   /* queue head of tasks blocked sending to us */
-    struct task *send_next;     /* intrusive link within a receiver's queue */
+    /* IPC (stage 3): synchronous rendezvous message passing */
+    uint64  ipc_msg;            /* message a blocked sender is delivering */
+    uint64 *recv_ptr;           /* where a blocked receiver wants its message */
+    int     waiting_recv;       /* 1 => blocked in recv (vs. blocked in send) */
+    struct task *wait_sender;   /* head of senders blocked on us as receiver */
+    struct task *send_next;     /* intrusive link within that sender queue */
 };
 
 extern struct task *current;
@@ -39,3 +40,6 @@ void syscall_dispatch(uint64 num);   /* called from trap.c on ecall */
 /* trap / timer bring-up (trap.c) */
 void trap_init(void);
 void timer_init(void);
+
+/* IPC (ipc.c) — returns 1 if it handled `num`. */
+int ipc_syscall(uint64 num);

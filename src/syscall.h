@@ -29,5 +29,6 @@ static inline long _ecall2(long n, long a0, long a1)
 
 static inline void sys_yield(void)              { _ecall1(SYS_YIELD, 0); }
 static inline void sys_send(int dst, uint64 m)  { _ecall2(SYS_SEND, dst, (long)m); }
-/* recv: returns sender id; *msg receives the word (kernel writes a1 slot). */
-int sys_recv(uint64 *msg);
+/* recv: blocks until a message arrives; kernel writes *msg and returns the
+   sender's task id in a0. */
+static inline int sys_recv(uint64 *msg)         { return (int)_ecall1(SYS_RECV, (long)msg); }
