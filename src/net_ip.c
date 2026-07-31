@@ -944,6 +944,7 @@ static void tcp_close(struct tcb *c)
    waiting for a child, which is a narrower window and the same trade. */
 static int rcv_accept(struct tcb *c, const uint8 *data, int len)
 {
+    int cut = -1;
     if (c->intr_task > 0)
         for (int i = 0; i < len; i++)
             if (data[i] == TCP_INTR) {
@@ -951,16 +952,36 @@ static int rcv_accept(struct tcb *c, const uint8 *data, int len)
                     sys_kill(c->intr_task);
                 c->intr_task  = 0;
                 c->intr_fired = 1;
+                cut = i;
                 net_puts("  tcp: interrupt character; the program was killed\n");
                 break;
             }
+
     int room = RXQ - c->rxq_len;
     int n = len < room ? len : room;
-    if (n > 0) {
+    if (n <= 0)
+        return 0;
+
+    if (cut < 0 || cut >= n) {
         umemcpy(c->rxq + c->rxq_len, data, (unsigned long)n);
         c->rxq_len += n;
+        return n;
     }
-    return n;
+
+    /* Acted on *and* swallowed, which is what the console server has always
+       done with it and what the comment above claimed this did. It did not:
+       the byte was killed on and then queued as well, so the shell's own
+       reader saw it too and printed a second ^C. Two implementations of one
+       idea, and this is how they drift.
+
+       Swallowed only when it fired. With nobody nominated the byte is data
+       like any other, and the shell wants it — that is how Ctrl-C cancels a
+       half-typed line when no program is running. */
+    umemcpy(c->rxq + c->rxq_len, data, (unsigned long)cut);
+    umemcpy(c->rxq + c->rxq_len + cut, data + cut + 1,
+            (unsigned long)(n - cut - 1));
+    c->rxq_len += n - 1;
+    return n;                           /* the peer sent n; we took them all */
 }
 
 static void ooo_drain(struct tcb *c)

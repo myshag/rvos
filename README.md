@@ -3775,6 +3775,31 @@ there. Moving the `vfs_open` into the session thread is the whole fix, and the
 comment explaining why is longer than the change.
 
 
+### Why the interrupt character is implemented twice
+
+Because the byte has to be caught by whoever sees it first, and that is
+whoever owns the input: the console server drains it from the UART's queue in
+its interrupt handler, the network server takes it out of a segment in
+`rcv_accept`. Between a driver and the program reading from it there is
+nothing at all.
+
+Unix has that nothing filled in — the line discipline sits between the driver
+and the reader, and every terminal-ish device plugs into it. This system has
+no such layer precisely because **a terminal is not a type here, it is a
+name**: what makes something a terminal is what `/dev/console` resolves to in
+your namespace. A single layer could be built as a third server in the middle,
+and then every byte of input would cross two message round trips instead of
+one — 110 µs added to a keystroke for the sake of something that fires once a
+session. So it is written twice.
+
+And it drifted, the way two implementations of one idea do. The comment on the
+network side said the byte was "acted on rather than delivered"; the code
+killed the task and queued the byte anyway, so the shell's own reader saw it
+too and printed a second `^C`. Both now swallow it, and both only when it
+fired — with nobody nominated the byte is ordinary data, which is how Ctrl-C
+cancels a half-typed line when no program is running.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per
