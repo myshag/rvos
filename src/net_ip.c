@@ -1559,12 +1559,19 @@ static int net_status(char *o, int cap)
 #define NPFD 4
 enum { FD_STATUS0 = 1, FD_CTL0 = 8, FD_CONN0 = 16 };
 
+/* Each open gets a buffer of its own, holding either a ctl answer or a
+   snapshot of the status report. The snapshot matters: rendering afresh on
+   every read means a reader's offset can end up pointing into a *different*
+   string than the one it started reading — one number grew a digit between
+   two reads and a stray character appeared at the end. A file is a sequence
+   of bytes that does not change under the reader; a report that does is not
+   a file. */
 static struct {
     int  used;
     int  owner;                     /* the task that opened it */
     int  off;
-    int  len;                       /* ctl only: bytes of answer waiting */
-    char answer[64];
+    int  len;                       /* bytes of answer or snapshot waiting */
+    char buf[VFS_DATA_MAX];
 } pfd[NPFD];
 
 static struct tcb *conn_of(int fd)
@@ -1643,7 +1650,7 @@ static void ctl_answer(struct parked *p, const char *text, const uint8 *ip)
         p->used = 0;
         return;
     }
-    char *o = pfd[pi].answer;
+    char *o = pfd[pi].buf;
     int   n = app(o, 0, text);
     if (ip) {
         n = app_ip(o, n, ip);
@@ -1813,7 +1820,7 @@ static void net_wakeups(void)
             l->reader.used = 0;
 
             int pi = p.fd - FD_CTL0;
-            char *o = pfd[pi].answer;
+            char *o = pfd[pi].buf;
             int   n = 0;
             n = app(o, n, "ok ");
             n += uutoa((unsigned long)k, o + n);
@@ -1891,7 +1898,7 @@ static int word_is(const char **s, const char *word)
    parked (accept, with nobody calling yet). */
 static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
 {
-    char *o = pfd[pi].answer;
+    char *o = pfd[pi].buf;
     int   n = 0;
     const char *s = skip_spaces(cmd);
 
@@ -2015,7 +2022,11 @@ int net_vfs(int from, struct vfs_req *r)
                     pfd[i].used  = 1;
                     pfd[i].owner = from;
                     pfd[i].off   = 0;
-                    pfd[i].len   = 0;
+                    /* The status file is rendered once, here: what the caller
+                       reads is the system as it was when it opened it. */
+                    pfd[i].len   = base == FD_STATUS0
+                                 ? net_status(pfd[i].buf, (int)sizeof(pfd[i].buf))
+                                 : 0;
                     r->result = base + i;
                     break;
                 }
@@ -2044,36 +2055,20 @@ int net_vfs(int from, struct vfs_req *r)
     }
 
     case VFS_READ:
-        if (r->fd >= FD_STATUS0 && r->fd < FD_STATUS0 + NPFD) {
-            int i = r->fd - FD_STATUS0;
+        if ((r->fd >= FD_STATUS0 && r->fd < FD_STATUS0 + NPFD) ||
+            (r->fd >= FD_CTL0    && r->fd < FD_CTL0 + NPFD)) {
+            int i = (r->fd >= FD_CTL0 ? r->fd - FD_CTL0 : r->fd - FD_STATUS0);
             if (!pfd[i].used) {
                 r->result = -1;
                 break;
             }
-            /* Rendered afresh each time, then served from the caller's
-               offset: the report is of the system as it is now, and it is
-               short enough that one read takes all of it. */
-            static char page[VFS_DATA_MAX];
-            int len = net_status(page, (int)sizeof(page));
-            int n = len - pfd[i].off;
+            int n = pfd[i].len - pfd[i].off;
             if (n > r->len)
                 n = r->len;
             if (n <= 0) {
                 r->result = 0;                          /* end of file */
             } else {
-                umemcpy(r->data, page + pfd[i].off, (unsigned long)n);
-                pfd[i].off += n;
-                r->result = n;
-            }
-        } else if (r->fd >= FD_CTL0 && r->fd < FD_CTL0 + NPFD) {
-            int i = r->fd - FD_CTL0;
-            int n = pfd[i].len - pfd[i].off;
-            if (n > r->len)
-                n = r->len;
-            if (n <= 0) {
-                r->result = 0;
-            } else {
-                umemcpy(r->data, pfd[i].answer + pfd[i].off, (unsigned long)n);
+                umemcpy(r->data, pfd[i].buf + pfd[i].off, (unsigned long)n);
                 pfd[i].off += n;
                 r->result = n;
             }

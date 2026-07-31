@@ -71,6 +71,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/user.c`       | user-mode demo programs |
 | `src/loader.c`     | **ELF loader** — user mode; the kernel never parses ELF |
 | `src/sh.c`         | an interactive shell — reads a line, runs what you typed |
+| `src/srv_rsh.c`    | the same shell, reached over TCP on port 23 |
 | `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
 | `prog/netd.c`      | a program that owns TCP port 7 and answers callers |
 | `prog/get.c`       | an HTTP client: resolve, connect, fetch — all through files |
@@ -228,7 +229,11 @@ rvos$ /NETD.ELF
 ```
 ```bash
 nc localhost 5555            # on the host: talks to /NETD.ELF in the guest
+nc localhost 5556            # a shell on the guest, over its own TCP stack
 ```
+
+Port 5556 needs no program started for it: the remote shell is a task and
+takes port 23 at boot.
 
 Exit QEMU with `Ctrl-A` then `X`.
 
@@ -335,6 +340,8 @@ $ read the fs server's private data region
     becomes `/GET.ELF`, a program that names its own host
 24. generation-tagged task ids, a `send` that reports a dead destination, and
     servers that reclaim what a dead client was holding
+25. a shell over TCP: the same shell, reading and writing a connection
+    instead of the console
 
 ## Loading a program
 
@@ -1175,8 +1182,98 @@ sweep also costs a handful of `SYS_ALIVE` traps per request, which is fine at
 four connections and would not be at four thousand. And the console still
 takes one waiter.
 
+## A shell over TCP
+
+`sh.c` reads from `/dev/console` and writes to it. `srv_rsh.c` reads from a
+TCP connection and writes to it, and is otherwise the same program: a line,
+split into words, either a builtin or a path to run. Nothing about the network
+is visible in it beyond four lines of setup — it asks `/net/ctl` for port 23,
+accepts, opens `/net/tcp/N`, and from there the connection is a file.
+
+```
+$ nc localhost 5556
+
+rvos — you are on the guest, over its own TCP stack.
+type `help`. connection 0
+
+rvos# net
+mac      52:54:00:12:34:56
+address  10.0.2.15/24
+gateway  10.0.2.2
+arp      10.0.2.2 -> 52:55:0a:00:02:02
+tcp 0 established  :23 <-> 10.0.2.2:46936
+        rx 0  unacked 0  srtt 1ms  rto 200ms  cwnd 7168
+tcp 1 listen       :23
+
+rvos# cat /README.TXT
+rvos readme
+===========
+Educational RISC-V microkernel with FAT16.
+
+rvos# run /GET.ELF example.com
+started as task 518; its output goes to the serial console
+```
+
+`cat` is the command worth looking at, and it is worth looking at because it
+is dull. The path may be a file on the FAT16 volume, a report the proc server
+renders on demand, or the state of a TCP connection — and neither `cat`, nor
+the shell, nor the connection carrying the answer can tell which. The second
+line of that transcript is the stack describing, over one of its own
+connections, the connection it is describing it over.
+
+It is a task in `kernel.elf` rather than a program on the disk for one reason:
+`spawn()` lives in the shared user text that this image links, and a program
+loaded from FAT16 cannot reach it. Everything else it does, a disk program
+could.
+
+### Two bugs this turned up
+
+**A linker glob that was nearly right.** The remote shell needs its own
+writable region — sharing the local shell's would mean two tasks sharing a
+line buffer and an ELF scratch area. It got one, and it stayed empty, because
+the existing pattern for the local shell was `*sh.o`, and ld matches these
+against the whole path it is given: `build/srv_rsh.o` ends in `sh.o` too. So
+the new file's globals were quietly filed under the old shell's region, the
+region that should have held them had nothing in it, and the first write
+faulted:
+
+```
+[trap] store page fault in task 'rsh'
+       scause=15  stval=0x80013000
+```
+
+Anchoring the pattern with a directory separator fixes it. The lesson is not
+about ld: a glob that is *nearly* right is worse than one that is wrong,
+because the build succeeds and the symptom arrives somewhere else.
+
+**A file that changed under its reader.** `cat /net/status` over TCP printed a
+stray digit at the end. The status file was rendered afresh on every read and
+served from the caller's offset — and between the first read and the second,
+`cwnd` had grown a digit, so the offset now pointed into a longer string. It
+is rendered once, at `open`, and the reader gets the system as it was when it
+asked. A report that changes under its reader is not a file.
+
+### What it does not do
+
+A program started with `run` writes through `SYS_PUTC`, which is the console
+of last resort and goes to the serial line — so its output appears on the
+local console, not down the connection. Redirecting it is not a change to this
+shell but to how every program writes: output would have to go to a path
+rather than a syscall, and the child would have to inherit a namespace in
+which that path means the connection. The pieces for that exist — `vfs_bind`,
+`vfs_ns_clone`, a per-task mount table — but a task created by `SYS_NEWTASK`
+currently gets the root namespace rather than its creator's, so the last step
+is missing. `run` reports the task id and says where to look, which is honest
+if not satisfying.
+
+One session at a time, for the same reason `netd` takes one caller at a time:
+there is no `poll`.
+
 ## Next steps
 
+- a spawned program's output following it: child inherits the parent's
+  namespace, programs write to a path rather than to `SYS_PUTC`, and `run`
+  over TCP shows what it started
 - `poll`/`select`, or a second task per connection — either would let `netd`
   serve more than one caller at a time
 - more than one waiter on the console, so two programs can read keystrokes

@@ -15,6 +15,7 @@
 #define SH_TASK_ID      10
 #define NET_TASK_ID     11
 #define IDLE_TASK_ID    12
+#define RSH_TASK_ID     13
 
 void fs_server(void);        /* srv_fs.c      — FAT16 behind the interface */
 void console_server(void);   /* srv_console.c — UART behind the interface */

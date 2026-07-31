@@ -40,11 +40,12 @@ DISK_ADDR := 0x84000000
 # driver speaks virtio 1.x, so the transport has to be the modern one.
 # hostfwd is what makes the guest reachable at all: QEMU's user-mode network
 # is a NAT, so nothing on the host can open a connection inward unless a port
-# is forwarded. localhost:5555 becomes 10.0.2.15:7 inside the guest, which is
-# the port the stack listens on — `nc localhost 5555` is a call into rvos.
+# is forwarded. localhost:5555 becomes 10.0.2.15:7 — the port /NETD.ELF takes
+# once you start it — and localhost:5556 becomes port 23, where the shell is
+# listening from boot. `nc localhost 5556` is a login.
 QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic \
            -global virtio-mmio.force-legacy=false -kernel $(ELF) \
-           -netdev user,id=n0,hostfwd=tcp::5555-:7 \
+           -netdev user,id=n0,hostfwd=tcp::5555-:7,hostfwd=tcp::5556-:23 \
            -device virtio-net-device,netdev=n0
 
 .PHONY: all run rundisk runpcap disk prog clean

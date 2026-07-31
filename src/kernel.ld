@@ -29,7 +29,8 @@ SECTIONS
         *srv_fs.o(.text .text.*)
         *srv_proc.o(.text .text.*)
         *loader.o(.text .text.*)
-        *sh.o(.text .text.*)
+        */sh.o(.text .text.*)
+        *srv_rsh.o(.text .text.*)
         *srv_net.o(.text .text.*)
         *net_ip.o(.text .text.*)
         *fat16.o(.text .text.*)
@@ -42,7 +43,8 @@ SECTIONS
         *srv_fs.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_proc.o(.rodata .rodata.* .srodata .srodata.*)
         *loader.o(.rodata .rodata.* .srodata .srodata.*)
-        *sh.o(.rodata .rodata.* .srodata .srodata.*)
+        */sh.o(.rodata .rodata.* .srodata .srodata.*)
+        *srv_rsh.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_net.o(.rodata .rodata.* .srodata .srodata.*)
         *net_ip.o(.rodata .rodata.* .srodata .srodata.*)
         *fat16.o(.rodata .rodata.* .srodata .srodata.*)
@@ -104,20 +106,46 @@ SECTIONS
     . = ALIGN(4096);
     __uload_end = .;
 
-    /* the shell (line buffer and ELF scratch) */
+    /* the shell (line buffer and ELF scratch).
+
+       The pattern below is anchored with a directory separator on purpose. ld
+       matches these against the whole path it was given, so a bare "star sh.o"
+       also matches build/srv_rsh.o — which quietly put the remote shell's
+       globals in this region, left its own region empty, and produced a store
+       page fault the first time it wrote to one of them. A glob that is
+       nearly right is worse than one that is wrong: the build succeeds.
+
+       (And a literal star-slash cannot appear in this comment, which is its
+       own small lesson about writing linker scripts.) */
     __ush_start = .;
     .ush_data : {
-        *sh.o(.data .data.* .sdata .sdata.*)
+        */sh.o(.data .data.* .sdata .sdata.*)
     }
     . = ALIGN(8);
     __ush_bss_start = .;
     .ush_bss : {
-        *sh.o(.sbss .sbss.* .bss .bss.* COMMON)
+        */sh.o(.sbss .sbss.* .bss .bss.* COMMON)
     }
     . = ALIGN(8);
     __ush_bss_end = .;
     . = ALIGN(4096);
     __ush_end = .;
+
+    /* the shell that arrives over TCP (its own line and ELF buffers: sharing
+       the local shell's would be sharing writable state between two tasks) */
+    __ursh_start = .;
+    .ursh_data : {
+        *srv_rsh.o(.data .data.* .sdata .sdata.*)
+    }
+    . = ALIGN(8);
+    __ursh_bss_start = .;
+    .ursh_bss : {
+        *srv_rsh.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __ursh_bss_end = .;
+    . = ALIGN(4096);
+    __ursh_end = .;
 
     /* the network driver and protocol layer */
     __unet_start = .;

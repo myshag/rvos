@@ -114,6 +114,7 @@ static void shell(void)
     sys_send(LOADER_TASK_ID,  &m, (int)sizeof(m));
     sys_send(SH_TASK_ID,      &m, (int)sizeof(m));
     sys_send(NET_TASK_ID,     &m, (int)sizeof(m));
+    sys_send(RSH_TASK_ID,     &m, (int)sizeof(m));
 
     for (;;)
         yield();
@@ -124,6 +125,7 @@ void peeker_main(void);      /* user.c — probes another server's memory */
 void loader_main(void);      /* loader.c — reads an ELF and spawns it */
 void sh_main(void);          /* sh.c — reads a command line and runs it */
 void net_server(void);       /* srv_net.c — virtio-net, in user mode */
+void rsh_main(void);         /* srv_rsh.c — the same shell, over TCP */
 
 /* Always runnable, so the scheduler never runs out of candidates — without
    it, retiring a faulting task while everyone else is blocked left nothing to
@@ -150,6 +152,7 @@ void smain(void)
         extern char __uproc_bss_start[], __uproc_bss_end[];
         extern char __uload_bss_start[], __uload_bss_end[];
         extern char __ush_bss_start[],   __ush_bss_end[];
+        extern char __ursh_bss_start[],  __ursh_bss_end[];
         extern char __unet_bss_start[],  __unet_bss_end[];
         extern char __umisc_bss_start[], __umisc_bss_end[];
         char *bss[][2] = {
@@ -157,6 +160,7 @@ void smain(void)
             { __uproc_bss_start, __uproc_bss_end },
             { __uload_bss_start, __uload_bss_end },
             { __ush_bss_start,   __ush_bss_end   },
+            { __ursh_bss_start,  __ursh_bss_end  },
             { __unet_bss_start,  __unet_bss_end  },
             { __umisc_bss_start, __umisc_bss_end },
         };
@@ -186,6 +190,7 @@ void smain(void)
     extern char __umisc_start[], __umisc_end[];
     extern char __uload_start[], __uload_end[];
     extern char __ush_start[], __ush_end[];
+    extern char __ursh_start[], __ursh_end[];
     extern char __unet_start[], __unet_end[];
 
     /* The system services are user programs now. */
@@ -210,6 +215,10 @@ void smain(void)
     struct task *net =
         task_create_user("net", net_server, __unet_start, __unet_end); /* 11 */
     task_create("idle",    idle);                     /* 12 */
+    /* The shell you reach over the network. It needs spawn(), which lives
+       in the shared user text linked into this image, so it is a task here
+       rather than a program on the disk. */
+    task_create_user("rsh", rsh_main, __ursh_start, __ursh_end); /* 13 */
 
     /* Devices are handed to their driver and to nobody else — with the U bit,
        so the driver reaches them from user mode without the kernel on the
