@@ -47,10 +47,31 @@ static struct fs_file fs_tab[FS_MAXFD];
    where presentation belongs. */
 static int fs_format_dir(const char *path, char *out, int cap)
 {
-    /* Static, not on the stack: a long name is 96 bytes and two dozen of them
-       is more than a task's stack wants to carry. */
-    static struct dirent ents[32];
-    int n = fat16_list(path, ents, 32);
+    /* Not on the stack: a long name is 96 bytes and two dozen of them is more
+       than a task's stack wants to carry. It used to be a static array of
+       thirty-two, which meant the thirty-third file in a directory did not
+       exist as far as anything above this line was concerned — silently, with
+       nothing anywhere reporting a truncation. It grows until the driver
+       stops filling it, which is the only way to know it did not. */
+    static struct dirent *ents;
+    static int room;
+
+    int n;
+    for (;;) {
+        if (!ents) {
+            room = 32;
+            ents = malloc((unsigned long)room * sizeof *ents);
+            if (!ents) { room = 0; return -1; }
+        }
+        n = fat16_list(path, ents, room);
+        if (n < room)
+            break;                      /* it stopped early, so it stopped */
+        struct dirent *bigger = realloc(ents, (unsigned long)room * 2 * sizeof *ents);
+        if (!bigger)
+            break;                      /* report what we have rather than nothing */
+        ents = bigger;
+        room *= 2;
+    }
     if (n < 0)
         return -1;
     int o = 0;

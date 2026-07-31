@@ -2788,6 +2788,61 @@ back what it borrowed, and a task that exits hands back the rest, because
 is exactly that.
 
 
+### Where else it belonged, and where it did not
+
+The allocator went in to remove limits, so the next question is which of the
+remaining fixed arrays are limits and which are decisions. The IP stack held
+the answer to both.
+
+**A TCP control block was 7.9 kilobytes**, almost all of it three buffers: two
+kilobytes to send, two to receive, and three slots of twelve hundred bytes for
+segments that arrive out of order. Four of those is thirty-one kilobytes of
+memory that a machine with no connections was carrying anyway. The buffers are
+allocated when a block is claimed and freed when it is released, and the
+out-of-order slots are allocated only when a segment actually arrives out of
+order — which on a working link is never, so the rarest path in the stack had
+been half its memory.
+
+**The count of control blocks stayed fixed, and that is the decision.** A
+stack that allocates a block for every arriving SYN can be pushed out of
+memory by a stranger; it is the oldest denial of service there is and the
+reason SYN cookies exist. A fixed four bounds what a peer can make this
+machine spend. What is inside them is another matter — nobody can make this
+machine hold more than four connections' worth of buffers, and an idle stack
+now costs a few hundred bytes.
+
+There is a pleasing consequence in the reassembly path. If the allocation for
+a held-aside segment fails, the segment is dropped — which is exactly what the
+code already did when its queue was full, and exactly what the protocol was
+designed around. **An allocation that fails in TCP is not an error; it is a
+lost packet.**
+
+The filesystem server's directory listing was the one real bug found by
+looking. It read into a static array of thirty-two entries, so the
+thirty-third file in a directory did not exist as far as anything above that
+line was concerned — silently, with nothing reporting a truncation. It grows
+now until the driver stops filling it, which is the only way to know that it
+did not truncate. A directory of sixty files was the test, and sixty came
+back.
+
+What stayed static, on purpose:
+
+| stayed | why |
+|--------|-----|
+| `ns_pool` in the namespace code, 9.8 KiB | it is kernel memory, and the kernel has a page allocator and no heap — `malloc.h` runs in user tasks by construction |
+| the task table, 7.8 KiB | a task id is a slot number and a generation; the table is the mechanism, not a buffer |
+| the trap stack, 4 KiB | it has to exist before anything can allocate anything |
+| the IP stack's packet scratch, 3.6 KiB | one buffer used on every frame in and out — allocating it per packet would be pure cost |
+| the console's key ring, 256 B | it catches keystrokes at interrupt time |
+
+The kernel's `.bss` finished at **83160 bytes, from 313592 four commits ago** —
+a quarter of what it was. And it costs nothing measurable: five runs of `ping /`
+on each build put the message round trip at 94–117 µs before and 94–111 µs
+after, and `open+close`, which now allocates and frees a whole-file buffer on
+every open, at 177–217 µs before and 182–218 µs after. The allocation is lost
+in the two messages around it.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

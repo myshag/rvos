@@ -27,6 +27,7 @@
    written, has never been observed working: this link loses nothing that was
    not deliberately dropped. */
 #include "netif.h"
+#include "malloc.h"
 #include "ulib.h"
 #include "syscall.h"
 #include "vfs.h"
@@ -473,6 +474,13 @@ enum {
     T_CLOSE_WAIT, T_LAST_ACK
 };
 
+/* Four control blocks, and that number stays fixed on purpose even though
+   everything inside them is allocated now. A stack that allocates a block for
+   every arriving SYN can be pushed out of memory by a stranger — the oldest
+   denial of service there is, and the reason SYN cookies exist. A fixed count
+   of blocks bounds what a peer can make this machine spend; allocating what
+   is *inside* them means an idle stack costs a few hundred bytes instead of
+   thirty-one kilobytes, and a busy one costs exactly what it did before. */
 #define NTCB   4
 #define RXQ    2048       /* the read queue, and therefore our window */
 #define SNDBUF 2048       /* bytes written but not yet acknowledged */
@@ -513,7 +521,7 @@ struct tcb {
     uint32   snd_una, snd_nxt;
     uint32   snd_base;            /* the sequence number of snd_buf[0] */
     uint32   snd_wnd;             /* what the peer last advertised */
-    char     snd_buf[SNDBUF];
+    char    *snd_buf;             /* SNDBUF bytes, for as long as this is in use */
     int      snd_len;
     int      snd_fin;             /* a FIN is queued behind those bytes */
     int      fin_sent;
@@ -536,13 +544,17 @@ struct tcb {
 
     /* --- the receive side ----------------------------------------------- */
     uint32   irs, rcv_nxt;
-    char     rxq[RXQ];
+    char    *rxq;                 /* RXQ bytes, and therefore our window */
     int      rxq_len;
+    /* Held aside until the gap in front of them closes. The room for one is
+       taken when a segment actually arrives out of order, which on a working
+       link is never — so the rarest path in the stack is the one that used to
+       account for half of its memory. */
     struct {
         uint32 seq;
         int    len;
         int    used;
-        char   data[OOOSEG];
+        char  *data;
     } ooo[NOOO];
 
     uint64   tw_at;               /* TIME-WAIT expiry, absolute ms */
@@ -572,18 +584,36 @@ static struct tcb *tcb_alloc(void)
 {
     for (int i = 0; i < NTCB; i++)
         if (tcbs[i].state == T_FREE) {
-            umemset(&tcbs[i], 0, sizeof(tcbs[i]));
-            tcbs[i].peer_mss = 536;     /* what RFC 1122 says to assume */
-            tcbs[i].rto      = RTO_INITIAL;
-            tcbs[i].srtt     = -1;
-            tcbs[i].cwnd     = 2 * MSS;
-            tcbs[i].ssthresh = 64 * 1024;
-            return &tcbs[i];
+            struct tcb *c = &tcbs[i];
+            umemset(c, 0, sizeof(*c));
+            c->snd_buf = malloc(SNDBUF);
+            c->rxq     = malloc(RXQ);
+            if (!c->snd_buf || !c->rxq) {
+                /* Out of memory looks like out of connections, which every
+                   caller already knows how to be told. */
+                free(c->snd_buf);
+                free(c->rxq);
+                umemset(c, 0, sizeof(*c));
+                return 0;
+            }
+            c->peer_mss = 536;          /* what RFC 1122 says to assume */
+            c->rto      = RTO_INITIAL;
+            c->srtt     = -1;
+            c->cwnd     = 2 * MSS;
+            c->ssthresh = 64 * 1024;
+            return c;
         }
     return 0;
 }
 
-static void tcb_free(struct tcb *c) { umemset(c, 0, sizeof(*c)); }
+static void tcb_free(struct tcb *c)
+{
+    free(c->snd_buf);
+    free(c->rxq);
+    for (int i = 0; i < NOOO; i++)
+        free(c->ooo[i].data);
+    umemset(c, 0, sizeof(*c));
+}
 
 /* Demultiplexing: the exact four-tuple wins; a listener on the local port is
    the fallback. Getting that order wrong sends a listener the segments of an
@@ -902,6 +932,8 @@ static void ooo_drain(struct tcb *c)
                 continue;                       /* still ahead of the gap */
             if (seq_le(s + (uint32)l, c->rcv_nxt)) {
                 c->ooo[i].used = 0;             /* wholly overtaken by events */
+                free(c->ooo[i].data);
+                c->ooo[i].data = 0;
                 progress = 1;
                 continue;
             }
@@ -909,8 +941,11 @@ static void ooo_drain(struct tcb *c)
             int n = rcv_accept(c, (const uint8 *)c->ooo[i].data + skip,
                                l - skip);
             c->rcv_nxt += (uint32)n;
-            if (n == l - skip)
+            if (n == l - skip) {
                 c->ooo[i].used = 0;
+                free(c->ooo[i].data);
+                c->ooo[i].data = 0;
+            }
             net_putn("  tcp: gap closed, ", (unsigned long)n,
                      " held bytes delivered\n");
             progress = 1;
@@ -927,16 +962,23 @@ static void ooo_store(struct tcb *c, uint32 seq, const uint8 *data, int len)
             return;                             /* already held */
     for (int i = 0; i < NOOO; i++)
         if (!c->ooo[i].used) {
+            char *room = malloc((unsigned long)len);
+            if (!room)
+                break;              /* out of memory: drop it, see below */
             c->ooo[i].used = 1;
             c->ooo[i].seq  = seq;
             c->ooo[i].len  = len;
+            c->ooo[i].data = room;
             umemcpy(c->ooo[i].data, data, (unsigned long)len);
             net_putn("  tcp: segment ahead of the stream, held aside (",
                      (unsigned long)len, " bytes)\n");
             return;
         }
-    /* No room. Dropping it is correct — it will be sent again — and is what
-       a real stack does when its reassembly queue is full. */
+    /* No room, whether because the queue is full or because the machine is.
+       Dropping it is correct — it will be sent again — and is what a real
+       stack does when its reassembly queue is full. An allocation that fails
+       in TCP is not an error; it is a lost packet, and the protocol was built
+       around those from the beginning. */
 }
 
 static void rcv_data(struct tcb *c, uint32 seq, const uint8 *data, int len)
