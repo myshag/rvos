@@ -3491,6 +3491,31 @@ server nobody has mounted is a server nobody can ask. A description longer
 than one message is read in several: `len` in is an offset, the bytes come
 back from there, and zero means the end.
 
+The same text is also in the task's own directory, because it belongs to the
+task rather than to the name:
+
+```
+rvos$ ls /proc/11        rvos$ ls /proc/4         rvos$ cat /proc/4/doc
+mounts  (0 bytes)        mounts  (0 bytes)        cat: cannot open /proc/4/doc
+pagetable  (0 bytes)     pagetable  (0 bytes)
+ipc  (0 bytes)           ipc  (0 bytes)
+ctl  (0 bytes)           ctl  (0 bytes)
+doc  (0 bytes)
+```
+
+Task 11 is the network server and task 4 is a shell, and **the presence of
+`doc` is the shortest way to ask which is which** — a task has something to
+say about itself exactly when it answers for a name. Two paths, one text,
+which is what a namespace is for.
+
+Asking has to be done carefully, and the care is not politeness. A message to
+a task that is not a server is delivered into whatever it is doing, and if
+that task is blocked in a closed receive waiting for its own reply, the
+message queues behind it and is never taken — so the asker waits for an answer
+that cannot come. The mount table is the list of tasks that have agreed to
+answer questions of this shape, and a task that is not in it is refused
+without a message being sent.
+
 The property worth having is not that the text is nearby. It is that **the
 text is the server speaking**. A comment can describe an ioctl that was
 removed last week; this cannot, because if the code that answers is gone the

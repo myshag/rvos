@@ -6,6 +6,9 @@
 
      /proc/tasks       task table: id, state, name, and what it waits for
      /proc/ipc         the rendezvous graph: who is holding out to whom
+     /proc/<id>/doc    that task's own description of itself, if it is a
+                       server — the same text /doc/<name> gives, reached
+                       from the task rather than from the name
      /proc/mounts      the namespace of whoever is asking
      /proc/pagetable   the address space of whoever is asking
      /proc/<id>/       the same two questions about a named task
@@ -278,6 +281,98 @@ static int format_task_ipc(int who, char *out, int cap)
     return -1;
 }
 
+static const char proc_doc[] =
+"proc — kernel state as files, and nothing behind it.\n"
+                    "\n"
+                    "tasks       id, state, name, and what each is waiting for\n"
+                    "ipc         the rendezvous graph. A cycle in it is a\n"
+                    "            deadlock.\n"
+                    "mounts      the namespace of whoever is asking\n"
+                    "pagetable   the address space of whoever is asking\n"
+                    "<id>/       the same two questions about a named task,\n"
+                    "            plus what it waits for and what can be done\n"
+                    "            to it\n"
+                    "<id>/ctl    write `kill`\n"
+                    "<id>/doc    that task's own words, if it is a server. Its\n"
+                    "            presence is the shortest way to ask whether\n"
+                    "            this task answers for a name at all.\n"
+                    "\n"
+                    "The unqualified names answer about the caller, because a\n"
+                    "message carries its sender: this server is told who is\n"
+                    "asking without the path having to say. That is why there\n"
+                    "is no /proc/self here.\n"
+                    "\n"
+                    "A file is rendered when it is opened, so its size is not\n"
+                    "known until then and a listing reports 0 for all of them.\n"
+                    "\n"
+                    "ioctl     GETSIZE, PING, DOC\n";
+
+/* Is that task a server somebody has mounted?
+
+   The question has to be asked before sending it anything, and not out of
+   politeness. A message to a task that is not a server is delivered into
+   whatever it is doing — and if that task is blocked in a closed receive
+   waiting for its own reply, the message queues behind and is never taken,
+   so the asker waits for an answer that cannot come. The mount table is the
+   list of tasks that have agreed to answer questions of this shape. */
+static int is_mounted_server(int id)
+{
+    char mounts[512];
+    int n = sys_mounts(-1, mounts, (int)sizeof(mounts));
+    for (int i = 0; i < n; ) {
+        int s = i;
+        while (i < n && mounts[i] != '\n') i++;
+        int e = i;
+        if (i < n) i++;
+        int a = -1;
+        for (int k = s; k + 8 < e; k++)
+            if (mounts[k] == '-' && mounts[k+1] == '>' && mounts[k+3] == 't' &&
+                mounts[k+4] == 'a' && mounts[k+5] == 's' && mounts[k+6] == 'k')
+                a = k + 8;
+        if (a < 0)
+            continue;                   /* a bind names a name, not a server */
+        int got = 0;
+        for (int k = a; k < e && mounts[k] >= '0' && mounts[k] <= '9'; k++)
+            got = got * 10 + (mounts[k] - '0');
+        if (got == id)
+            return 1;
+    }
+    return 0;
+}
+
+/* That task's own words about itself, fetched a message at a time. The same
+   text /doc/<name> gives, reached from the task rather than from the name —
+   which is what a namespace is for. */
+static int fetch_doc(int id, char *out, int cap)
+{
+    if (id == sys_self())
+        return append(out, 0, proc_doc);    /* nobody can ask themselves */
+    if (!is_mounted_server(id))
+        return -1;
+
+    int o = 0;
+    for (;;) {
+        struct vfs_req q;
+        q.op = VFS_IOCTL;
+        q.fd = -1;
+        q.ioctl_cmd = IOCTL_DOC;
+        q.len = o;
+        q.path[0] = 0;
+        if (vfs_call(id, &q) <= 0)
+            break;
+        int n = q.result;
+        if (n > cap - o - 1)
+            n = cap - o - 1;
+        if (n <= 0)
+            break;
+        umemcpy(out + o, q.data, (unsigned long)n);
+        o += n;
+    }
+    if (!o)
+        o = append(out, 0, "this server does not describe itself\n");
+    return o;
+}
+
 static int proc_alloc(void)
 {
     for (int i = 0; i < PROC_MAXFD; i++)
@@ -307,7 +402,7 @@ static void proc_do_open(struct vfs_req *r, int caller)
     f->ctl_task = 0;
 
     int n;
-    const char *leaf;
+    const char *leaf = "";      /* path_task only sets it when it finds one */
     int who = path_task(r->path, &leaf);
 
     /* "/proc/" and "/proc" name the directory itself, and a directory that
@@ -323,9 +418,17 @@ static void proc_do_open(struct vfs_req *r, int caller)
            makes that distinction possible. */
         if (!sys_alive(who))
             n = -1;
-        else if (leaf[0] == 0)
+        else if (leaf[0] == 0) {
             n = append(f->data, 0, "- 0 mounts\n- 0 pagetable\n- 0 ipc\n"
                                    "- 0 ctl\n");
+            /* Only a task that answers for a name has anything to say about
+               itself, and its presence here is the shortest way to ask
+               whether this task is a server at all. */
+            if (who == sys_self() || is_mounted_server(who))
+                n = append(f->data, n, "- 0 doc\n");
+        }
+        else if (ustr_has_prefix(leaf, "doc"))
+            n = fetch_doc(who, f->data, PROC_BUFSZ);
         else if (ustr_has_prefix(leaf, "ipc"))
             n = format_task_ipc(who, f->data, PROC_BUFSZ);
         else if (ustr_has_prefix(leaf, "ctl")) {
@@ -410,27 +513,7 @@ void proc_server(void)
             if (r->ioctl_cmd == IOCTL_PING)
                 r->result = 0;
             else if (r->ioctl_cmd == IOCTL_DOC)
-                r->result = vfs_doc_reply(r,
-                    "proc — kernel state as files, and nothing behind it.\n"
-                    "\n"
-                    "tasks       id, state, name, and what each is waiting for\n"
-                    "ipc         the rendezvous graph. A cycle in it is a\n"
-                    "            deadlock.\n"
-                    "mounts      the namespace of whoever is asking\n"
-                    "pagetable   the address space of whoever is asking\n"
-                    "<id>/       the same two questions about a named task,\n"
-                    "            plus ipc and ctl\n"
-                    "<id>/ctl    write `kill`\n"
-                    "\n"
-                    "The unqualified names answer about the caller, because a\n"
-                    "message carries its sender: this server is told who is\n"
-                    "asking without the path having to say. That is why there\n"
-                    "is no /proc/self here.\n"
-                    "\n"
-                    "A file is rendered when it is opened, so its size is not\n"
-                    "known until then and a listing reports 0 for all of them.\n"
-                    "\n"
-                    "ioctl     GETSIZE, PING, DOC\n");
+                r->result = vfs_doc_reply(r, proc_doc);
             else if (r->ioctl_cmd == IOCTL_GETSIZE &&
                 r->fd >= 0 && r->fd < PROC_MAXFD && p_tab[r->fd].used)
                 r->result = p_tab[r->fd].size;
