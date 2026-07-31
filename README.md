@@ -45,6 +45,11 @@ which is how the sandbox in the demo is silenced without knowing it.
 
 ## Layout
 
+There is a reference manual for the kernel, in Russian, at
+[`doc/kernel.ru.md`](doc/kernel.ru.md): the subsystems one at a time, with the
+numbers and the invariants. This file is the story of how it was built; that
+one is what it is.
+
 | File | Role |
 |------|------|
 | `src/boot.S`       | reset entry: park secondary harts, clear bss, call `mstart` |

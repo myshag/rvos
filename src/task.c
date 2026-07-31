@@ -556,8 +556,12 @@ void syscall_dispatch(uint64 num)
     case SYS_KILL: {
         struct task *t = task_by_id((int)current->ctx.x[10]);
         /* Not itself through this door — SYS_EXIT is that door, and it does
-           not have to survive the return. Not task 0 either: the idle task is
-           the one thing the scheduler assumes is always there. */
+           not have to survive the return. And not slot 0, which is whichever
+           task was created first: at boot that is the filesystem server, and
+           a machine that cannot open a file cannot load a program to fix
+           itself with. (The idle task is not special here — schedule() parks
+           in wfi if nothing is runnable, so killing it costs a machine that
+           idles in a halt rather than a loop.) */
         if (!t || t == current || t == &tasks[0]) {
             current->ctx.x[10] = (uint64)-1;
             break;
