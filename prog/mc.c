@@ -417,28 +417,60 @@ static int prompt(const char *label, char *out, int cap)
    measured 861 MIPS is about twenty microseconds. A gap buffer would be a
    data structure carried for a saving nobody can perceive.                */
 
-#define ED_MAX   16384          /* half of what the fs server will hold */
-#define ED_LINES 1024
-
-static char ed_buf[ED_MAX];
+static char *ed_buf;            /* the file, and as much again to type into */
+static int  ed_cap;
 static int  ed_len;
-static int  ed_ls[ED_LINES];    /* where each line starts */
+static int  *ed_ls;             /* where each line starts */
+static int  ed_lcap;
 static int  ed_nl;
 static int  ed_pos;             /* the cursor, as an offset into the file */
 static int  ed_top;             /* first line shown */
 static int  ed_hoff;            /* horizontal scroll, in screen columns */
 static int  ed_dirty;
-static int  ed_big;             /* it did not fit, so saving would truncate */
+
+/* Room for `want` bytes of text and `lines` line starts. Both used to be
+   fixed arrays, and the fixed one that mattered was the text: a file bigger
+   than it opened read-only, because the alternative was saving a copy that
+   had been silently cut off. Neither is fixed now. */
+static int ed_room(int want, int lines)
+{
+    if (want > ed_cap) {
+        int cap = ed_cap ? ed_cap : 1024;
+        while (cap < want)
+            cap += cap / 2 + 1;
+        char *p = realloc(ed_buf, (unsigned long)cap);
+        if (!p)
+            return -1;
+        ed_buf = p;
+        ed_cap = cap;
+    }
+    if (lines > ed_lcap) {
+        int cap = ed_lcap ? ed_lcap : 256;
+        while (cap < lines)
+            cap *= 2;
+        int *p = realloc(ed_ls, (unsigned long)cap * sizeof(int));
+        if (!p)
+            return -1;
+        ed_ls = p;
+        ed_lcap = cap;
+    }
+    return 0;
+}
 
 /* A line ends where the next one starts. A file that ends in a newline has a
    last line that is empty, which is what it is and what an editor shows. */
 static void ed_index(void)
 {
     ed_nl = 0;
+    if (ed_room(0, 1) < 0)
+        return;
     ed_ls[ed_nl++] = 0;
-    for (int i = 0; i < ed_len && ed_nl < ED_LINES; i++)
-        if (ed_buf[i] == '\n')
+    for (int i = 0; i < ed_len; i++)
+        if (ed_buf[i] == '\n') {
+            if (ed_room(0, ed_nl + 1) < 0)
+                return;
             ed_ls[ed_nl++] = i + 1;
+        }
 }
 
 static int ed_end(int line)
@@ -542,13 +574,14 @@ static int ed_at(int line, int chars)
 static int ed_load(const char *path)
 {
     ed_len = ed_pos = ed_top = ed_hoff = 0;
-    ed_dirty = ed_big = 0;
+    ed_dirty = 0;
     int fd = vfs_open(path);
     if (fd < 0)
         return -1;
     for (;;) {
-        if (ed_len >= ED_MAX) { ed_big = 1; break; }
-        int n = vfs_read(fd, ed_buf + ed_len, ED_MAX - ed_len);
+        if (ed_room(ed_len + 4096, 0) < 0)
+            break;
+        int n = vfs_read(fd, ed_buf + ed_len, ed_cap - ed_len);
         if (n <= 0)
             break;
         ed_len += n;
@@ -563,8 +596,6 @@ static int ed_load(const char *path)
    back: saving it would silently cut it off at sixteen kilobytes. */
 static int ed_save(const char *path)
 {
-    if (ed_big)
-        return -1;
     int fd = vfs_create(path);
     if (fd < 0)
         return -1;
@@ -586,7 +617,7 @@ static int ed_save(const char *path)
 
 static int ed_insert(const char *s, int n)
 {
-    if (ed_len + n > ED_MAX)
+    if (ed_room(ed_len + n, 0) < 0)
         return -1;
     for (int i = ed_len - 1; i >= ed_pos; i--)
         ed_buf[i + n] = ed_buf[i];
@@ -652,8 +683,6 @@ static void ed_draw(const char *path, int writable, const char *msg)
     addnstr(path, COLS - 30);
     if (ed_dirty)
         addstr(" *");
-    if (ed_big)
-        addstr(" [too big to save]");
     addstr("   ");
     char n[24];
     num_into(n, (unsigned long)(line + 1));
@@ -729,8 +758,6 @@ static int edit_file(const char *path, int writable)
         draw("cannot open it");
         return 0;
     }
-    if (ed_big)
-        writable = 0;
     int h = LINES - 2, saved = 0;
     const char *msg = 0;
     char pattern[64];
@@ -804,11 +831,9 @@ static int edit_file(const char *path, int writable)
             continue;
         }
         case KEY_F(4):
-            if (!writable && !ed_big) {
+            if (!writable) {
                 writable = 1;
                 curs_set(1);
-            } else if (ed_big) {
-                msg = "too big to edit";
             }
             continue;
         case KEY_F(2):
@@ -852,6 +877,8 @@ static int edit_file(const char *path, int writable)
     }
     curs_set(0);
     curses_touchall();
+    free(ed_buf);  ed_buf = 0;  ed_cap = 0;
+    free(ed_ls);   ed_ls  = 0;  ed_lcap = 0;
     return saved;
 }
 

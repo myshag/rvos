@@ -1,6 +1,7 @@
 #pragma once
 #include "syscall.h"
 #include "vfs.h"
+#include "malloc.h"      /* every program on the disk can ask for memory */
 
 /* lib.h — what a program on the disk has instead of a library.
 

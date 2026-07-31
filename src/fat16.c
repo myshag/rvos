@@ -609,6 +609,24 @@ int fat16_list(const char *path, struct dirent *out, int max)
     return n;
 }
 
+/* How big it is, without reading it. The buffer used to be a fixed array and
+   the answer did not matter; it is allocated now, and the allocator has to be
+   told a number before the bytes exist. */
+int fat16_size(const char *path)
+{
+    uint16 dir;
+    char   leaf[FAT_NAME_MAX];
+    int    has_leaf;
+    if (resolve(path, &dir, leaf, (int)sizeof(leaf), &has_leaf) < 0 || !has_leaf)
+        return -1;
+    uint8 d[32];
+    if (dir_lookup(dir, leaf, d, 0) < 0)
+        return -1;
+    if (d[11] & 0x10)
+        return -1;                      /* a directory has no size of its own */
+    return (int)rd32(d + 28);
+}
+
 int fat16_read(const char *path, void *out, int maxlen)
 {
     uint16 dir;

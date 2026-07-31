@@ -15,6 +15,11 @@ int    vm_map_at(pagetable_t pt, uint64 va, uint64 pa, uint64 size,
    else — no other task's pages, and none of the free-page arena. */
 pagetable_t vm_create_task_pt(void);
 
+/* Take one page out of an address space and give the frame back. Only for
+   pages the task owns privately: an identity mapping is shared with every
+   task, and freeing one would be freeing the kernel's own memory. */
+int    vm_unmap_page(pagetable_t pt, uint64 va);
+
 uint64 vm_translate(uint64 va);                       /* in the kernel table */
 uint64 vm_translate_in(pagetable_t pt, uint64 va);    /* in any table */
 

@@ -17,6 +17,23 @@ static struct task *alloc_slot(void);
 
 extern void _ret_to_task(void) __attribute__((noreturn));
 
+/* The first page of the heap, mapped at birth like the stack. The allocator
+   keeps its state at the front of it and nowhere else, which is what lets a
+   single copy of malloc — sitting in the shared user text — run in a task
+   whose private data it cannot reach. A page arrives zeroed, and zero is what
+   the allocator reads as "not initialised yet".
+
+   The cost is one page per task whether it allocates or not; the price of not
+   paying it is a syscall on every malloc to ask whether the heap exists. */
+static void map_heap_page(struct task *t, uint64 perm)
+{
+    void *p = pmm_alloc();
+    if (!p)
+        return;
+    vm_map_at(t->pt, UHEAP_BASE, (uint64)p, PGSIZE, perm, 0);
+    t->brk = UHEAP_BASE + PGSIZE;
+}
+
 struct task *task_create(const char *name, void (*entry)(void))
 {
     struct task *t = alloc_slot();
@@ -34,6 +51,8 @@ struct task *task_create(const char *name, void (*entry)(void))
         vm_map_at(t->pt, USTACK_TOP - (uint64)(i + 1) * PGSIZE,
                   (uint64)p, PGSIZE, PTE_R | PTE_W, 0);
     }
+
+    map_heap_page(t, PTE_R | PTE_W);
 
     t->ctx.x[2]   = USTACK_TOP;                        /* sp -> stack top */
     t->ctx.satp   = MAKE_SATP(t->pt);
@@ -139,6 +158,7 @@ struct task *task_new_empty(const char *name)
         vm_map_at(t->pt, USTACK_TOP - (uint64)(i + 1) * PGSIZE,
                   (uint64)p, PGSIZE, PTE_R | PTE_W | PTE_U, 0);
     }
+    map_heap_page(t, PTE_R | PTE_W | PTE_U);
     t->ctx.satp = MAKE_SATP(t->pt);
     int k = 0;
     for (; k < 15 && name[k]; k++)
@@ -185,6 +205,8 @@ struct task *task_create_user(const char *name, void (*entry)(void),
         uint64 pa = vm_translate_in(t->pt, va);
         vm_map_at(t->pt, va, pa, PGSIZE, PTE_R | PTE_W | PTE_U, 0);
     }
+    vm_map_at(t->pt, UHEAP_BASE, vm_translate_in(t->pt, UHEAP_BASE),
+              PGSIZE, PTE_R | PTE_W | PTE_U, 0);
 
     t->ctx.status = SSTATUS_SPIE;      /* SPP = 0: sret lands in U-mode */
     return t;
@@ -385,6 +407,53 @@ void syscall_dispatch(uint64 num)
         task_retire(current);
         schedule();
         break;
+    /* Grow or shrink this task's heap, and answer with where it used to end.
+       The whole of malloc is above this line; the kernel's part is pages. */
+    case SYS_SBRK: {
+        long d = (long)current->ctx.x[10];
+        if (!current->brk)
+            current->brk = UHEAP_BASE;
+        uint64 old = current->brk;
+        uint64 want = old + (uint64)d;
+
+        if (d > 0) {
+            if (want > UHEAP_TOP || want < old) {
+                current->ctx.x[10] = (uint64)-1;
+                break;
+            }
+            uint64 a = PGROUNDUP(old);
+            for (; a < PGROUNDUP(want); a += PGSIZE) {
+                void *p = pmm_alloc();
+                if (!p)
+                    break;
+                if (vm_map_at(current->pt, a, (uint64)p, PGSIZE,
+                              PTE_R | PTE_W | PTE_U, 0) < 0) {
+                    pmm_free(p);
+                    break;
+                }
+            }
+            if (a < PGROUNDUP(want)) {
+                /* Out of memory partway: give back what this call took, so a
+                   failed sbrk leaves the address space exactly as it was. */
+                for (uint64 b = PGROUNDUP(old); b < a; b += PGSIZE)
+                    vm_unmap_page(current->pt, b);
+                sfence_vma();
+                current->ctx.x[10] = (uint64)-1;
+                break;
+            }
+        } else if (d < 0) {
+            if (want < UHEAP_BASE + PGSIZE)
+                want = UHEAP_BASE + PGSIZE;   /* the first page is never given back */
+            for (uint64 a = PGROUNDUP(want); a < PGROUNDUP(old); a += PGSIZE)
+                vm_unmap_page(current->pt, a);
+            /* A mapping that has gone away may still be in the TLB, and this
+               task is about to run again with the same satp. */
+            sfence_vma();
+        }
+        current->brk = want;
+        current->ctx.x[10] = old;
+        break;
+    }
     case SYS_NEWTASK: {
         char nm[16];
         copy_string_in(current->ctx.x[10], nm, sizeof(nm));

@@ -73,6 +73,18 @@ int vm_map_at(pagetable_t pt, uint64 va, uint64 pa, uint64 size,
     return 0;
 }
 
+int vm_unmap_page(pagetable_t pt, uint64 va)
+{
+    pte_t *pte = walk(pt, va, 0, 0);
+    if (!pte || !(*pte & PTE_V))
+        return -1;
+    uint64 pa = PTE2PA(*pte);
+    *pte = 0;
+    if (pa != va)                 /* never the identity-mapped, shared kind */
+        pmm_free((void *)pa);
+    return 0;
+}
+
 uint64 vm_translate_in(pagetable_t pt, uint64 va)
 {
     for (int level = 2; level >= 0; level--) {

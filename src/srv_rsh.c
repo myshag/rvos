@@ -23,18 +23,15 @@
 #include "servers.h"
 
 #define LINEMAX 128
-#define ELFMAX  32768
 #define INBUF   256
 
 static char line[LINEMAX];
-static char elfbuf[ELFMAX];
 static char *argv[8];
 static char inbuf[INBUF];
 static int  inlen;
 static char scratch[64];
 
-int spawn(const char *path, char *sc, int scsz,
-          int argc, char *const argv[]);   /* loader.c */
+int spawn(const char *path, int argc, char *const argv[]);   /* loader.c */
 
 static int rlen(const char *s)
 {
@@ -325,7 +322,7 @@ static void run_command(int argc, char **argv)
     char path[VFS_PATH_MAX];
     find_program(argv[0], path, (int)sizeof(path));
 
-    int tid = spawn(path, elfbuf, ELFMAX, argc, argv);
+    int tid = spawn(path, argc, argv);
     if (tid < 0) {
         puts_conn("rsh: no such command: ");
         puts_conn(argv[0]);
@@ -418,7 +415,7 @@ static void session(int slot)
                 av[1] = argv[1];
                 av[2] = argv[2];
                 av[3] = argv[3];        /* its own mount point, to strip */
-                int tid = spawn(av[0], elfbuf, ELFMAX, 4, av);
+                int tid = spawn(av[0], 4, av);
                 if (tid < 0) {
                     puts_conn("import: cannot run /BIN/IMPORT.ELF\n");
                 } else if (sys_mount(argv[3], tid, MREPL) < 0) {

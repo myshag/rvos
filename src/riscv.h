@@ -95,6 +95,18 @@ typedef uint64 *pagetable_t;
 #define USTACK_TOP   0x30000000UL
 #define USTACK_PAGES 4                       /* 16 KiB */
 
+/* And where its heap sits: between the program at 0x20000000 and the stack,
+   with room for 128 MiB it will never have. Like the stack, this is part of
+   the ABI rather than a kernel secret — the allocator keeps its own state at
+   the front of it, and has to know the address to find it.
+
+   Every task is given the first page at creation, the way it is given a
+   stack. That is not a convenience: it means the allocator needs no variable
+   of its own anywhere, and one copy of its code can therefore run inside a
+   task whose data it cannot see. */
+#define UHEAP_BASE   0x28000000UL
+#define UHEAP_TOP    0x2f000000UL
+
 #define RAM_BASE          0x80000000UL
 #define RAM_TOP           0x88000000UL   /* qemu virt default: 128 MiB */
 #define DISK_PA           0x84000000UL   /* FAT16 image loaded here */

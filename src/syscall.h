@@ -85,6 +85,11 @@ enum {
        message from anybody is not a race but a wrong answer. Anything from
        another sender stays queued. */
     SYS_RECVFROM = 24,   /* a0 = sender, a1 = buffer, a2 = cap */
+
+    /* Move this task's break by a0 bytes and answer with where it was. The
+       kernel's entire contribution to having an allocator: pages, mapped and
+       unmapped, at a fixed window in the address space. */
+    SYS_SBRK    = 25,
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -149,6 +154,11 @@ static inline long _ecall4(long n, long a0, long a1, long a2, long a3)
 }
 
 static inline void sys_yield(void) { _ecall1(SYS_YIELD, 0); }
+
+static inline void *sys_sbrk(long delta)
+{
+    return (void *)_ecall1(SYS_SBRK, delta);
+}
 
 static inline int sys_taskinfo(int idx, struct taskinfo *out)
 {

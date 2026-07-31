@@ -2679,9 +2679,11 @@ carried around for a saving nobody could perceive. Saving is `create`, which
 truncates, then the bytes, then `close`, which is what puts them on the disk —
 the same three facts `cp` is built on.
 
-A file too big for the buffer opens read-only and says so in the title bar,
+A file too big for the buffer opened read-only and said so in the title bar,
 because the alternative is an editor that silently cuts a file off at sixteen
-kilobytes and calls it saving.
+kilobytes and calls it saving. There is no such buffer any more: the next
+stage gave the system an allocator, and the editor asks for the size of the
+file it is opening.
 
 ### The byte that is not a character
 
@@ -2704,6 +2706,86 @@ typed into `/README.TXT` through a telnet session came back through `mtype` on
 the host reading the raw FAT16 image, Cyrillic and all, and `HELLO.TXT` — the
 one edited and then abandoned at the "save? y / n" question — was byte for
 byte what it had been.
+
+
+## malloc, and the limits that were never a policy
+
+Every buffer in this system was written into it at compile time. The loaders'
+scratch space for an ELF file. The filesystem server's copy of an open file.
+The editor's copy of the text. Those numbers are why `mc` stopped fitting and
+had to be given a larger cage rather than let out of it — and a limit that is
+a static array is not a policy, it is an absence.
+
+**The kernel's whole contribution is one call.**
+
+```c
+SYS_SBRK = 25,      /* a0 = bytes, positive or negative -> the old break */
+```
+
+It moves the end of a window in the calling task's address space and answers
+with where that end used to be. Growing allocates page frames and maps them;
+shrinking unmaps them and gives the frames back, with an `sfence.vma` after,
+because the task is about to go on running with the same `satp` and a mapping
+that has gone away may still be in the TLB. If it runs out of memory partway
+it unmaps what it just took, so a failed `sbrk` leaves the address space
+exactly as it found it. That is thirty lines, and it is the entire privileged
+part of having an allocator.
+
+### The state has to be at a fixed address
+
+Everything else is arithmetic, unprivileged, in `src/malloc.h` — and it has
+one constraint that shaped it. User programs here share their text and not
+their data: `spawn` lives in the shared user text and is *called by the
+shell*, so a variable of its own would sit at an address mapped into the
+loader's task and not into the caller's. An allocator with
+
+```c
+static struct mheap *heap;      /* faults the first time the shell allocates */
+```
+
+cannot work. So the heap describes itself: its header is the first thing in
+the region it manages, at a fixed `UHEAP_BASE`, and the kernel maps that one
+page when the task is created, the way it maps a stack. A page arrives zeroed,
+and zero is what the allocator reads as "nothing here yet". One copy of the
+code then works for whoever is running, in whatever address space they have.
+
+The rest is the plain allocator out of the textbook: one free list in address
+order, first fit, split on the way out, coalesced with both neighbours on the
+way back in, whole pages asked for when nothing fits and whole pages returned
+when the last block reaches the break. Not fast, nothing to lock — a task is
+single-threaded and its heap is its own — and readable, which is the point.
+
+One bug is worth recording because it is the kind this design invites. Growing
+inserted the new pages into the free list, and inserting ran the "the tail is
+free, give it back" rule, which handed the kernel the very pages the call had
+just gone to get. `malloc` of anything larger than a page returned zero,
+always. The fix is that growing inserts and does not trim, and trimming
+happens only on `free` — with sixty-four kilobytes of hysteresis, so that a
+program alternating one large allocation with one large free does not make a
+syscall each time.
+
+### What it took away
+
+| was | is |
+|-----|-----|
+| `ELFMAX`, three static 32 KiB buffers | `spawn` reads the file into a buffer its own size |
+| `FS_BUFSZ`, three static 32 KiB buffers | the fs server allocates per open file and grows on write |
+| `ED_MAX`, 16 KiB in the editor | the editor asks for the size of the file |
+| `ED_LINES`, 1024 | the line index grows with the file |
+
+The kernel's static footprint fell from 313592 bytes of `.bss` to 117032 —
+192 KiB, which is exactly the six buffers — while its text grew by 3.7 KiB for
+the allocator and the syscall. Then the numbers stopped being interesting,
+which is the real result: a 60000-byte file was opened in the editor, paged to
+line 661 of 1353, typed into, saved, and read back on the host out of the raw
+FAT16 image with the insertion at line 661 and a length of 60022. Nothing in
+that sentence would have been possible two stages ago, and nothing in it
+mentions a limit.
+
+`free` reports the same 11971 pages before and after — the allocator gives
+back what it borrowed, and a task that exits hands back the rest, because
+`vm_free_task` already frees every page a task owns privately and a heap page
+is exactly that.
 
 
 ## Next steps

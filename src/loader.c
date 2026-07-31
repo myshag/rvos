@@ -6,33 +6,59 @@
    and a starting register set. The kernel is never told what ELF is — it is
    handed the numbers a program header already contains.
 
-   spawn() takes the scratch buffer from its caller rather than owning one,
-   because user programs share their code but not their data: the shell calls
-   this very function, and its buffer is the only one it can write to. */
+   spawn() used to take a scratch buffer from its caller, because user
+   programs share their code but not their data: the shell calls this very
+   function, and a static buffer here would be at an address mapped into the
+   loader's task and not into the shell's. That was a real constraint answered
+   with a fixed number — ELFMAX, 16 KiB and then 32 KiB, and a program that
+   outgrew it could not be run at all.
+
+   It allocates now. The allocator has the same constraint and answers it
+   differently: its state lives at a fixed address inside the caller's own
+   address space rather than in a variable, so one copy of malloc works for
+   whoever is running. The buffer is the size of the file. */
 #include "syscall.h"
 #include "vfs.h"
 #include "ulib.h"
 #include "elf.h"
+#include "malloc.h"
 
-/* Slurp a whole file: our fs server only reads forward, and program headers
-   live at an arbitrary offset. Small executables make this reasonable; a
-   grown-up loader would seek, or map the file. */
-static int read_file(const char *path, char *dst, int cap)
+/* Slurp a whole file: the fs server only reads forward, and program headers
+   live at an arbitrary offset. A grown-up loader would seek, or map the file.
+
+   The size is not asked for in advance. It could be — the interface has an
+   ioctl for it — but doubling works against every server, including one at
+   the far end of a TCP connection that may not answer that question, and the
+   copy it costs is one memcpy against a disk read. */
+static char *read_whole(const char *path, int *lenout)
 {
     int fd = vfs_open(path);
     if (fd < 0)
-        return -1;
-    int total = 0;
-    for (;;) {
-        int n = vfs_read(fd, dst + total, cap - total);
+        return 0;
+
+    unsigned long cap = 8192, len = 0;
+    char *buf = malloc(cap);
+    while (buf) {
+        if (len == cap) {
+            char *bigger = realloc(buf, cap * 2);
+            if (!bigger) {
+                free(buf);
+                buf = 0;
+                break;
+            }
+            buf = bigger;
+            cap *= 2;
+        }
+        int n = vfs_read(fd, buf + len, (int)(cap - len));
         if (n <= 0)
             break;
-        total += n;
-        if (total >= cap)
-            break;
+        len += (unsigned long)n;
     }
     vfs_close(fd);
-    return total;
+    if (!buf)
+        return 0;
+    *lenout = (int)len;
+    return buf;
 }
 
 /* Lay out argv the way a C program expects to find it: an array of pointers
@@ -63,13 +89,9 @@ static int build_args(char *blk, int argc, char *const argv[])
    there, it means one here. This used to take a connection number and attach
    it to the task id in the window before SYS_START — a mechanism that existed
    only because a name could not be bound to another name. It can now. */
-int spawn(const char *path, char *scratch, int scratchsz,
-          int argc, char *const argv[])
+static int spawn_image(const char *path, char *scratch, int n,
+                       int argc, char *const argv[])
 {
-    int n = read_file(path, scratch, scratchsz);
-    if (n <= 0)
-        return -1;
-
     struct elf64_ehdr *eh = (struct elf64_ehdr *)scratch;
     if (eh->e_magic != ELF_MAGIC)
         return -1;
@@ -125,9 +147,19 @@ int spawn(const char *path, char *scratch, int scratchsz,
     return tid;
 }
 
+int spawn(const char *path, int argc, char *const argv[])
+{
+    int n = 0;
+    char *img = read_whole(path, &n);
+    if (!img)
+        return -1;
+    int tid = n > 0 ? spawn_image(path, img, n, argc, argv) : -1;
+    free(img);                  /* the pages are in the child now, or nowhere */
+    return tid;
+}
+
 /* ---- the boot-time demo: load one program and report what it did -------- */
-#define ELFMAX 32768
-static char elfbuf[ELFMAX];
+
 
 static void say_num(const char *label, unsigned long v, const char *tail)
 {
@@ -156,7 +188,7 @@ void loader_main(void)
     argv[2] = (char *)"beta";
 
     uputs("$ exec /BIN/HELLO.ELF alpha beta\n");
-    int tid = spawn("/BIN/HELLO.ELF", elfbuf, ELFMAX, 3, argv);
+    int tid = spawn("/BIN/HELLO.ELF", 3, argv);
     if (tid < 0)
         uputs("  exec failed\n");
     else

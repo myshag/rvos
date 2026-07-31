@@ -12,14 +12,11 @@
 #include "servers.h"
 
 #define LINEMAX 128
-#define ELFMAX  32768
 
 static char line[LINEMAX];
-static char elfbuf[ELFMAX];
 static char *argv[8];
 
-int spawn(const char *path, char *scratch, int scratchsz,
-          int argc, char *const argv[]);   /* loader.c */
+int spawn(const char *path, int argc, char *const argv[]);   /* loader.c */
 
 /* One character. This used to spin — read, get 0, yield, read again — because
    the console server always answered at once. It does not any more: a read
@@ -115,7 +112,7 @@ static void run_command(int argc, char **argv)
     char path[VFS_PATH_MAX];
     find_program(argv[0], path, (int)sizeof(path));
 
-    int tid = spawn(path, elfbuf, ELFMAX, argc, argv);
+    int tid = spawn(path, argc, argv);
     if (tid < 0) {
         uputs("sh: no such command: ");
         uputs(argv[0]);
@@ -234,7 +231,7 @@ void sh_main(void)
             av[1] = argv[1];
             av[2] = argv[2];
             av[3] = argv[3];
-            int tid = spawn(av[0], elfbuf, ELFMAX, 4, av);
+            int tid = spawn(av[0], 4, av);
             if (tid < 0)
                 uputs("import: cannot run /BIN/IMPORT.ELF\n");
             else if (sys_mount(argv[3], tid, MREPL) < 0)

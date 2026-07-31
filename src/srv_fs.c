@@ -8,29 +8,27 @@
 #include "vfs.h"
 #include "servers.h"
 #include "fat16.h"
+#include "malloc.h"
 #include "syscall.h"
 #include "ulib.h"
 
 #define FS_MAXFD  3
-/* A whole file at a time, because the FAT16 driver only reads forward. That
-   makes this the largest file the system can open — and it has to be at least
-   as big as the loaders' scratch buffers, or a program on the disk cannot be
-   run. The two numbers are coupled and there is nothing to enforce it.
+/* A whole file at a time, because the FAT16 driver only reads forward.
 
-   Doubled when the first program grew past it. Most of an ELF file here is
-   padding — a page before the text so that the file offset and the load
-   address agree, and another between text and data so that the two segments
-   land on pages that can carry different permissions — so a program with ten
-   kilobytes of code is a seventeen-kilobyte file. */
-#define FS_BUFSZ  32768
-
+   This used to be a fixed array of 16 and then 32 KiB, which made it the
+   largest file the system could open — a limit nobody chose, coupled by hand
+   to the loaders' scratch buffer with nothing to enforce the coupling. The
+   buffer is allocated now, at the size the directory entry says, and grown by
+   half again whenever a write runs past the end of it. The largest file is
+   whatever is left of the machine's memory. */
 struct fs_file {
     int    used;
     uint32 size;
     uint32 pos;
+    uint32 cap;                 /* how much of `data` there is */
     int    dirty;               /* written to, and not yet on the disk */
     char   name[VFS_PATH_MAX];  /* what to write it back as */
-    char   data[FS_BUFSZ];
+    char  *data;
 };
 static struct fs_file fs_tab[FS_MAXFD];
 
@@ -89,22 +87,60 @@ static void fs_keep_name(struct fs_file *f, const char *path)
     f->name[i] = 0;
 }
 
+/* Room for at least `want` bytes, keeping what is already there. */
+static int fs_room(struct fs_file *f, uint32 want)
+{
+    if (f->cap >= want)
+        return 0;
+    uint32 cap = f->cap ? f->cap : 512;
+    while (cap < want)
+        cap += cap / 2 + 1;         /* half again, not double: files are big */
+    char *p = realloc(f->data, cap);
+    if (!p)
+        return -1;
+    f->data = p;
+    f->cap  = cap;
+    return 0;
+}
+
 static void fs_do_open(struct vfs_req *r, int create)
 {
     int fd = fs_alloc();
     if (fd < 0) { r->result = -1; return; }
     struct fs_file *f = &fs_tab[fd];
+    f->data = 0;
+    f->cap  = 0;
 
     /* A directory answers read() with its listing and a file with its bytes,
        and the only way to tell them apart is to ask. Listing first: a name
-       that is a directory is never also a file. */
-    int n;
-    if (create)
-        n = 0;                                      /* a new, empty file */
-    else if ((n = fs_format_dir(r->path, f->data, FS_BUFSZ)) < 0)
-        n = fat16_read(r->path, f->data, FS_BUFSZ);
+       that is a directory is never also a file.
 
-    if (n < 0) { r->result = -1; return; }
+       A listing has no size until it is made, so that one is grown until it
+       stops overflowing; a file has one in its directory entry. */
+    int n = -1;
+    if (create) {
+        n = 0;                                      /* a new, empty file */
+    } else if (fat16_list(r->path, 0, 0) >= 0) {   /* room for none: a probe */
+        for (uint32 cap = 4096; cap <= (1u << 20); cap *= 2) {
+            if (fs_room(f, cap) < 0)
+                break;
+            n = fs_format_dir(r->path, f->data, (int)cap);
+            if (n >= 0 && (uint32)n < cap - (FAT_NAME_MAX + 24))
+                break;                              /* it all fitted */
+            n = -1;
+        }
+    } else {
+        int size = fat16_size(r->path);
+        if (size >= 0 && fs_room(f, (uint32)size + 1) == 0)
+            n = size ? fat16_read(r->path, f->data, size) : 0;
+    }
+
+    if (n < 0) {
+        free(f->data);
+        f->data = 0;
+        r->result = -1;
+        return;
+    }
     f->used  = 1;
     f->size  = (uint32)n;
     f->pos   = 0;
@@ -147,9 +183,11 @@ static void fs_do_write(struct vfs_req *r)
     if (n < 0 || !f->name[0]) { r->result = -1; return; }
     if (n > VFS_DATA_MAX)
         n = VFS_DATA_MAX;
-    if (f->pos + (uint32)n > FS_BUFSZ)
-        n = (int)(FS_BUFSZ - f->pos);       /* the file cannot outgrow this */
     if (n <= 0) { r->result = 0; return; }
+    /* Writing past the end is how a file grows, and the buffer grows with it
+       rather than clipping the write — which is what it used to do, silently,
+       at whatever the fixed size happened to be. */
+    if (fs_room(f, f->pos + (uint32)n) < 0) { r->result = -1; return; }
 
     umemcpy(f->data + f->pos, r->data, (unsigned long)n);
     f->pos += (uint32)n;
@@ -213,6 +251,9 @@ void fs_server(void)
         case VFS_CLOSE:
             if (r->fd >= 0 && r->fd < FS_MAXFD && fs_tab[r->fd].used) {
                 fs_flush(&fs_tab[r->fd]);
+                free(fs_tab[r->fd].data);   /* the copy goes when the disk has it */
+                fs_tab[r->fd].data = 0;
+                fs_tab[r->fd].cap  = 0;
                 fs_tab[r->fd].used = 0;
             }
             r->result = 0;
