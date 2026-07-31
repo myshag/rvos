@@ -99,7 +99,11 @@ struct vfs_req {
    told whose — there is no ambient "the" namespace to inspect. */
 #define VFS_PREFIX_MAX 16
 #define VFS_NMOUNT     8
-#define VFS_NNS        8        /* root + private namespaces */
+/* As many namespaces as there are tasks, because a namespace is reachable
+   only through a task that is looking at it: more could never be wanted. The
+   number matches NTASK in task.h, which this header cannot see — a user
+   program includes this one and not that one. */
+#define VFS_NNS        24       /* root + private namespaces */
 
 struct namespace;
 

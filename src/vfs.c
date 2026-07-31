@@ -29,6 +29,7 @@
 #include "vfs.h"
 #include "task.h"
 #include "util.h"
+#include "pmm.h"
 
 enum { MNT_SERVER, MNT_BIND };
 
@@ -45,11 +46,29 @@ struct namespace {
     int used;
 };
 
-static struct namespace ns_pool[VFS_NNS];   /* ns_pool[0] is the root */
+/* A table of pointers, and a namespace is a page taken when one is wanted.
+
+   It used to be an array of structures — nine and a half kilobytes of kernel
+   .bss, present whether anything had ever cloned a namespace or not. A
+   namespace is 1224 bytes and a page is 4096, so this wastes most of a page
+   on each; carving several out of one page is arithmetic the kernel would
+   have to do without an allocator, and there is no allocator in the kernel on
+   purpose. A page each, taken when needed and given back by the sweep. */
+static struct namespace *ns_pool[VFS_NNS];   /* ns_pool[0] is the root */
+
+static struct namespace *ns_get(int i)
+{
+    if (!ns_pool[i]) {
+        ns_pool[i] = pmm_alloc();       /* arrives zeroed, which is empty */
+        if (!ns_pool[i])
+            return 0;
+    }
+    return ns_pool[i];
+}
 
 struct namespace *vfs_root_ns(void)
 {
-    return &ns_pool[0];
+    return ns_get(0);
 }
 
 /* During kmain() there is no current task yet, so boot-time binds land in the
@@ -58,19 +77,22 @@ static struct namespace *cur_ns(void)
 {
     if (current && current->ns)
         return current->ns;
-    return &ns_pool[0];
+    return ns_get(0);
 }
 
 int vfs_ns_clone(void)
 {
     if (!current)
         return -1;
+    struct namespace *mine = cur_ns();
     for (int i = 1; i < VFS_NNS; i++) {
-        if (ns_pool[i].used)
+        if (ns_pool[i])
             continue;
-        ns_pool[i] = *cur_ns();         /* snapshot, then diverge freely */
-        ns_pool[i].used = 1;
-        current->ns = &ns_pool[i];
+        if (!ns_get(i))
+            return -1;                  /* no page to put one in */
+        *ns_pool[i] = *mine;            /* snapshot, then diverge freely */
+        ns_pool[i]->used = 1;
+        current->ns = ns_pool[i];
         return 0;
     }
     return -1;                          /* every private namespace is taken */
@@ -80,7 +102,7 @@ int vfs_ns_inuse(void)
 {
     int n = 1;                          /* the root is always one of them */
     for (int i = 1; i < VFS_NNS; i++)
-        n += ns_pool[i].used;
+        n += ns_pool[i] != 0;
     return n;
 }
 
@@ -99,15 +121,17 @@ int vfs_ns_inuse(void)
 void vfs_ns_gc(void)
 {
     for (int i = 1; i < VFS_NNS; i++) {
-        if (!ns_pool[i].used)
+        if (!ns_pool[i])
             continue;
         int live = 0;
         for (int t = 0; t < NTASK && !live; t++)
             if ((tasks[t].state != T_UNUSED || tasks[t].pt) &&
-                tasks[t].ns == &ns_pool[i])
+                tasks[t].ns == ns_pool[i])
                 live = 1;
-        if (!live)
-            ns_pool[i].used = 0;
+        if (!live) {
+            pmm_free(ns_pool[i]);       /* the page goes back too */
+            ns_pool[i] = 0;
+        }
     }
 }
 
@@ -329,7 +353,9 @@ int vfs_dump_mounts_of(int task_id, char *out, int cap)
     if (t && t->ns)
         ns = t->ns;
     else
-        ns = &ns_pool[0];
+        ns = ns_get(0);
+    if (!ns)
+        return 0;
 
     int o = 0;
     for (int i = 0; i < ns->n && o < cap - 32; i++) {

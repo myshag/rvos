@@ -62,9 +62,14 @@ static void sandbox(void)
 
     kprintf("\n--- sandbox (task %d) ----------------------------------\n",
             SANDBOX_TASK_ID);
-    vfs_ns_clone();
-    vfs_mount("/dev/console", NULL_TASK_ID, MREPL);
-    kprintf("$ vfs_ns_clone(); mount /dev/console -> null\n");
+    /* Через системные вызовы, а не напрямую: пространство имён теперь лежит
+       на странице из арены, а арена не отображена ни в одну задачу — даже в
+       задачу режима S. Вызов пойдёт через ловушку, где установлена таблица
+       ядра, и увидит эту страницу. Прежде обе функции работали и так, потому
+       что пул был в .bss ядра, отображённом всюду. */
+    sys_nsclone();
+    sys_mount("/dev/console", NULL_TASK_ID, MREPL);
+    kprintf("$ nsclone(); mount /dev/console -> null\n");
     say("  THIS LINE SHOULD NEVER APPEAR\n");
     kprintf("  write(/dev/console) printed nothing: rebound to null\n");
 

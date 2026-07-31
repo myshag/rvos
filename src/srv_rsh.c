@@ -21,15 +21,27 @@
 #include "vfs.h"
 #include "ulib.h"
 #include "servers.h"
+#include "malloc.h"
 
 #define LINEMAX 128
 #define INBUF   256
 
-static char line[LINEMAX];
-static char *argv[8];
-static char inbuf[INBUF];
-static int  inlen;
-static char scratch[64];
+/* Всё, что раньше было файловыми статиками, — состояние одной сессии.
+   Нити делят данные задачи, поэтому две сессии в одном сервере затоптали бы
+   друг друга на первой же строке ввода. Структура выделяется на соединение и
+   передаётся указателем; больше в этом файле общего состояния нет. */
+struct session {
+    int      conn;
+    int      slot;
+    char     line[LINEMAX];
+    char    *argv[8];
+    char     inbuf[INBUF];
+    int      inlen;
+    int      tstate;                /* разбор telnet — тоже своё у каждого */
+    unsigned tcmd;
+    char     scratch[64];
+    char    *stack;                 /* её же, освобождает она сама */
+};
 
 int spawn(const char *path, int argc, char *const argv[]);   /* loader.c */
 
@@ -52,13 +64,11 @@ static int streq(const char *a, const char *b)
    full buffer returns 0. There is no blocking write — a read parks, a write
    does not — so this is the one place in the program that spins, and it is
    marked as such rather than hidden. */
-static int conn = -1;
-
-static int wr(const char *s, int n)
+static int wr(struct session *S, const char *s, int n)
 {
     int off = 0;
     while (off < n) {
-        int k = vfs_write(conn, s + off, n - off);
+        int k = vfs_write(S->conn, s + off, n - off);
         if (k < 0)
             return -1;                  /* the connection is gone */
         if (k == 0) {
@@ -72,13 +82,13 @@ static int wr(const char *s, int n)
 
 /* The shell's own text, with the line endings a terminal on the far end
    expects. `wr` stays raw: telnet's own bytes must not be rewritten. */
-static int puts_conn(const char *s)
+static int puts_conn(struct session *S, const char *s)
 {
     char buf[128];
     int k = 0;
     for (; *s; s++) {
         if (k > (int)sizeof(buf) - 2) {
-            if (wr(buf, k) < 0)
+            if (wr(S, buf, k) < 0)
                 return -1;
             k = 0;
         }
@@ -86,14 +96,14 @@ static int puts_conn(const char *s)
             buf[k++] = '\r';
         buf[k++] = *s;
     }
-    return k ? wr(buf, k) : 0;
+    return k ? wr(S, buf, k) : 0;
 }
 
-static void put_num(unsigned long v)
+static void put_num(struct session *S, unsigned long v)
 {
-    int n = uutoa(v, scratch);
-    scratch[n] = 0;
-    puts_conn(scratch);
+    int n = uutoa(v, S->scratch);
+    S->scratch[n] = 0;
+    puts_conn(S, S->scratch);
 }
 
 /* ---- telnet ------------------------------------------------------------
@@ -125,56 +135,54 @@ static void put_num(unsigned long v)
 #define DONT 254
 
 enum { T_DATA, T_IAC, T_OPT, T_SB, T_SB_IAC };
-static int tstate;
-static unsigned tcmd;
 
-static void telnet_refuse(unsigned cmd, unsigned opt)
+static void telnet_refuse(struct session *S, unsigned cmd, unsigned opt)
 {
     char r[3];
     r[0] = (char)IAC;
     r[1] = (char)(cmd == WILL ? DONT : WONT);
     r[2] = (char)opt;
-    wr(r, 3);
+    wr(S, r, 3);
 }
 
 /* Raw bytes in, data bytes into inbuf, answers straight back out. */
-static void telnet_in(const char *raw, int n)
+static void telnet_in(struct session *S, const char *raw, int n)
 {
     for (int i = 0; i < n; i++) {
         unsigned c = (unsigned char)raw[i];
-        switch (tstate) {
+        switch (S->tstate) {
         case T_DATA:
             if (c == IAC) {
-                tstate = T_IAC;
-            } else if (inlen < INBUF) {
-                inbuf[inlen++] = (char)c;
+                S->tstate = T_IAC;
+            } else if (S->inlen < INBUF) {
+                S->inbuf[S->inlen++] = (char)c;
             }
             break;
         case T_IAC:
             if (c == IAC) {                 /* two of them mean one of them */
-                if (inlen < INBUF)
-                    inbuf[inlen++] = (char)c;
-                tstate = T_DATA;
+                if (S->inlen < INBUF)
+                    S->inbuf[S->inlen++] = (char)c;
+                S->tstate = T_DATA;
             } else if (c == WILL || c == WONT || c == DO || c == DONT) {
-                tcmd = c;
-                tstate = T_OPT;
+                S->tcmd = c;
+                S->tstate = T_OPT;
             } else if (c == SBo) {
-                tstate = T_SB;
+                S->tstate = T_SB;
             } else {
-                tstate = T_DATA;            /* NOP, AYT, break: nothing to do */
+                S->tstate = T_DATA;            /* NOP, AYT, break: nothing to do */
             }
             break;
         case T_OPT:
-            if (tcmd == WILL || tcmd == DO)
-                telnet_refuse(tcmd, c);     /* a WONT needs no answer */
-            tstate = T_DATA;
+            if (S->tcmd == WILL || S->tcmd == DO)
+                telnet_refuse(S, S->tcmd, c);     /* a WONT needs no answer */
+            S->tstate = T_DATA;
             break;
         case T_SB:                          /* a subnegotiation, to be skipped */
             if (c == IAC)
-                tstate = T_SB_IAC;
+                S->tstate = T_SB_IAC;
             break;
         case T_SB_IAC:
-            tstate = (c == SEo) ? T_DATA : T_SB;
+            S->tstate = (c == SEo) ? T_DATA : T_SB;
             break;
         }
     }
@@ -182,57 +190,57 @@ static void telnet_in(const char *raw, int n)
 
 /* One line from the connection, without the ending. Returns -1 at end of
    file. TCP is a stream, so a line may arrive in pieces or two may arrive at
-   once; the leftovers stay in inbuf for the next call.
+   once; the leftovers stay in S->inbuf for the next call.
 
    Line endings are whatever the client believes in: nc sends LF, telnet sends
    CR LF, and a telnet sending a bare carriage return sends CR NUL. Leading
    remnants of any of them are dropped rather than reported as empty lines. */
-static int readline(char *out, int cap)
+static int readline(struct session *S, char *out, int cap)
 {
     for (;;) {
         int skip = 0;
-        while (skip < inlen && (inbuf[skip] == '\n' || inbuf[skip] == '\r' ||
-                                inbuf[skip] == 0))
+        while (skip < S->inlen && (S->inbuf[skip] == '\n' || S->inbuf[skip] == '\r' ||
+                                S->inbuf[skip] == 0))
             skip++;
         if (skip) {
-            for (int k = skip; k < inlen; k++)
-                inbuf[k - skip] = inbuf[k];
-            inlen -= skip;
+            for (int k = skip; k < S->inlen; k++)
+                S->inbuf[k - skip] = S->inbuf[k];
+            S->inlen -= skip;
         }
 
         /* Nobody is nominated while this shell is the one reading, so the
            interrupt character arrives here as a byte and means the only thing
            it can mean: forget the line. */
-        for (int i = 0; i < inlen; i++) {
-            if (inbuf[i] == 3) {
-                inlen = 0;
+        for (int i = 0; i < S->inlen; i++) {
+            if (S->inbuf[i] == 3) {
+                S->inlen = 0;
                 out[0] = 0;
-                puts_conn("^C\n");
+                puts_conn(S, "^C\n");
                 return 0;
             }
-            if (inbuf[i] != '\n' && inbuf[i] != '\r')
+            if (S->inbuf[i] != '\n' && S->inbuf[i] != '\r')
                 continue;
             int n = i;
             if (n > cap - 1)
                 n = cap - 1;
-            umemcpy(out, inbuf, (unsigned long)n);
+            umemcpy(out, S->inbuf, (unsigned long)n);
             out[n] = 0;
-            int rest = inlen - (i + 1);
+            int rest = S->inlen - (i + 1);
             for (int k = 0; k < rest; k++)
-                inbuf[k] = inbuf[i + 1 + k];
-            inlen = rest;
+                S->inbuf[k] = S->inbuf[i + 1 + k];
+            S->inlen = rest;
             return n;
         }
-        if (inlen >= INBUF) {           /* a line longer than we will take */
-            inlen = 0;
+        if (S->inlen >= INBUF) {           /* a line longer than we will take */
+            S->inlen = 0;
             out[0] = 0;
             return 0;
         }
         char raw[VFS_DATA_MAX];
-        int n = vfs_read(conn, raw, (int)sizeof(raw));
+        int n = vfs_read(S->conn, raw, (int)sizeof(raw));
         if (n <= 0)
             return -1;                  /* 0 = the far end closed its half */
-        telnet_in(raw, n);
+        telnet_in(S, raw, n);
     }
 }
 
@@ -269,9 +277,9 @@ static int split(char *s, char **out, int max)
    `echo`, whose output has to come back here rather than wherever
    /dev/console happens to point. Everything else is a file in /BIN. */
 
-static void do_help(void)
+static void do_help(struct session *S)
 {
-    puts_conn("commands:\n"
+    puts_conn(S, "commands:\n"
               "  ls [path]      list a directory (default /)\n"
               "  cat <path>...  print a file, a report, or a connection\n"
               "  ps             running tasks              (/proc/tasks)\n"
@@ -321,7 +329,7 @@ static void find_program(const char *word, char *out, int cap)
    this same connection, so without it the prompt and the program's first line
    arrive interleaved. That used to be an accepted wart because `cat` was a
    builtin. It is not one now. */
-static void run_command(int argc, char **argv)
+static void run_command(struct session *S, int argc, char **argv)
 {
     int background = 0;
     if (argc > 1 && streq(argv[argc - 1], "&")) {
@@ -333,52 +341,58 @@ static void run_command(int argc, char **argv)
 
     int tid = spawn(path, argc, argv);
     if (tid < 0) {
-        puts_conn("rsh: no such command: ");
-        puts_conn(argv[0]);
-        puts_conn("  (try `help`)\n");
+        puts_conn(S, "rsh: no such command: ");
+        puts_conn(S, argv[0]);
+        puts_conn(S, "  (try `help`)\n");
         return;
     }
     if (background) {
-        puts_conn("[");
-        put_num((unsigned long)tid);
-        puts_conn("]\n");
+        puts_conn(S, "[");
+        put_num(S, (unsigned long)tid);
+        puts_conn(S, "]\n");
     } else {
         /* The connection is told who is in front of it, so that Ctrl-C has
            something to mean while this shell is not reading anything. */
-        vfs_ioctl_arg(conn, IOCTL_INTR, tid);
+        vfs_ioctl_arg(S->conn, IOCTL_INTR, tid);
         sys_wait(tid);
-        if (vfs_ioctl_arg(conn, IOCTL_INTR, 0) > 0)
-            puts_conn("^C\n");
+        if (vfs_ioctl_arg(S->conn, IOCTL_INTR, 0) > 0)
+            puts_conn(S, "^C\n");
     }
 }
 
 /* ---- one session ------------------------------------------------------ */
 
-static void session(int slot)
+/* Сколько стека нити-сессии. Шестнадцать килобайт — столько же, сколько у
+   задачи: под сессией лежит spawn, а под ним vfs_call со своим запросом на
+   664 байта в кадре. */
+#define SESSION_STACK 16384
+
+static void session(struct session *S)
 {
-    inlen  = 0;
-    tstate = T_DATA;
-    puts_conn("\nrvos — you are on the guest, over its own TCP stack.\n"
+    S->inlen  = 0;
+    S->tstate = T_DATA;
+    puts_conn(S, "\nrvos — you are on the guest, over its own TCP stack.\n"
               "type `help`. connection ");
-    put_num((unsigned long)slot);
-    puts_conn("\n");
+    put_num(S, (unsigned long)S->slot);
+    puts_conn(S, "\n");
 
     for (;;) {
-        if (puts_conn("\nrvos# ") < 0)
+        if (puts_conn(S, "\nrvos# ") < 0)
             return;
-        if (readline(line, LINEMAX) < 0)
+        if (readline(S, S->line, LINEMAX) < 0)
             return;                     /* the caller hung up */
 
-        int argc = split(line, argv, 8);
+        char **argv = S->argv;
+        int argc = split(S->line, argv, 8);
         if (argc == 0)
             continue;
 
         if (streq(argv[0], "exit") || streq(argv[0], "quit")) {
-            puts_conn("goodbye\n");
+            puts_conn(S, "goodbye\n");
             return;
         }
         if (streq(argv[0], "help")) {
-            do_help();
+            do_help(S);
         } else if (streq(argv[0], "echo")) {
             /* The one command kept, because its output has to arrive *here*
                rather than wherever /dev/console points — which for a program
@@ -386,10 +400,10 @@ static void session(int slot)
                nothing to start. */
             for (int i = 1; i < argc; i++) {
                 if (i > 1)
-                    puts_conn(" ");
-                puts_conn(argv[i]);
+                    puts_conn(S, " ");
+                puts_conn(S, argv[i]);
             }
-            puts_conn("\n");
+            puts_conn(S, "\n");
         } else if (streq(argv[0], "bind") || streq(argv[0], "mount")) {
             /* -a and -b are Plan 9's spelling of "join what is already there,
                after it" and "…before it". Without one, replace. */
@@ -400,7 +414,7 @@ static void session(int slot)
             }
             int mnt = streq(argv[0], "mount");
             if (argc < a + 2) {
-                puts_conn(mnt ? "usage: mount [-a|-b] <prefix> <task>\n"
+                puts_conn(S, mnt ? "usage: mount [-a|-b] <prefix> <task>\n"
                               : "usage: bind [-a|-b] <old> <new>\n");
             } else if (mnt) {
                 int t = 0;
@@ -408,21 +422,21 @@ static void session(int slot)
                 while (*d >= '0' && *d <= '9')
                     t = t * 10 + (*d++ - '0');
                 if (sys_mount(argv[a], t, f) < 0)
-                    puts_conn("mount: no room in the mount table\n");
+                    puts_conn(S, "mount: no room in the mount table\n");
             } else if (sys_bind(argv[a], argv[a + 1], f) < 0) {
-                puts_conn("bind: no room in the mount table\n");
+                puts_conn(S, "bind: no room in the mount table\n");
             }
         } else if (streq(argv[0], "unmount")) {
             if (argc < 2)
-                puts_conn("usage: unmount <name>\n");
+                puts_conn(S, "usage: unmount <name>\n");
             else if (sys_unmount(argv[1]) < 0)
-                puts_conn("unmount: nothing bound there\n");
+                puts_conn(S, "unmount: nothing bound there\n");
         } else if (streq(argv[0], "import")) {
             /* Two steps and nothing else: start the proxy, and mount it. It
                is a task, and a mount takes a task — the namespace has no
                notion of "remote" and does not need one. */
             if (argc < 4) {
-                puts_conn("usage: import <a.b.c.d> <port> <prefix>\n");
+                puts_conn(S, "usage: import <a.b.c.d> <port> <prefix>\n");
             } else {
                 char *av[4];
                 av[0] = (char *)"/BIN/IMPORT.ELF";
@@ -431,19 +445,61 @@ static void session(int slot)
                 av[3] = argv[3];        /* its own mount point, to strip */
                 int tid = spawn(av[0], 4, av);
                 if (tid < 0) {
-                    puts_conn("import: cannot run /BIN/IMPORT.ELF\n");
+                    puts_conn(S, "import: cannot run /BIN/IMPORT.ELF\n");
                 } else if (sys_mount(argv[3], tid, MREPL) < 0) {
-                    puts_conn("import: no room in the mount table\n");
+                    puts_conn(S, "import: no room in the mount table\n");
                 } else {
-                    puts_conn("mounted, task ");
-                    put_num((unsigned long)tid);
-                    puts_conn("\n");
+                    puts_conn(S, "mounted, task ");
+                    put_num(S, (unsigned long)tid);
+                    puts_conn(S, "\n");
                 }
             }
         } else {
-            run_command(argc, argv);
+            run_command(S, argc, argv);
         }
     }
+}
+
+/* Нить сессии. Первое, что она делает, — заводит собственное пространство
+   имён: нити делят память, но не обязаны делить смысл имён, и именно поэтому
+   две сессии могут привязать /dev/console каждая к своему соединению. Всё,
+   что запустит эта сессия, унаследует её пространство, а не соседкино. */
+static void session_thread(long arg)
+{
+    struct session *S = (struct session *)arg;
+
+    /* Соединение открывает та задача, которая его и закроет.
+
+       Держателя соединение помнит по идентификатору задачи, а нить — это
+       отдельная задача. Открыть в родителе и закрыть в нити значит добавить
+       ссылку одному и снять её у другого: ref_drop не находит совпадения,
+       счётчик не доходит до нуля, и соединение навсегда остаётся в
+       close-wait. Ровно это и случилось при первой сборке — три висящих
+       соединения при пяти вошедших и вышедших. */
+    S->conn = vfs_open(S->scratch);
+    if (S->conn < 0) {
+        char *st = S->stack;
+        free(S);
+        free(st);
+        sys_exit();
+    }
+
+    /* Своё пространство имён: нити делят память, но не обязаны делить смысл
+       имён — потому две сессии и могут привязать /dev/console каждая к своему
+       соединению. Всё, что запустит эта сессия, унаследует её пространство. */
+    sys_nsclone();
+    sys_bind(S->scratch, "/dev/console", MREPL);
+
+    session(S);
+
+    vfs_close(S->conn);                 /* последний дескриптор: и соединение */
+    uputs("  [rsh] they logged out\n");
+    char *stack = S->stack;
+    free(S);
+    free(stack);                        /* стек, на котором мы стоим, — но
+                                           free только помечает его свободным,
+                                           а следующим действием мы уходим */
+    sys_exit();
 }
 
 /* ---- the port ---------------------------------------------------------- */
@@ -516,9 +572,9 @@ void rsh_main(void)
         const char *a = "accept ";
         while (*a)
             cmd[k++] = *a++;
-        if (lslot >= 10)
-            cmd[k++] = (char)('0' + lslot / 10);
-        cmd[k++] = (char)('0' + lslot % 10);
+        /* Слот теперь может быть трёхзначным: соединений сто двадцать
+           восемь, а не четыре. */
+        k += uutoa((unsigned long)lslot, cmd + k);
         cmd[k] = 0;
 
         if (ctl(cmd, answer, sizeof(answer)) < 0)
@@ -532,28 +588,35 @@ void rsh_main(void)
         a = "/net/tcp/";
         while (*a)
             path[k++] = *a++;
-        if (slot >= 10)
-            path[k++] = (char)('0' + slot / 10);
-        path[k++] = (char)('0' + slot % 10);
+        k += uutoa((unsigned long)slot, path + k);
         path[k] = 0;
 
-        conn = vfs_open(path);
-        if (conn < 0)
+        /* Одна сессия — одна нить. Всё, что ей нужно, выделяется здесь:
+           состояние и стек. Освобождает она их сама, потому что этот цикл к
+           тому времени уже ждёт следующего соединения. */
+        struct session *S = malloc(sizeof(*S));
+        char *stack = S ? malloc(SESSION_STACK) : 0;
+        if (!S || !stack) {
+            free(S);
+            free(stack);
+            uputs("  [rsh] no memory for a session\n");
             continue;
+        }
+        umemset(S, 0, sizeof(*S));
+        S->stack = stack;
+        S->slot  = slot;
+        S->conn  = -1;                  /* откроет нить, и вот почему */
+        for (int q = 0; q < (int)sizeof(path) && path[q]; q++)
+            S->scratch[q] = path[q];
 
-        /* One line, and it is the whole of output redirection: in this
-           shell's namespace — and so in the namespace of every program it
-           starts — /dev/console now means this connection. The programs know
-           nothing about it, and neither does the network server: it is asked
-           for /net/tcp/N, which is a name it has always understood. */
-        sys_bind(path, "/dev/console", MREPL);
-
+        int tid = sys_thread(session_thread, stack + SESSION_STACK, (long)S);
+        if (tid < 0) {
+            uputs("  [rsh] no task slot for a session\n");
+            free(stack);
+            free(S);
+            continue;
+        }
         uputs("  [rsh] someone logged in\n");
-        session(slot);
-        vfs_close(conn);               /* the last descriptor: this also
-                                          closes the connection */
-        conn = -1;
-        uputs("  [rsh] they logged out\n");
     }
 
     uputs("  [rsh] stopping\n");

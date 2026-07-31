@@ -3714,6 +3714,67 @@ survive, because it counts how many tasks this slot has been.
 were before threads existed, and a thread takes a slot like anything else.
 
 
+## Nine telnet sessions
+
+The remote shell served one connection at a time, and every reason for that
+has now gone. It kept the session in file-scope statics — the line buffer, the
+input buffer, the telnet parser's state, the connection — and its loop was
+accept, serve, accept. The state moved into a `struct session`, the loop
+became accept and spawn, and a session is a thread.
+
+```
+одновременно работают сессий: 8 из 9
+соединений: 10
+после закрытия всех: 0  (0 bytes) | 1  (0 bytes)
+```
+
+Nine at once, each answering independently; a program started in one writes
+only into that one; Ctrl-C kills only its own; and when they close, the
+connections and the memory come back.
+
+**Threads share memory but need not share what names mean**, and that is what
+makes it work. A namespace is a field of a task, not of an address space, so
+each session thread calls `sys_nsclone()` for itself and binds `/dev/console`
+to *its* connection — and everything it starts inherits its namespace rather
+than a neighbour's. The whole of per-session output redirection is still one
+`bind`.
+
+### Two tables stopped being tables
+
+`NTCB` went from 4 to 128, and the control block is allocated with it: the
+table is pointers and an empty slot is a null one. The number is still a
+**cap**, and for the reason four was — a stack that allocates without bound
+for every arriving SYN can be pushed out of memory by a stranger. What the cap
+bounds is now explicit: 128 × (284 + 2048 + 2048) bytes, about half a megabyte
+against forty-seven free. An idle stack costs the pointers.
+
+Namespaces went the same way, and further: `ns_pool` was an array of
+structures, 9.8 KiB of kernel `.bss` present whether anything had ever cloned
+a namespace or not. It is a table of pointers now and a namespace is a page,
+taken when wanted and given back by the sweep. A namespace is 1224 bytes of
+4096 and most of the page is wasted — carving several from one page is
+arithmetic the kernel would have to do without an allocator, and there is no
+allocator in the kernel on purpose.
+
+That last change broke something instructive. A page from the free-page arena
+is **not mapped into any task** — `vm_create_task_pt` gives the kernel image
+and MMIO and nothing else. So `vfs_ns_clone` and `vfs_mount` can no longer be
+called directly, even by a task in supervisor mode: the call has to go through
+a trap, where the kernel's page table is installed. The sandbox demo in
+`kmain.c` called them directly and faulted on the first one. It had worked
+only because the pool lived in `.bss`, which is mapped everywhere.
+
+### And the bug that only many sessions could show
+
+**A connection must be opened by the task that will close it.** The connection
+remembers its holder by task id, and a thread is a separate task; opening in
+the parent and closing in the thread adds a reference for one and drops it for
+the other, so the count never reaches zero and the connection sits in
+`close-wait` for ever. Five logins, five logouts, three connections still
+there. Moving the `vfs_open` into the session thread is the whole fix, and the
+comment explaining why is longer than the change.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

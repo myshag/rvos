@@ -474,14 +474,17 @@ enum {
     T_CLOSE_WAIT, T_LAST_ACK
 };
 
-/* Four control blocks, and that number stays fixed on purpose even though
-   everything inside them is allocated now. A stack that allocates a block for
-   every arriving SYN can be pushed out of memory by a stranger — the oldest
-   denial of service there is, and the reason SYN cookies exist. A fixed count
-   of blocks bounds what a peer can make this machine spend; allocating what
-   is *inside* them means an idle stack costs a few hundred bytes instead of
-   thirty-one kilobytes, and a busy one costs exactly what it did before. */
-#define NTCB   4
+/* A hundred and twenty-eight connections, and the block itself is allocated
+   too — the table is pointers, and an empty slot is a null one.
+
+   The number is a *cap*, and it is still there for the reason four was: a
+   stack that allocates without bound for every arriving SYN can be pushed out
+   of memory by a stranger, which is the oldest denial of service there is and
+   the reason SYN cookies exist. What the cap bounds is now explicit: at most
+   128 × (284 + 2048 + 2048) bytes, about half a megabyte, against forty-seven
+   free. An idle stack costs the pointers — one kilobyte — and a connection
+   costs what a connection costs. */
+#define NTCB   128
 #define RXQ    2048       /* the read queue, and therefore our window */
 #define SNDBUF 2048       /* bytes written but not yet acknowledged */
 #define MSS    1024       /* the largest segment we send or advertise */
@@ -583,42 +586,59 @@ struct tcb {
     int      intr_fired;
 };
 
-static struct tcb tcbs[NTCB];
+static struct tcb *tcbs[NTCB];          /* a null slot is a free one */
 static unsigned next_port = 40001;
+
+/* The slot a block sits in, which is the number /net/tcp/N is named by. */
+static int tcb_slot(const struct tcb *c)
+{
+    for (int i = 0; i < NTCB; i++)
+        if (tcbs[i] == c)
+            return i;
+    return -1;
+}
 
 static struct tcb *tcb_alloc(void)
 {
-    for (int i = 0; i < NTCB; i++)
-        if (tcbs[i].state == T_FREE) {
-            struct tcb *c = &tcbs[i];
-            umemset(c, 0, sizeof(*c));
-            c->snd_buf = malloc(SNDBUF);
-            c->rxq     = malloc(RXQ);
-            if (!c->snd_buf || !c->rxq) {
-                /* Out of memory looks like out of connections, which every
-                   caller already knows how to be told. */
-                free(c->snd_buf);
-                free(c->rxq);
-                umemset(c, 0, sizeof(*c));
-                return 0;
-            }
-            c->peer_mss = 536;          /* what RFC 1122 says to assume */
-            c->rto      = RTO_INITIAL;
-            c->srtt     = -1;
-            c->cwnd     = 2 * MSS;
-            c->ssthresh = 64 * 1024;
-            return c;
+    for (int i = 0; i < NTCB; i++) {
+        if (tcbs[i])
+            continue;
+        struct tcb *c = malloc(sizeof(*c));
+        if (!c)
+            return 0;
+        umemset(c, 0, sizeof(*c));
+        c->snd_buf = malloc(SNDBUF);
+        c->rxq     = malloc(RXQ);
+        if (!c->snd_buf || !c->rxq) {
+            /* Out of memory looks like out of connections, which every caller
+               already knows how to be told. */
+            free(c->snd_buf);
+            free(c->rxq);
+            free(c);
+            return 0;
         }
+        c->peer_mss = 536;          /* what RFC 1122 says to assume */
+        c->rto      = RTO_INITIAL;
+        c->srtt     = -1;
+        c->cwnd     = 2 * MSS;
+        c->ssthresh = 64 * 1024;
+        tcbs[i] = c;
+        return c;
+    }
     return 0;
 }
 
 static void tcb_free(struct tcb *c)
 {
+    int i = tcb_slot(c);
     free(c->snd_buf);
     free(c->rxq);
-    for (int i = 0; i < NOOO; i++)
-        free(c->ooo[i].data);
-    umemset(c, 0, sizeof(*c));
+    for (int k = 0; k < NOOO; k++)
+        free(c->ooo[k].data);
+    umemset(c, 0, sizeof(*c));      /* anything still holding it sees T_FREE */
+    free(c);
+    if (i >= 0)
+        tcbs[i] = 0;
 }
 
 /* Demultiplexing: the exact four-tuple wins; a listener on the local port is
@@ -628,8 +648,8 @@ static struct tcb *tcb_find(const uint8 *raddr, unsigned rport, unsigned lport)
 {
     struct tcb *listener = 0;
     for (int i = 0; i < NTCB; i++) {
-        struct tcb *c = &tcbs[i];
-        if (c->state == T_FREE || c->lport != lport)
+        struct tcb *c = tcbs[i];
+        if (!c || c->state == T_FREE || c->lport != lport)
             continue;
         if (c->state == T_LISTEN)
             listener = c;
@@ -1399,8 +1419,8 @@ static void timers_rearm(void)
     if (retry_at && (!best || retry_at < best))
         best = retry_at;
     for (int i = 0; i < NTCB; i++) {
-        struct tcb *c = &tcbs[i];
-        if (c->state == T_FREE)
+        struct tcb *c = tcbs[i];
+        if (!c || c->state == T_FREE)
             continue;
         if (c->rt_at && (!best || c->rt_at < best))
             best = c->rt_at;
@@ -1441,8 +1461,8 @@ void net_timeout(void)
     dns_retry(now);
 
     for (int i = 0; i < NTCB; i++) {
-        struct tcb *c = &tcbs[i];
-        if (c->state == T_FREE)
+        struct tcb *c = tcbs[i];
+        if (!c || c->state == T_FREE)
             continue;
 
         if (c->tw_at && c->tw_at <= now) {
@@ -1586,7 +1606,8 @@ static int net_status(char *o, int cap)
     }
 
     for (int i = 0; i < NTCB; i++) {
-        struct tcb *c = &tcbs[i];
+        struct tcb *c = tcbs[i];
+        if (!c) continue;
         if (c->state == T_FREE || n > cap - 120)
             continue;
         n = app(o, n, "tcp ");
@@ -1654,16 +1675,16 @@ static struct {
 static struct tcb *conn_of(int fd)
 {
     int i = fd - FD_CONN0;
-    if (i < 0 || i >= NTCB || tcbs[i].state == T_FREE)
+    if (i < 0 || i >= NTCB || !tcbs[i] || tcbs[i]->state == T_FREE)
         return 0;
-    return &tcbs[i];
+    return tcbs[i];
 }
 
 /* "/net/tcp" with no number means the connection this system placed. */
 static int client_slot(void)
 {
     for (int i = 0; i < NTCB; i++)
-        if (tcbs[i].state != T_FREE && tcbs[i].is_client)
+        if (tcbs[i] && tcbs[i]->state != T_FREE && tcbs[i]->is_client)
             return i;
     return -1;
 }
@@ -1799,8 +1820,8 @@ static void reap_dead_clients(void)
         }
 
     for (int i = 0; i < NTCB; i++) {
-        struct tcb *c = &tcbs[i];
-        if (c->state == T_FREE)
+        struct tcb *c = tcbs[i];
+        if (!c || c->state == T_FREE)
             continue;
         if (c->reader.used && !sys_alive(c->reader.task))
             c->reader.used = 0;
@@ -1877,8 +1898,8 @@ static void net_wakeups(void)
     int refused = 0;
 
     for (int i = 0; i < NTCB; i++) {
-        struct tcb *c = &tcbs[i];
-        if (c->state == T_FREE)
+        struct tcb *c = tcbs[i];
+        if (!c || c->state == T_FREE)
             continue;
         if (c->opener.used && c->state != T_SYN_SENT && c->state != T_SYN_RCVD) {
             char ok[16];
@@ -1907,11 +1928,13 @@ static void net_wakeups(void)
        nobody has been given yet. */
     (void)0;
     for (int i = 0; i < NTCB; i++) {
-        struct tcb *l = &tcbs[i];
+        struct tcb *l = tcbs[i];
+        if (!l) continue;
         if (l->state != T_LISTEN || !l->reader.used)
             continue;
         for (int k = 0; k < NTCB; k++) {
-            struct tcb *c = &tcbs[k];
+            struct tcb *c = tcbs[k];
+            if (!c) continue;
             if (c == l || c->state == T_FREE || c->lport != l->lport)
                 continue;
             if (c->state != T_ESTABLISHED || c->accepted)
@@ -2070,17 +2093,17 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
             else {
                 ref_add(c, from);       /* the port belongs to whoever asked */
                 n = app(o, n, "ok ");
-                n += uutoa((unsigned long)(c - tcbs), o + n);
+                n += uutoa((unsigned long)tcb_slot(c), o + n);
                 o[n++] = '\n';
             }
         }
     } else if (word_is(&s, "accept")) {
         unsigned slot;
         if (!parse_uint(s, &slot) || slot >= NTCB ||
-            tcbs[slot].state != T_LISTEN) {
+            !tcbs[slot] || tcbs[slot]->state != T_LISTEN) {
             n = app(o, n, "error not a listener\n");
         } else {
-            struct tcb *l = &tcbs[slot];
+            struct tcb *l = tcbs[slot];
             if (l->reader.used) {
                 n = app(o, n, "error already accepting\n");
             } else {
@@ -2108,10 +2131,10 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
     } else if (word_is(&s, "close")) {
         unsigned slot;
         if (!parse_uint(s, &slot) || slot >= NTCB ||
-            tcbs[slot].state == T_FREE)
+            !tcbs[slot] || tcbs[slot]->state == T_FREE)
             n = app(o, n, "error no such connection\n");
         else {
-            tcp_close(&tcbs[slot]);
+            tcp_close(tcbs[slot]);
             n = app(o, n, "ok\n");
         }
     } else {
@@ -2150,7 +2173,7 @@ static int net_dir(const char *path, char *out, int cap)
         return o;
     }
     for (int i = 0; i < NTCB && o < cap - 24; i++) {
-        if (tcbs[i].state == T_FREE)
+        if (!tcbs[i] || tcbs[i]->state == T_FREE)
             continue;
         out[o++] = '-';
         out[o++] = ' ';
@@ -2202,9 +2225,9 @@ int net_vfs(int from, struct vfs_req *r)
                 }
         } else if (ustr_has_prefix(r->path, "/net/tcp/")) {
             int i = path_slot(r->path);
-            if (i < 0 || tcbs[i].state == T_FREE) {
+            if (i < 0 || !tcbs[i] || tcbs[i]->state == T_FREE) {
                 r->result = -1;
-            } else if (ref_add(&tcbs[i], from) < 0) {
+            } else if (ref_add(tcbs[i], from) < 0) {
                 r->result = -1;             /* too many holders */
             } else {
                 r->result = FD_CONN0 + i;
@@ -2213,7 +2236,7 @@ int net_vfs(int from, struct vfs_req *r)
             int i = client_slot();
             if (i < 0) {
                 r->result = -1;
-            } else if (ref_add(&tcbs[i], from) < 0) {
+            } else if (ref_add(tcbs[i], from) < 0) {
                 r->result = -1;
             } else {
                 r->result = FD_CONN0 + i;
@@ -2284,8 +2307,8 @@ int net_vfs(int from, struct vfs_req *r)
             char t[VFS_DATA_MAX];
             int o = 0;
             for (int i = 0; i < NTCB && o < VFS_DATA_MAX - 64; i++) {
-                struct tcb *c = &tcbs[i];
-                if (c->state == T_FREE)
+                struct tcb *c = tcbs[i];
+                if (!c || c->state == T_FREE)
                     continue;
                 for (int k = 0; k < NREF; k++)
                     if (c->refs[k].used && c->refs[k].task == r->len) {
