@@ -1574,29 +1574,6 @@ static struct {
     char buf[VFS_DATA_MAX];
 } pfd[NPFD];
 
-/* ---- a task's console -------------------------------------------------
-   A program writes to /dev/console because that is where programs write. In
-   the namespace a shell over TCP hands its children, that name is bound to
-   this server — so the open arrives here, with the asking task's id, and this
-   is the table that says which connection the task belongs to.
-
-   The association is made by the loader, in the one moment a child exists and
-   is not yet running. Doing it any later is a race the child can win. */
-#define NCONSOLE 4
-static struct {
-    int used;
-    int task;
-    int slot;
-} attached[NCONSOLE];
-
-static int console_slot_of(int task)
-{
-    for (int i = 0; i < NCONSOLE; i++)
-        if (attached[i].used && attached[i].task == task)
-            return attached[i].slot;
-    return -1;
-}
-
 static struct tcb *conn_of(int fd)
 {
     int i = fd - FD_CONN0;
@@ -1730,10 +1707,6 @@ static void ref_drop(struct tcb *c, int task)
    this scale that there is no reason to be clever about when. */
 static void reap_dead_clients(void)
 {
-    for (int i = 0; i < NCONSOLE; i++)
-        if (attached[i].used && !sys_alive(attached[i].task))
-            attached[i].used = 0;
-
     for (int i = 0; i < NPFD; i++)
         if (pfd[i].used && !sys_alive(pfd[i].owner)) {
             net_putn("  net: reclaiming a control file from dead task ",
@@ -2012,26 +1985,6 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
                 return 0;                /* parked, or answered inside there */
             }
         }
-    } else if (word_is(&s, "attach")) {
-        unsigned slot, task;
-        const char *p = parse_uint(s, &slot);
-        if (!p || !parse_uint(skip_spaces(p), &task) || slot >= NTCB ||
-            tcbs[slot].state == T_FREE) {
-            n = app(o, n, "error syntax\n");
-        } else {
-            int k = 0;
-            while (k < NCONSOLE && attached[k].used &&
-                   attached[k].task != (int)task)
-                k++;
-            if (k == NCONSOLE) {
-                n = app(o, n, "error no room\n");
-            } else {
-                attached[k].used = 1;
-                attached[k].task = (int)task;
-                attached[k].slot = (int)slot;
-                n = app(o, n, "ok\n");
-            }
-        }
     } else if (word_is(&s, "close")) {
         unsigned slot;
         if (!parse_uint(s, &slot) || slot >= NTCB ||
@@ -2077,16 +2030,6 @@ int net_vfs(int from, struct vfs_req *r)
                     r->result = base + i;
                     break;
                 }
-        } else if (ustr_has_prefix(r->path, "/dev/console")) {
-            /* Only this name, and only for a task that has been attached: the
-               server does not otherwise answer for anything outside /net/. */
-            int i = console_slot_of(from);
-            if (i < 0 || tcbs[i].state == T_FREE)
-                r->result = -1;
-            else if (ref_add(&tcbs[i], from) < 0)
-                r->result = -1;
-            else
-                r->result = FD_CONN0 + i;
         } else if (ustr_has_prefix(r->path, "/net/tcp/")) {
             int i = path_slot(r->path);
             if (i < 0 || tcbs[i].state == T_FREE) {

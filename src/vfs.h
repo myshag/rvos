@@ -55,9 +55,12 @@ struct vfs_req {
 
 struct namespace;
 
-int vfs_bind(const char *prefix, int server_task);  /* in caller's ns */
+int vfs_mount(const char *prefix, int server_task); /* a server behind a name */
+int vfs_bind(const char *old, const char *new);    /* `new` means `old` now */
 int vfs_ns_clone(void);                             /* private copy of it */
-int vfs_route(const char *path);                    /* server id, -1 unbound */
+/* -> the server that answers, and in `out` the name to ask it about, which
+   differs from `path` if a bind was crossed. -1 if nothing is bound over it. */
+int vfs_resolve(const char *path, char *out, int cap);
 int vfs_dump_mounts_of(int task_id, char *out, int cap);
 struct namespace *vfs_root_ns(void);
 
@@ -92,12 +95,17 @@ static inline int vfs_call(int dst, struct vfs_req *r)
 
 static inline int vfs_open(const char *path)
 {
-    int srv = sys_route(path);
+    /* Resolution answers two questions at once now: who serves this name, and
+       what name to serve. They are different questions as soon as a bind is
+       involved — /dev/console may be a connection, and the server on the far
+       end has never heard of /dev/console. */
+    char real[VFS_PATH_MAX];
+    int srv = sys_resolve(path, real, (int)sizeof(real));
     if (srv < 0)
         return -1;                      /* nothing bound over this path */
     struct vfs_req r;
     r.op = VFS_OPEN;
-    vfs__scpy(r.path, path);
+    vfs__scpy(r.path, real);
     if (vfs_call(srv, &r) < 0)
         return -1;
     return (srv << 16) | (r.result & 0xffff);

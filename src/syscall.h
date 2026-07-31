@@ -19,19 +19,23 @@ enum {
        no task maps those any more — so introspection had to become a kernel
        service the moment address spaces were separated. */
     SYS_PGDUMP = 4,
-    /* a0 = path -> server task id. Path resolution reads the caller's mount
-       table, which lives in kernel memory; a user-mode task cannot look at it
+    /* a0 = path, a1 = out buffer, a2 = cap -> server task id, and in `out`
+       the name that server should be asked about — not the same name if a
+       bind was crossed on the way. Resolution reads the caller's mount table,
+       which lives in kernel memory; a user-mode task cannot look at it
        directly, so the namespace is reached through the kernel like anything
        else. */
-    SYS_ROUTE  = 5,
+    SYS_RESOLVE = 5,
     /* Kernel state a user-mode server cannot read for itself. The task table,
        the mount tables and the page allocator all live in kernel memory, so
        the proc server asks instead of looking. */
     SYS_TASKINFO = 6,  /* a0 = index, a1 = struct taskinfo* -> 0 / -1 */
     SYS_MOUNTS   = 7,  /* a0 = task id, a1 = buf, a2 = cap -> bytes */
     SYS_MEMINFO  = 8,  /* a0 = int[2] out: {free pages, total pages} */
-    /* Namespace mutation: also kernel-side per-task state. */
-    SYS_BIND     = 9,  /* a0 = prefix, a1 = server task id */
+    /* Namespace mutation: also kernel-side per-task state. Plan 9's two
+       operations, kept apart because they are not the same thing: mount puts
+       a server behind a name, bind makes one name mean another. */
+    SYS_BIND     = 9,  /* a0 = old path, a1 = new path */
     SYS_NSCLONE  = 10,
     /* Loading a program. Three primitives, matched to what an ELF program
        header actually says, so the loader can live in user space and the
@@ -65,6 +69,7 @@ enum {
        answers "no" for a slot that has been reused as well as for one that is
        empty. */
     SYS_ALIVE   = 19,     /* a0 = task id -> 1 or 0 */
+    SYS_MOUNT   = 20,     /* a0 = prefix, a1 = server task id */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -142,9 +147,15 @@ static inline int sys_meminfo(int out[2])
 {
     return (int)_ecall1(SYS_MEMINFO, (long)out);
 }
-static inline int sys_bind(const char *prefix, int server_task)
+static inline int sys_mount(const char *prefix, int server_task)
 {
-    return (int)_ecall2(SYS_BIND, (long)prefix, server_task);
+    return (int)_ecall2(SYS_MOUNT, (long)prefix, server_task);
+}
+/* bind(old, new): `new` means `old` from now on. The second argument is the
+   one that changes — Plan 9's order, and the one everybody gets backwards. */
+static inline int sys_bind(const char *old, const char *new)
+{
+    return (int)_ecall2(SYS_BIND, (long)old, (long)new);
 }
 static inline int sys_nsclone(void)
 {
@@ -189,9 +200,9 @@ static inline void sys_exit(void)
     for (;;) ;                 /* not reached */
 }
 
-static inline int sys_route(const char *path)
+static inline int sys_resolve(const char *path, char *out, int cap)
 {
-    return (int)_ecall1(SYS_ROUTE, (long)path);
+    return (int)_ecall3(SYS_RESOLVE, (long)path, (long)out, cap);
 }
 
 /* Render one task's translation of `va` as text into our own buffer. */

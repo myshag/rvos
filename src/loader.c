@@ -35,26 +35,6 @@ static int read_file(const char *path, char *dst, int cap)
     return total;
 }
 
-/* Tell the network server that a task's console is one of its connections.
-   Nothing here understands TCP: it is a line of text written to a file. */
-static void attach_console(int tid, int slot)
-{
-    int fd = vfs_open("/net/ctl");
-    if (fd < 0)
-        return;
-    char cmd[40];
-    int n = 0;
-    const char *p = "attach ";
-    while (*p)
-        cmd[n++] = *p++;
-    n += uutoa((unsigned long)slot, cmd + n);
-    cmd[n++] = ' ';
-    n += uutoa((unsigned long)tid, cmd + n);
-    cmd[n] = 0;
-    vfs_write(fd, cmd, n);
-    vfs_close(fd);
-}
-
 /* Lay out argv the way a C program expects to find it: an array of pointers
    terminated by NULL, followed by the strings themselves. The pointers have
    to name addresses in the *new* task's space, which is why they are computed
@@ -78,10 +58,13 @@ static int build_args(char *blk, int argc, char *const argv[])
 
 /* Load `path` into a new task and start it. Returns the task id, or -1.
 
-   `console` is a TCP connection slot the child's output should reach, or -1
-   for "wherever /dev/console means in the namespace it inherits". */
+   Nothing here arranges where the child's output goes, and nothing needs to:
+   it inherits its parent's namespace, and if /dev/console means a connection
+   there, it means one here. This used to take a connection number and attach
+   it to the task id in the window before SYS_START — a mechanism that existed
+   only because a name could not be bound to another name. It can now. */
 int spawn(const char *path, char *scratch, int scratchsz,
-          int argc, char *const argv[], int console)
+          int argc, char *const argv[])
 {
     int n = read_file(path, scratch, scratchsz);
     if (n <= 0)
@@ -137,18 +120,6 @@ int spawn(const char *path, char *scratch, int scratchsz,
             return -1;
     }
 
-    /* The one moment at which the child can be arranged for without racing
-       it: its address space is built, its registers are set, and it is still
-       not runnable. Anything the parent wants true before the program's first
-       instruction has to happen here, which is why this is a parameter of
-       spawn rather than something the caller does afterwards.
-
-       `console` names a TCP connection the child's output should reach. The
-       loader does not know what that means; it writes the request to
-       /net/ctl and lets the network server keep the association. */
-    if (console >= 0)
-        attach_console(tid, console);
-
     if (sys_start(tid, &si) < 0)
         return -1;
     return tid;
@@ -185,7 +156,7 @@ void loader_main(void)
     argv[2] = (char *)"beta";
 
     uputs("$ exec /HELLO.ELF alpha beta\n");
-    int tid = spawn("/HELLO.ELF", elfbuf, ELFMAX, 3, argv, -1);
+    int tid = spawn("/HELLO.ELF", elfbuf, ELFMAX, 3, argv);
     if (tid < 0)
         uputs("  exec failed\n");
     else

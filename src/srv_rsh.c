@@ -12,14 +12,11 @@
    program could.
 
    A program started from here has its output arrive on the connection, and
-   the way that works is worth following, because no part of it knows about
-   any other part. This shell clones its namespace and binds /dev/console to
-   the network server. A task it creates inherits that namespace. The program
-   writes to /dev/console because that is where programs write. The network
-   server, asked to open that name, looks up which connection the asking task
-   was attached to — an association the loader made in the one moment the
-   child existed but had not yet run. Four independent mechanisms, none of
-   them added for this, and the program contains no line about any of it. */
+   the whole of the mechanism is one line: bind("/net/tcp/N", "/dev/console")
+   in this shell's namespace. A task it creates inherits that namespace; the
+   program writes to /dev/console because that is where programs write; the
+   network server is asked for /net/tcp/N, a name it has always understood.
+   Nobody in that chain knows about anybody else. */
 #include "syscall.h"
 #include "vfs.h"
 #include "ulib.h"
@@ -37,7 +34,7 @@ static int  inlen;
 static char scratch[64];
 
 int spawn(const char *path, char *sc, int scsz,
-          int argc, char *const argv[], int console);   /* loader.c */
+          int argc, char *const argv[]);   /* loader.c */
 
 static int rlen(const char *s)
 {
@@ -168,6 +165,9 @@ static void do_help(void)
               "  cat <path>...  print a file, a report, or a connection\n"
               "  ps             running tasks              (/proc/tasks)\n"
               "  mounts         this shell's namespace     (/proc/mounts)\n"
+              "  bind <old> <new>   make <new> mean <old>, here and in\n"
+              "                     anything started from here\n"
+              "  mount <pfx> <task> put a server behind a name\n"
               "  net            interface, ARP, connections (/net/status)\n"
               "  mem            free and total pages\n"
               "  run <path> ..  start a program; its output comes back here\n"
@@ -217,6 +217,23 @@ static void session(int slot)
                proc server has to be told which task to report on rather than
                having "the" mount table to look at. */
             do_cat("/proc/mounts");
+        } else if (streq(argv[0], "bind")) {
+            /* Plan 9's order: the second name is the one that changes. */
+            if (argc < 3)
+                puts_conn("usage: bind <old> <new>\n");
+            else if (sys_bind(argv[1], argv[2]) < 0)
+                puts_conn("bind: no room in the mount table\n");
+        } else if (streq(argv[0], "mount")) {
+            if (argc < 3) {
+                puts_conn("usage: mount <prefix> <task>\n");
+            } else {
+                int t = 0;
+                const char *d = argv[2];
+                while (*d >= '0' && *d <= '9')
+                    t = t * 10 + (*d++ - '0');
+                if (sys_mount(argv[1], t) < 0)
+                    puts_conn("mount: no room in the mount table\n");
+            }
         } else if (streq(argv[0], "net")) {
             do_cat("/net/status");
         } else if (streq(argv[0], "echo")) {
@@ -249,7 +266,7 @@ static void session(int slot)
                 puts_conn(argv[1]);
                 puts_conn("\n");
                 if (spawn(argv[1], elfbuf, ELFMAX,
-                          argc - 1, argv + 1, slot) < 0) {
+                          argc - 1, argv + 1) < 0) {
                     puts_conn("rsh: cannot run ");
                     puts_conn(argv[1]);
                     puts_conn("\n");
@@ -318,11 +335,12 @@ void rsh_main(void)
        else's — and one binding in it: /dev/console now means the network.
        Every task we create inherits this, which is the whole mechanism by
        which a program's output follows it down a connection. */
-    sys_nsclone();                        /* not vfs_ns_clone(): that is the
-                                             kernel's own copy of this, and
-                                             this task may not call into the
-                                             kernel's text at all */
-    sys_bind("/dev/console", NET_TASK_ID);
+    /* Our own view of the tree, so that what we bend does not bend anybody
+       else's. The binding itself is per session, below: which connection
+       /dev/console means depends on who is logged in. (sys_nsclone, not
+       vfs_ns_clone — that one is the kernel's own copy of this function, and
+       this task may not call into kernel text at all.) */
+    sys_nsclone();
 
     uputs("  [rsh] a shell is listening on port 23\n");
 
@@ -356,6 +374,14 @@ void rsh_main(void)
         conn = vfs_open(path);
         if (conn < 0)
             continue;
+
+        /* One line, and it is the whole of output redirection: in this
+           shell's namespace — and so in the namespace of every program it
+           starts — /dev/console now means this connection. The programs know
+           nothing about it, and neither does the network server: it is asked
+           for /net/tcp/N, which is a name it has always understood. */
+        sys_bind(path, "/dev/console");
+
         uputs("  [rsh] someone logged in\n");
         session(slot);
         vfs_close(conn);               /* the last descriptor: this also

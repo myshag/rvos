@@ -61,8 +61,8 @@ static void sandbox(void)
     kprintf("\n--- sandbox (task %d) ----------------------------------\n",
             SANDBOX_TASK_ID);
     vfs_ns_clone();
-    vfs_bind("/dev/console", NULL_TASK_ID);
-    kprintf("$ vfs_ns_clone(); bind /dev/console -> null\n");
+    vfs_mount("/dev/console", NULL_TASK_ID);
+    kprintf("$ vfs_ns_clone(); mount /dev/console -> null\n");
     say("  THIS LINE SHOULD NEVER APPEAR\n");
     kprintf("  write(/dev/console) printed nothing: rebound to null\n");
 
@@ -230,10 +230,10 @@ void smain(void)
     vm_map_at(net->pt, VIRTIO_MMIO_BASE, VIRTIO_MMIO_BASE,
               VIRTIO_MMIO_STRIDE * VIRTIO_MMIO_SLOTS, PTE_R | PTE_W | PTE_U, 0);
 
-    vfs_bind("/",      FS_TASK_ID);
-    vfs_bind("/dev/",  CONSOLE_TASK_ID);
-    vfs_bind("/proc/", PROC_TASK_ID);
-    vfs_bind("/net/",  NET_TASK_ID);
+    vfs_mount("/",      FS_TASK_ID);
+    vfs_mount("/dev/",  CONSOLE_TASK_ID);
+    vfs_mount("/proc/", PROC_TASK_ID);
+    vfs_mount("/net/",  NET_TASK_ID);
 
     kprintf("[boot] 4 user servers, 3 kernel apps, 2 user programs, %d pages.\n",
             pmm_free_count());

@@ -60,7 +60,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/task.c`       | task table, preemptive round-robin scheduler, syscalls |
 | `src/ipc.c`        | synchronous rendezvous `send`/`recv` |
 | `src/vfs.h`        | **the one interface** + client wrappers |
-| `src/vfs.c`        | the namespace: mount table, `bind`, longest-prefix routing |
+| `src/vfs.c`        | the namespace: `mount` and Plan 9 `bind`, longest-prefix routing |
 | `src/srv_fs.c`     | filesystem server — **user mode**, owns the disk mapping |
 | `src/srv_console.c`| console server — **user mode**, drives the UART itself |
 | `src/srv_proc.c`   | kernel state as files — **user mode**, asks via syscalls |
@@ -108,12 +108,14 @@ which is how the sandbox in the demo is silenced without knowing it.
   provides `yield`, `send`, `recv`. Since servers spend their lives blocked in
   `recv`, most switching actually happens at IPC boundaries — the timer is
   there so a CPU-bound task can't wedge the system.
-- **Namespace** is data, not policy, and it belongs to a *task*:
-  `vfs_bind(prefix, task)` works on a running system, `vfs_ns_clone()` gives
-  the caller a private copy to diverge (Plan 9's `rfork(RFNAMEG)`), and
-  resolution is longest-prefix-wins. Because the namespace is the caller's,
-  a server asked to report one has to be told whose — hence
-  `vfs_dump_mounts_of(task_id, …)` behind `/proc/mounts`.
+- **Namespace** is data, not policy, and it belongs to a *task*. Plan 9's two
+  operations are kept apart: `vfs_mount(prefix, task)` puts a server behind a
+  name, `vfs_bind(old, new)` makes one name mean another. Both work on a
+  running system, `vfs_ns_clone()` gives the caller a private copy to diverge
+  (Plan 9's `rfork(RFNAMEG)`), and resolution is longest-prefix-wins with a
+  bind rewriting the head of the path and resolving again. Because the
+  namespace is the caller's, a server asked to report one has to be told
+  whose — hence `vfs_dump_mounts_of(task_id, …)` behind `/proc/mounts`.
 - **Filesystem** image is loaded into guest RAM at `0x84000000` via
   `-device loader`; the driver treats that region as a flat block device.
 
@@ -344,6 +346,8 @@ $ read the fs server's private data region
     instead of the console
 26. output as a path, not a syscall: a namespace inherited by children, and a
     program's output arriving wherever it was started from
+27. `bind` as Plan 9 means it — a name onto a name — which deletes the
+    machinery stage 26 needed to work around not having it
 
 ## Loading a program
 
@@ -1281,6 +1285,9 @@ asked. A report that changes under its reader is not a file.
 
 ### Where a program's output goes
 
+*(This section describes stage 26. What it built was later replaced by one
+line — see [Bind, as Plan 9 means it](#bind-as-plan-9-means-it).)*
+
 A program started with `run` has its output arrive on the connection:
 
 ```
@@ -1341,8 +1348,82 @@ running.
 One session at a time, for the same reason `netd` takes one caller at a time:
 there is no `poll`.
 
+## Bind, as Plan 9 means it
+
+What this system called `bind` was `mount`: it put a *server* behind a name.
+That is a real operation and Plan 9 has it, but it is not bind, and calling it
+bind hid the fact that the other one was missing. A name could be pointed at a
+server; it could not be pointed at another name.
+
+The cost of that gap was the previous section. To make a program's output
+arrive on a connection, the network server had to special-case `/dev/console`,
+keep a table of which task belonged to which connection, and reclaim entries
+from it when tasks died — and the loader had to attach the association in the
+one window where a child exists but has not run, because doing it later is a
+race. Four moving parts, and a paragraph in this README explaining why the
+race mattered.
+
+With the real operation, all of it is one line:
+
+```c
+sys_bind(path, "/dev/console");     /* path is "/net/tcp/2" */
+```
+
+and the four parts are gone: 57 lines out of the network server, 36 out of the
+loader, and the race with them — there is nothing to arrange for the child,
+because the arrangement is in the namespace it inherits by construction.
+
+```
+rvos# mounts
+/ -> task 0
+/dev/ -> task 1
+/proc/ -> task 2
+/net/ -> task 11
+/dev/console -> /net/tcp/0     <- a name, not a server
+```
+
+`bind(old, new)` takes Plan 9's argument order, in which the *second* name is
+the one that changes — the thing everybody gets backwards. A second bind on
+the same point replaces the first rather than stacking, which is Plan 9's
+`MREPL` default and is what lets the shell rebind on every connection without
+filling the table.
+
+Resolution rewrites the head of the path and goes round again, up to four
+times, because `bind /a /b; bind /b /a` is a thing a person can type:
+
+```
+rvos# bind / /mnt
+rvos# cat /mnt/README.TXT
+rvos readme
+===========
+Educational RISC-V microkernel with FAT16.
+
+rvos# bind /a /b
+rvos# bind /b /a
+rvos# cat /a
+rsh: cannot open /a          <- four hops and it gives up, rather than not
+```
+
+Two things had to be right in the rewrite, and neither was on the first try.
+Joining `/` to `/README.TXT` gives `//README.TXT`, which is a name the
+filesystem has never heard of. And a prefix has to end where a component ends,
+or `/mnt` claims `/mnt2/x` and rewrites it to `2/x`.
+
+### What it still is not
+
+Plan 9 evaluates `old` at bind time and holds the resulting channel, so
+rebinding what `old` refers to afterwards does not disturb the bind. This
+stores the string and re-resolves it on every open, which is simpler and
+observably different: rebind `/net/tcp/0` and everything bound onto it moves.
+There is no union mount (`MAFTER`/`MBEFORE`), no `unmount`, eight mounts per
+namespace, and four namespaces in the whole system — never reclaimed, since
+`vfs_ns_clone` only ever takes the next slot. The fourth clone will fail and
+nobody will notice.
+
 ## Next steps
 
+- `unmount`, and reclaiming a namespace when the task holding it dies: there
+  are four, and they are handed out and never returned
 - `wait()`, so `run` can return when the program does, and job control so a
   program that never exits does not have to be left running blind
 - `poll`/`select`, or a second task per connection — either would let `netd`
