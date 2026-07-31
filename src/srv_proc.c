@@ -409,6 +409,28 @@ void proc_server(void)
                answered before the descriptor is even looked at. */
             if (r->ioctl_cmd == IOCTL_PING)
                 r->result = 0;
+            else if (r->ioctl_cmd == IOCTL_DOC)
+                r->result = vfs_doc_reply(r,
+                    "proc — kernel state as files, and nothing behind it.\n"
+                    "\n"
+                    "tasks       id, state, name, and what each is waiting for\n"
+                    "ipc         the rendezvous graph. A cycle in it is a\n"
+                    "            deadlock.\n"
+                    "mounts      the namespace of whoever is asking\n"
+                    "pagetable   the address space of whoever is asking\n"
+                    "<id>/       the same two questions about a named task,\n"
+                    "            plus ipc and ctl\n"
+                    "<id>/ctl    write `kill`\n"
+                    "\n"
+                    "The unqualified names answer about the caller, because a\n"
+                    "message carries its sender: this server is told who is\n"
+                    "asking without the path having to say. That is why there\n"
+                    "is no /proc/self here.\n"
+                    "\n"
+                    "A file is rendered when it is opened, so its size is not\n"
+                    "known until then and a listing reports 0 for all of them.\n"
+                    "\n"
+                    "ioctl     GETSIZE, PING, DOC\n");
             else if (r->ioctl_cmd == IOCTL_GETSIZE &&
                 r->fd >= 0 && r->fd < PROC_MAXFD && p_tab[r->fd].used)
                 r->result = p_tab[r->fd].size;

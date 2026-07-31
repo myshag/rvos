@@ -276,6 +276,31 @@ void fs_server(void)
                answered before the descriptor is even looked at. */
             if (r->ioctl_cmd == IOCTL_PING) {
                 r->result = 0;
+            } else if (r->ioctl_cmd == IOCTL_DOC) {
+                r->result = vfs_doc_reply(r,
+                    "fs — the FAT16 volume, one whole file at a time.\n"
+                    "\n"
+                    "open      a file gives its bytes; a directory gives its\n"
+                    "          listing, one line per entry: <type> <size> <name>,\n"
+                    "          type being d or -, and the name running to the\n"
+                    "          end of the line so that spaces need no rules.\n"
+                    "read      forward only; there is no seek in the interface.\n"
+                    "write     at the position reached; the buffer grows.\n"
+                    "create    truncates, which is how a file is overwritten.\n"
+                    "close     is what puts a file on the disk. Nothing before\n"
+                    "          it does — a program that dies leaves the volume\n"
+                    "          as it was, and that is deliberate.\n"
+                    "\n"
+                    "ioctl     GETSIZE  the open file's size\n"
+                    "          REMOVE   delete the open file, without writing\n"
+                    "                   it back\n"
+                    "          MKDIR    on the path, not the descriptor: there\n"
+                    "                   is nothing to open yet\n"
+                    "          PING     answered before the fd is looked at\n"
+                    "          DOC      this\n"
+                    "\n"
+                    "A file open by a task that has died is reclaimed when the\n"
+                    "last slot is wanted, and not written back.\n");
             } else if (r->ioctl_cmd == IOCTL_MKDIR) {
                 /* On the path, not on the descriptor: there is nothing to
                    open yet. The fd is ignored and the path carries it. */

@@ -189,6 +189,29 @@ void console_server(void)
                answered before the descriptor is even looked at. */
             if (r->ioctl_cmd == IOCTL_PING) {
                 r->result = 0;
+            } else if (r->ioctl_cmd == IOCTL_DOC) {
+                r->result = vfs_doc_reply(r,
+                    "console — the UART, driven from user mode.\n"
+                    "\n"
+                    "/dev/console  read one keystroke, write bytes.\n"
+                    "/dev          the directory it lives in, which lists\n"
+                    "              console and nothing else. Opening it does\n"
+                    "              not open the keyboard: reading a directory\n"
+                    "              must not wait for a key.\n"
+                    "\n"
+                    "read      answers when a key arrives and not before. The\n"
+                    "          request is kept, not refused — blocking here is\n"
+                    "          a server declining to answer yet, and the kernel\n"
+                    "          never learns the word. One waiter; a second\n"
+                    "          reader is told 0.\n"
+                    "write     bytes to the line, LF becoming CR LF.\n"
+                    "\n"
+                    "ioctl     INTR  a task id: if the interrupt character\n"
+                    "                arrives, kill that task. 0 takes the\n"
+                    "                nomination back and answers whether it\n"
+                    "                went off. This is what a tty does with\n"
+                    "                SIGINT, without signals or groups.\n"
+                    "          PING, DOC\n");
             } else if (r->ioctl_cmd == IOCTL_INTR) {
                 /* Clearing the nomination answers whether it went off. */
                 r->result  = r->len > 0 ? 0 : intr_fired;

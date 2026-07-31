@@ -3459,6 +3459,68 @@ it. That is a namespace, an address space, a rendezvous and a signal — four
 mechanisms of this kernel, in four files, for a task that is not you.
 
 
+## Documentation that cannot go stale
+
+Every server here accepts a handful of ioctls and, if it has a control file, a
+handful of words to write into it. Where that was written down was: in
+comments, in this file, and in the head of whoever wrote it. Two of those go
+out of date silently.
+
+So a server is asked instead. `IOCTL_DOC` means "describe yourself", it is
+answered before the descriptor is looked at — like a ping, it is about the
+server and not about a file — and `/doc` collects the answers:
+
+```
+rvos$ ls /doc            rvos$ cat /doc/net
+fs  (0 bytes)            net — ARP, IPv4, ICMP, UDP, DNS and TCP, as files.
+proc  (0 bytes)
+net  (0 bytes)           ctl       write a line, read the answer:
+dev  (0 bytes)                       resolve <name>        -> ok <address>
+console  (0 bytes)                   connect <ip> <port>   -> ok <n>, when the
+                                                              handshake finishes
+                                     listen <port>         -> ok <n>
+                                     accept <n>            -> ok <m>
+                                     address, close <n>
+                         tcp/<n>   the connection itself: read receives,
+                                   write sends, close closes.
+```
+
+**Nothing in `/doc` knows what any of it says.** The server that publishes it
+asks and pages, and the list of servers comes from the mount table, because a
+server nobody has mounted is a server nobody can ask. A description longer
+than one message is read in several: `len` in is an offset, the bytes come
+back from there, and zero means the end.
+
+The property worth having is not that the text is nearby. It is that **the
+text is the server speaking**. A comment can describe an ioctl that was
+removed last week; this cannot, because if the code that answers is gone the
+file is gone with it. A server that does not answer gets `this server does not
+describe itself`, which is a better failure than a page of confident prose
+about behaviour that no longer exists.
+
+### It deadlocked immediately, in the most obvious way
+
+The device server publishes `/doc`, so `cat /doc/dev` made it ask *itself*.
+`sys_send` to your own task cannot complete: the rendezvous needs two tasks
+and there is one, so it parked on its own queue and never reached a `recv` to
+take the message off. And because the task was a server, everything that had
+asked it anything stopped too — the machine looked wedged rather than the
+task.
+
+Two fixes, at two levels, and both are worth having on their own:
+
+```c
+if (dst == current) { A0(current) = -1; return; }   /* ipc.c */
+```
+
+The kernel refuses it. One comparison on every message, and a system-wide hang
+becomes an error return that the caller can see. And `SYS_SELF`, which was
+missing: a server could ask for its own namespace (`sys_mounts(-1)`) but not
+for its own number, and a server that has to recognise itself in a list of
+servers needs the number. The device server now answers its own entry without
+sending anything, which is the only way anybody can.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

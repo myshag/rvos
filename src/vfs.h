@@ -44,6 +44,17 @@ enum {
        so the terminal is told which single task is in front of it and kills
        that one. A shell sets it before it waits and clears it after. */
     IOCTL_INTR,
+    /* "Describe yourself." A server answers with text: which ioctls it takes,
+       which words its control file accepts, what its names mean. The answer
+       is not a file on a disk anywhere — it is the server speaking, so it
+       cannot be stale, and a server that has no answer has no documentation
+       rather than wrong documentation.
+
+       `len` in is an offset, `data` and `result` out are the bytes from
+       there, so a description longer than one message is read in several.
+       Like a ping, it is about the server and not about a descriptor, and is
+       answered before the fd is looked at. */
+    IOCTL_DOC,
 };
 
 /* Long names need somewhere to fit. 32 was enough while every name was 8.3;
@@ -272,6 +283,22 @@ static inline int vfs_write(int fd, const void *buf, int len)
 
 /* No out-pointer any more: whatever the command yields comes home in
    `result`, because an address would not survive the trip. */
+/* The other half of IOCTL_DOC: what a server does to answer one. Shared here
+   so that six servers do not each write it out. */
+static inline int vfs_doc_reply(struct vfs_req *r, const char *text)
+{
+    int off = r->len > 0 ? r->len : 0;
+    int l = 0;
+    while (text[l]) l++;
+    if (off >= l)
+        return 0;                       /* the end, which is how paging stops */
+    int n = l - off;
+    if (n > VFS_DATA_MAX)
+        n = VFS_DATA_MAX;
+    vfs__cpy(r->data, text + off, n);
+    return n;
+}
+
 /* An ioctl that carries a number. */
 static inline int vfs_ioctl_arg(int fd, unsigned long cmd, int arg)
 {

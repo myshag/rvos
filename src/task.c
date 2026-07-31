@@ -531,6 +531,9 @@ void syscall_dispatch(uint64 num)
         current->ctx.x[10] = (uint64)(long)n;
         break;
     }
+    case SYS_SELF:
+        current->ctx.x[10] = (uint64)current->id;
+        break;
     case SYS_KILL: {
         struct task *t = task_by_id((int)current->ctx.x[10]);
         /* Not itself through this door — SYS_EXIT is that door, and it does

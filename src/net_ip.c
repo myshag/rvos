@@ -2229,6 +2229,39 @@ int net_vfs(int from, struct vfs_req *r)
            this task is still turning its loop, not about a connection. */
         if (r->ioctl_cmd == IOCTL_PING) {
             r->result = 0;
+        } else if (r->ioctl_cmd == IOCTL_DOC) {
+            r->result = vfs_doc_reply(r,
+                "net — ARP, IPv4, ICMP, UDP, DNS and TCP, as files.\n"
+                "\n"
+                "ctl       write a line, read the answer:\n"
+                "            resolve <name>        -> ok <address>\n"
+                "            connect <ip> <port>   -> ok <n>, when the\n"
+                "                                     handshake finishes and\n"
+                "                                     not before\n"
+                "            listen <port>         -> ok <n>\n"
+                "            accept <n>            -> ok <m>, when somebody\n"
+                "                                     calls\n"
+                "            address               -> this machine's\n"
+                "            close <n>\n"
+                "status    what the stack is doing, rendered once at open so\n"
+                "          that reading it twice does not change it\n"
+                "tcp/      the live connections, one name each\n"
+                "tcp/<n>   the connection itself: read receives, write sends,\n"
+                "          close closes. Bind it over /dev/console and a\n"
+                "          program talks to the network without knowing.\n"
+                "\n"
+                "There is no socket() here and no accept() call. A control\n"
+                "file and a data file is Plan 9's answer and it needs no new\n"
+                "system calls at all.\n"
+                "\n"
+                "ioctl     INTR  as the console's: a task to kill if the\n"
+                "                interrupt character arrives on this\n"
+                "                connection\n"
+                "          PING, DOC\n"
+                "\n"
+                "Four control blocks, fixed on purpose: a stack that allocates\n"
+                "one per arriving SYN can be pushed out of memory by a\n"
+                "stranger.\n");
         } else if (r->ioctl_cmd == IOCTL_INTR) {
             struct tcb *c = conn_of(r->fd);
             if (!c) {

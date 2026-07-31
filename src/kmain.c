@@ -317,6 +317,8 @@ void smain(void)
        describing itself. */
     vfs_mount("/dev/", devt ? devt->id : CONSOLE_TASK_ID, MREPL);
     vfs_mount("/dev/console", CONSOLE_TASK_ID, MREPL);
+    /* And the same server publishes what the others say about themselves. */
+    vfs_mount("/doc/", devt ? devt->id : PROC_TASK_ID, MREPL);
 
     kprintf("[boot] 4 user servers, 3 kernel apps, 2 user programs, %d pages.\n",
             pmm_free_count());

@@ -108,6 +108,12 @@ enum {
        are handed over as text and the formatting is left to whoever asked.
        a0 picks the question, a1 the index where one applies. */
     SYS_DEVINFO = 27,     /* a0 = what, a1 = index, a2 = buf, a3 = cap */
+
+    /* Which task am I? Every other way of finding out was indirect — a server
+       could ask for its own namespace with -1 but not for its own number, and
+       a server that has to recognise itself among a list of servers needs the
+       number. */
+    SYS_SELF    = 28,     /* -> this task's id */
 };
 
 enum {
@@ -298,6 +304,11 @@ static inline int sys_send(int dst, const void *msg, int len)
 static inline int sys_devinfo(int what, int index, char *out, int cap)
 {
     return (int)_ecall4(SYS_DEVINFO, what, index, (long)out, cap);
+}
+
+static inline int sys_self(void)
+{
+    return (int)_ecall1(SYS_SELF, 0);
 }
 
 static inline int sys_kill(int task_id)

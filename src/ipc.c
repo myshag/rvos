@@ -103,6 +103,17 @@ static void ipc_send(int nonblock)
         return;
     }
 
+    /* To itself is not a wait, it is a hang: a rendezvous needs two tasks and
+       the only one here is the one asking. It parked on its own queue and
+       never reached a recv to take the message off — and because the task was
+       a server, everything that had asked it anything stopped too, so the
+       machine looked wedged rather than the task. Cost of noticing: one
+       comparison, on every message. */
+    if (dst == current) {
+        A0(current) = -1;
+        return;
+    }
+
     if (wants(dst, current)) {
         /* Receiver is parked in recv(): copy straight across and free both. */
         if (deliver(current, sva, slen, dst, dst->recv_va, dst->recv_len) < 0) {
