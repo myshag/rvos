@@ -14,11 +14,18 @@
 
    Scope, stated plainly. UDP is complete. TCP does: active and passive open,
    the full close sequence including TIME-WAIT, demultiplexing to a connection
-   table, receive-side flow control from the space actually left in the read
-   queue, an initial sequence number taken from the clock, and retransmission
-   of a lost segment. What is still missing: out-of-order reassembly (a
-   segment arriving early is dropped and re-requested with a duplicate ack),
-   more than one segment in flight, and congestion control. */
+   table, a send buffer with as many segments in flight as the window allows,
+   out-of-order reassembly, flow control from the space actually left in the
+   read queue, a retransmission timeout measured with Jacobson's estimator
+   under Karn's rule, slow start and congestion avoidance, fast retransmit on
+   three duplicate acknowledgements, an initial sequence number taken from the
+   clock, and the maximum-segment-size option in both directions.
+
+   What it does not do: window scaling, selective acknowledgement, Nagle's
+   algorithm or delayed acknowledgements. Its reassembly queue is three
+   segments deep and a fourth is dropped. And its congestion control, while
+   written, has never been observed working: this link loses nothing that was
+   not deliberately dropped. */
 #include "netif.h"
 #include "ulib.h"
 #include "syscall.h"
@@ -428,41 +435,78 @@ enum {
     T_CLOSE_WAIT, T_LAST_ACK
 };
 
-#define NTCB 4
-#define RXQ  512
-#define MSS  512          /* also VFS_DATA_MAX: a write becomes one segment */
+#define NTCB   4
+#define RXQ    2048       /* the read queue, and therefore our window */
+#define SNDBUF 2048       /* bytes written but not yet acknowledged */
+#define MSS    1024       /* the largest segment we send or advertise */
+#define NOOO   3          /* segments held aside waiting for a gap to close */
+#define OOOSEG 1200
 
-/* Two milliseconds' worth of names for things measured in milliseconds. */
+#define RTO_MIN     200
+#define RTO_MAX    8000
 #define RTO_INITIAL 300
-#define RTO_TRIES   5
+#define RTO_TRIES     5
 #define TIME_WAIT_MS 2000 /* 2*MSL, with MSL taken as a second rather than the
                              two minutes a real link needs: this is a virtual
                              wire and the slot is wanted back. */
+
+/* Sequence numbers wrap. Every comparison has to be made on the *difference*,
+   read as signed, or a connection whose numbers cross 2^32 starts rejecting
+   its own peer's acknowledgements. */
+static int seq_lt(uint32 a, uint32 b) { return (int32)(a - b) <  0; }
+static int seq_le(uint32 a, uint32 b) { return (int32)(a - b) <= 0; }
+static int seq_gt(uint32 a, uint32 b) { return (int32)(a - b) >  0; }
 
 struct tcb {
     int      state;
     uint8    raddr[4];
     unsigned lport, rport;
 
-    uint32   iss, irs;
-    uint32   snd_una, snd_nxt, rcv_nxt;
-    unsigned snd_wnd;             /* what the peer last advertised */
+    /* --- the send side --------------------------------------------------
+       Three sequence numbers and one buffer. snd_una is the oldest byte the
+       peer has not acknowledged, snd_nxt the first not yet sent; the bytes
+       between them are in flight, and the bytes from snd_nxt to the end of
+       the buffer are waiting for room in the window. The SYN occupies the
+       number just below snd_base and the FIN the one just above the last
+       byte, which is how a handshake and a close take part in the same
+       arithmetic as the data. */
+    uint32   iss;
+    uint32   snd_una, snd_nxt;
+    uint32   snd_base;            /* the sequence number of snd_buf[0] */
+    uint32   snd_wnd;             /* what the peer last advertised */
+    char     snd_buf[SNDBUF];
+    int      snd_len;
+    int      snd_fin;             /* a FIN is queued behind those bytes */
+    int      fin_sent;
+    unsigned peer_mss;
 
-    /* One outstanding segment, held whole until it is acknowledged. A
-       retransmission has to be the same bytes with the same sequence number,
-       so the frame is kept rather than the intent that built it. */
-    uint8    rt_frame[1600];
-    int      rt_len;
-    uint32   rt_seq_end;
+    /* --- congestion and time --------------------------------------------
+       cwnd is what the *network* will take, snd_wnd what the peer will take;
+       the smaller of the two governs. srtt and rttvar are the smoothed
+       round-trip time and its variation, from which the retransmission
+       timeout is computed rather than guessed. */
+    unsigned cwnd, ssthresh;
+    int      rto, srtt, rttvar;   /* milliseconds; srtt < 0 = never measured */
+    uint32   rtt_seq;             /* the sequence number being timed */
+    uint64   rtt_at;
+    int      rtt_timing;
     int      rt_tries;
-    int      rt_rto;
-    uint64   rt_at;               /* absolute ms; 0 = no timer */
+    uint64   rt_at;               /* absolute ms; 0 = the timer is not running */
     unsigned rt_pending;          /* a control segment we could not address */
+    int      dupacks;
 
-    uint64   tw_at;               /* TIME-WAIT expiry, absolute ms */
-
+    /* --- the receive side ----------------------------------------------- */
+    uint32   irs, rcv_nxt;
     char     rxq[RXQ];
     int      rxq_len;
+    struct {
+        uint32 seq;
+        int    len;
+        int    used;
+        char   data[OOOSEG];
+    } ooo[NOOO];
+
+    uint64   tw_at;               /* TIME-WAIT expiry, absolute ms */
 
     int      fds;                 /* how many programs hold this open */
     int      is_client;           /* the one /net/tcp names */
@@ -479,6 +523,11 @@ static struct tcb *tcb_alloc(void)
     for (int i = 0; i < NTCB; i++)
         if (tcbs[i].state == T_FREE) {
             umemset(&tcbs[i], 0, sizeof(tcbs[i]));
+            tcbs[i].peer_mss = 536;     /* what RFC 1122 says to assume */
+            tcbs[i].rto      = RTO_INITIAL;
+            tcbs[i].srtt     = -1;
+            tcbs[i].cwnd     = 2 * MSS;
+            tcbs[i].ssthresh = 64 * 1024;
             return &tcbs[i];
         }
     return 0;
@@ -510,21 +559,26 @@ static struct tcb *tcb_find(const uint8 *raddr, unsigned rport, unsigned lport)
    is 10 MHz, so 40 ticks is that interval. */
 static uint32 gen_iss(void) { return (uint32)(unow_ticks() / 40); }
 
-/* ---- TCP: sending ------------------------------------------------------ */
+/* ---- TCP: building and sending a segment ------------------------------- */
 
 static unsigned rcv_window(const struct tcb *c)
 {
+    if (c->http)
+        return RXQ;                     /* the demo reads as fast as it arrives */
     int free_space = RXQ - c->rxq_len;
     return (unsigned)(free_space > 0 ? free_space : 0);
 }
 
 /* Build a segment into `out`; returns its total frame length, or -1 if the
-   peer's hardware address is not known yet. */
+   peer's hardware address is not known yet. `mss` non-zero adds the one TCP
+   option this stack uses, which is why the header length is a field rather
+   than a constant: a SYN carries 24 bytes of header, everything else 20. */
 static int tcp_build(const uint8 *dip, unsigned sport, unsigned dport,
                      uint32 seq, uint32 ack, unsigned flags, unsigned wnd,
-                     const char *data, int dlen)
+                     const char *data, int dlen, unsigned mss)
 {
-    int o = ip_begin(out, dip, IP_TCP, 20 + dlen);
+    int hlen = mss ? 24 : 20;
+    int o = ip_begin(out, dip, IP_TCP, hlen + dlen);
     if (o < 0)
         return -1;
     uint8 *t = out + o;
@@ -532,15 +586,19 @@ static int tcp_build(const uint8 *dip, unsigned sport, unsigned dport,
     put16(t + 2, dport);
     put32(t + 4, seq);
     put32(t + 8, ack);
-    t[12] = 5 << 4;                             /* 20-byte header, no options */
+    t[12] = (uint8)((hlen / 4) << 4);
     t[13] = (uint8)flags;
     put16(t + 14, wnd);
     put16(t + 16, 0);
     put16(t + 18, 0);
+    if (mss) {
+        t[20] = 2; t[21] = 4;           /* kind 2, length 4: maximum segment size */
+        put16(t + 22, mss);
+    }
     if (dlen)
-        umemcpy(t + 20, data, (unsigned long)dlen);
-    put16(t + 16, l4_checksum(IP_TCP, me_ip, dip, t, 20 + dlen));
-    return o + 20 + dlen;
+        umemcpy(t + hlen, data, (unsigned long)dlen);
+    put16(t + 16, l4_checksum(IP_TCP, me_ip, dip, t, hlen + dlen));
+    return o + hlen + dlen;
 }
 
 /* A test hook. On a virtual link nothing is ever lost, so the retransmit path
@@ -550,92 +608,161 @@ static int drop_next = 1;
 
 static void timers_rearm(void);
 
-static void seg_send(struct tcb *c, unsigned flags, const char *data, int dlen)
+/* Put one segment on the wire. Sequence bookkeeping belongs to the caller:
+   this function is used both for a first transmission and for a
+   retransmission, and the difference between them is entirely in what the
+   caller does to snd_nxt afterwards. */
+static int seg_xmit(struct tcb *c, unsigned flags, uint32 seq,
+                    const char *data, int dlen)
 {
-    int flen = tcp_build(c->raddr, c->lport, c->rport, c->snd_nxt, c->rcv_nxt,
-                         flags, rcv_window(c), data, dlen);
+    unsigned mss = (flags & TCP_SYN) ? MSS : 0;
+    int flen = tcp_build(c->raddr, c->lport, c->rport, seq, c->rcv_nxt,
+                         flags, rcv_window(c), data, dlen, mss);
     if (flen < 0) {
         /* The peer's hardware address is not known yet — a request has just
            gone out for it. A control segment is remembered and tried again
-           when the answer has had time to arrive; a segment carrying data is
-           simply not sent, and the caller is told nothing moved. */
+           when the answer has had time to arrive; data stays in the buffer,
+           where the retransmission timer will find it. */
         if (!dlen) {
             c->rt_pending = flags;
             c->rt_at = unow_ms() + RTO_INITIAL;
             timers_rearm();
         }
-        return;
+        return -1;
     }
     c->rt_pending = 0;
 
-    /* SYN and FIN each consume a sequence number, which is why a handshake
-       advances the stream without carrying any data. Anything that consumes
-       sequence space is something the peer must acknowledge, and therefore
-       something we must be prepared to send again. */
-    uint32 consumed = (uint32)dlen + ((flags & (TCP_SYN | TCP_FIN)) ? 1 : 0);
-
-    if (consumed) {
-        umemcpy(c->rt_frame, out, (unsigned long)flen);
-        c->rt_len     = flen;
-        c->rt_seq_end = c->snd_nxt + consumed;
-        c->rt_tries   = 0;
-        c->rt_rto     = RTO_INITIAL;
-        c->rt_at      = unow_ms() + (uint64)c->rt_rto;
-        timers_rearm();
-    }
-
-    if (drop_next && consumed) {
+    if (drop_next && (dlen || (flags & (TCP_SYN | TCP_FIN)))) {
         drop_next = 0;
         net_puts("  tcp: [test] dropping this segment before it reaches the card\n");
-    } else {
-        net_transmit(out, flen);
+        return 0;
     }
-
-    c->snd_nxt += consumed;
+    net_transmit(out, flen);
+    return 0;
 }
 
-/* A segment for a connection that does not exist. RFC 793 is specific about
-   what a reset carries: if the offending segment had an ACK, the reset takes
-   its sequence number from that acknowledgement; otherwise it acknowledges
-   everything the segment occupied and starts at zero. Without this a host
-   that connects to a closed port waits for its SYN to time out instead of
-   being told at once. */
-static void tcp_reset(const uint8 *dip, unsigned sport, unsigned dport,
-                      unsigned flags, uint32 seq, uint32 ack, int dlen)
+/* The timer runs while anything is outstanding, and is restarted — not
+   merely left running — each time the oldest unacknowledged byte changes. */
+static void timer_start(struct tcb *c)
 {
-    uint32 rseq, rack;
-    unsigned rflags;
-    if (flags & TCP_ACK) {
-        rseq = ack; rack = 0; rflags = TCP_RST;
-    } else {
-        rseq = 0;
-        rack = seq + (uint32)dlen + ((flags & (TCP_SYN | TCP_FIN)) ? 1 : 0);
-        rflags = TCP_RST | TCP_ACK;
-    }
-    int flen = tcp_build(dip, dport, sport, rseq, rack, rflags, 0, 0, 0);
-    if (flen > 0)
-        net_transmit(out, flen);
-}
-
-static void tcp_acked(struct tcb *c, uint32 ack)
-{
-    if (c->rt_len && (int32)(ack - c->rt_seq_end) >= 0) {
-        c->rt_len = 0;
-        c->rt_at  = 0;
+    if (!c->rt_at) {
+        c->rt_at = unow_ms() + (uint64)c->rto;
         timers_rearm();
     }
 }
-
-/* Everything we sent has been acknowledged — i.e. our FIN, if we sent one. */
-static int fin_acked(const struct tcb *c) { return c->snd_una == c->snd_nxt; }
-
-static void enter_time_wait(struct tcb *c)
+static void timer_stop(struct tcb *c)
 {
-    c->state = T_TIME_WAIT;
-    c->rt_len = 0;
-    c->rt_at  = 0;
-    c->tw_at  = unow_ms() + TIME_WAIT_MS;
+    c->rt_at = 0;
+    c->rt_tries = 0;
     timers_rearm();
+}
+
+/* ---- TCP: output -------------------------------------------------------
+   One routine decides what may go: everything between snd_nxt and the end of
+   the window, in segments no larger than the peer said it would take. It is
+   called after a write, after an acknowledgement opens the window, and after
+   a timeout has moved snd_nxt back — the three things that can make sending
+   possible. */
+
+static void tcp_output(struct tcb *c)
+{
+    if (c->state == T_SYN_SENT || c->state == T_SYN_RCVD) {
+        if (seq_lt(c->snd_nxt, c->snd_base)) {      /* the SYN is unsent */
+            unsigned f = TCP_SYN | (c->state == T_SYN_RCVD ? TCP_ACK : 0);
+            if (seg_xmit(c, f, c->iss, 0, 0) == 0) {
+                c->snd_nxt = c->snd_base;
+                timer_start(c);
+            }
+        }
+        return;                    /* nothing may pass a SYN that is in flight */
+    }
+    if (c->state == T_FREE || c->state == T_LISTEN || c->state == T_TIME_WAIT)
+        return;
+
+    uint32 inflight = c->snd_nxt - c->snd_una;
+    uint32 allowed  = c->snd_wnd < c->cwnd ? c->snd_wnd : c->cwnd;
+    uint32 usable   = allowed > inflight ? allowed - inflight : 0;
+
+    for (;;) {
+        int off   = (int)(c->snd_nxt - c->snd_base);
+        int avail = c->snd_len - off;
+        if (off < 0 || avail <= 0 || usable == 0)
+            break;
+        int n = avail;
+        if (n > (int)c->peer_mss)
+            n = (int)c->peer_mss;
+        if ((uint32)n > usable)
+            n = (int)usable;
+        if (seg_xmit(c, TCP_ACK | TCP_PSH, c->snd_nxt,
+                     c->snd_buf + off, n) < 0)
+            break;
+        /* Karn's algorithm needs one segment being timed at a time, and it
+           must not be one that has been sent before. */
+        if (!c->rtt_timing) {
+            c->rtt_timing = 1;
+            c->rtt_seq    = c->snd_nxt + (uint32)n - 1;
+            c->rtt_at     = unow_ms();
+        }
+        c->snd_nxt += (uint32)n;
+        usable     -= (uint32)n;
+        timer_start(c);
+    }
+
+    /* The FIN takes the sequence number after the last byte, and only goes
+       once every byte before it has been handed to the card. */
+    if (c->snd_fin && !c->fin_sent &&
+        c->snd_nxt == c->snd_base + (uint32)c->snd_len) {
+        if (seg_xmit(c, TCP_ACK | TCP_FIN, c->snd_nxt, 0, 0) == 0) {
+            c->fin_sent = 1;
+            c->snd_nxt++;
+            timer_start(c);
+        }
+    }
+}
+
+/* An acknowledgement of nothing new, sent to say where we are: after
+   accepting data, and after a gap in the stream that we want filled. */
+static void send_ack(struct tcb *c)
+{
+    seg_xmit(c, TCP_ACK, c->snd_nxt, 0, 0);
+}
+
+static int tcp_write(struct tcb *c, const char *data, int len)
+{
+    int room = SNDBUF - c->snd_len;
+    int n = len < room ? len : room;
+    if (n <= 0)
+        return 0;
+    umemcpy(c->snd_buf + c->snd_len, data, (unsigned long)n);
+    c->snd_len += n;
+    tcp_output(c);
+    return n;
+}
+
+/* ---- TCP: the round-trip time ------------------------------------------
+   Jacobson's estimator. The retransmission timeout is the smoothed
+   round-trip time plus four times its variation, because what matters is not
+   the average delay but how far past the average a sample can reasonably
+   fall. A fixed timeout is either too eager on a slow path or too patient on
+   a fast one, and it is wrong in a way that gets worse as the path changes. */
+
+static void rtt_update(struct tcb *c, int m)
+{
+    if (m < 1)
+        m = 1;
+    if (c->srtt < 0) {
+        c->srtt   = m;
+        c->rttvar = m / 2;
+    } else {
+        int err = m - c->srtt;
+        if (err < 0)
+            err = -err;
+        c->rttvar = (3 * c->rttvar + err) / 4;
+        c->srtt   = (7 * c->srtt + m) / 8;
+    }
+    c->rto = c->srtt + 4 * c->rttvar;
+    if (c->rto < RTO_MIN) c->rto = RTO_MIN;
+    if (c->rto > RTO_MAX) c->rto = RTO_MAX;
 }
 
 /* ---- TCP: opening and closing ------------------------------------------ */
@@ -657,52 +784,265 @@ static struct tcb *tcp_connect(const uint8 *ip, unsigned port)
     if (!c)
         return 0;
     umemcpy(c->raddr, ip, 4);
-    c->lport   = next_port++;
-    c->rport   = port;
-    c->iss     = gen_iss();
-    c->snd_una = c->iss;
-    c->snd_nxt = c->iss;
-    c->rcv_nxt = 0;
-    c->state   = T_SYN_SENT;
-    seg_send(c, TCP_SYN, 0, 0);
+    c->lport    = next_port++;
+    c->rport    = port;
+    c->iss      = gen_iss();
+    c->snd_una  = c->iss;
+    c->snd_nxt  = c->iss;
+    c->snd_base = c->iss + 1;
+    c->state    = T_SYN_SENT;
+    tcp_output(c);
     net_puts("  tcp: SYN -> ");
     ip_puts(ip);
     net_putn(":", (unsigned long)port, "\n");
     return c;
 }
 
-/* Our side has nothing more to send. Which close this is depends on whether
-   the peer has already said the same: an active close leads to FIN-WAIT, a
-   close after theirs leads to LAST-ACK. */
+/* Our side has nothing more to send. The FIN is queued behind whatever is
+   still in the send buffer rather than sent at once — closing does not
+   cancel what was written before it. */
 static void tcp_close(struct tcb *c)
 {
     if (c->state == T_ESTABLISHED) {
-        seg_send(c, TCP_ACK | TCP_FIN, 0, 0);
-        c->state = T_FIN_WAIT_1;
+        c->snd_fin = 1;
+        c->state   = T_FIN_WAIT_1;
+        tcp_output(c);
         net_puts("  tcp: closing (active)\n");
     } else if (c->state == T_CLOSE_WAIT) {
-        seg_send(c, TCP_ACK | TCP_FIN, 0, 0);
-        c->state = T_LAST_ACK;
+        c->snd_fin = 1;
+        c->state   = T_LAST_ACK;
+        tcp_output(c);
         net_puts("  tcp: closing (peer went first)\n");
     } else if (c->state == T_LISTEN || c->state == T_SYN_SENT) {
         tcb_free(c);
+        timers_rearm();
     }
 }
 
-/* ---- TCP: receiving ---------------------------------------------------- */
+/* ---- TCP: reassembly ---------------------------------------------------
+   A segment that arrives before the one in front of it is not an error and
+   not a loss — it is the ordinary consequence of a network that reorders.
+   Dropping it costs a round trip to fetch again something already in hand.
+   So a segment ahead of rcv_nxt is held aside, and every time the gap in
+   front closes, the held segments that now fit are folded in. */
 
-static void demo_opened(struct tcb *c);          /* the demo, at the bottom */
 static void demo_received(struct tcb *c, const uint8 *data, int dlen);
 
-static void tcp_queue(struct tcb *c, const uint8 *data, int dlen)
+/* Hand `len` bytes at rcv_nxt to whoever is reading. Returns how many were
+   taken: fewer than offered means the read queue is full, and the peer will
+   be told so by the window in the next acknowledgement. */
+static int rcv_accept(struct tcb *c, const uint8 *data, int len)
 {
+    if (c->http) {
+        demo_received(c, data, len);
+        return len;
+    }
     int room = RXQ - c->rxq_len;
-    int n = dlen < room ? dlen : room;
-    umemcpy(c->rxq + c->rxq_len, data, (unsigned long)n);
-    c->rxq_len += n;
+    int n = len < room ? len : room;
+    if (n > 0) {
+        umemcpy(c->rxq + c->rxq_len, data, (unsigned long)n);
+        c->rxq_len += n;
+    }
+    return n;
 }
 
-static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
+static void ooo_drain(struct tcb *c)
+{
+    for (int progress = 1; progress; ) {
+        progress = 0;
+        for (int i = 0; i < NOOO; i++) {
+            if (!c->ooo[i].used)
+                continue;
+            uint32 s = c->ooo[i].seq;
+            int    l = c->ooo[i].len;
+            if (seq_gt(s, c->rcv_nxt))
+                continue;                       /* still ahead of the gap */
+            if (seq_le(s + (uint32)l, c->rcv_nxt)) {
+                c->ooo[i].used = 0;             /* wholly overtaken by events */
+                progress = 1;
+                continue;
+            }
+            int skip = (int)(c->rcv_nxt - s);
+            int n = rcv_accept(c, (const uint8 *)c->ooo[i].data + skip,
+                               l - skip);
+            c->rcv_nxt += (uint32)n;
+            if (n == l - skip)
+                c->ooo[i].used = 0;
+            net_putn("  tcp: gap closed, ", (unsigned long)n,
+                     " held bytes delivered\n");
+            progress = 1;
+        }
+    }
+}
+
+static void ooo_store(struct tcb *c, uint32 seq, const uint8 *data, int len)
+{
+    if (len > OOOSEG)
+        len = OOOSEG;
+    for (int i = 0; i < NOOO; i++)
+        if (c->ooo[i].used && c->ooo[i].seq == seq)
+            return;                             /* already held */
+    for (int i = 0; i < NOOO; i++)
+        if (!c->ooo[i].used) {
+            c->ooo[i].used = 1;
+            c->ooo[i].seq  = seq;
+            c->ooo[i].len  = len;
+            umemcpy(c->ooo[i].data, data, (unsigned long)len);
+            net_putn("  tcp: segment ahead of the stream, held aside (",
+                     (unsigned long)len, " bytes)\n");
+            return;
+        }
+    /* No room. Dropping it is correct — it will be sent again — and is what
+       a real stack does when its reassembly queue is full. */
+}
+
+static void rcv_data(struct tcb *c, uint32 seq, const uint8 *data, int len)
+{
+    if (seq_le(seq + (uint32)len, c->rcv_nxt))
+        return;                                 /* every byte already taken */
+    if (seq_lt(seq, c->rcv_nxt)) {              /* partly old: trim the front */
+        int skip = (int)(c->rcv_nxt - seq);
+        data += skip;
+        len  -= skip;
+        seq   = c->rcv_nxt;
+    }
+    if (seq == c->rcv_nxt) {
+        int n = rcv_accept(c, data, len);
+        c->rcv_nxt += (uint32)n;
+        if (!c->http)
+            net_putn("  tcp: received ", (unsigned long)n,
+                     " bytes, queued for readers\n");
+        ooo_drain(c);
+    } else {
+        ooo_store(c, seq, data, len);
+    }
+}
+
+/* ---- TCP: input --------------------------------------------------------- */
+
+static void demo_opened(struct tcb *c);
+
+/* A segment for a connection that does not exist. RFC 793 is specific about
+   what a reset carries: if the offending segment had an ACK, the reset takes
+   its sequence number from that acknowledgement; otherwise it acknowledges
+   everything the segment occupied and starts at zero. Without this a host
+   that connects to a closed port waits for its SYN to time out instead of
+   being told at once. */
+static void tcp_reset(const uint8 *dip, unsigned sport, unsigned dport,
+                      unsigned flags, uint32 seq, uint32 ack, int dlen)
+{
+    uint32 rseq, rack;
+    unsigned rflags;
+    if (flags & TCP_ACK) {
+        rseq = ack; rack = 0; rflags = TCP_RST;
+    } else {
+        rseq = 0;
+        rack = seq + (uint32)dlen + ((flags & (TCP_SYN | TCP_FIN)) ? 1 : 0);
+        rflags = TCP_RST | TCP_ACK;
+    }
+    int flen = tcp_build(dip, dport, sport, rseq, rack, rflags, 0, 0, 0, 0);
+    if (flen > 0)
+        net_transmit(out, flen);
+}
+
+/* The only option this stack reads. A peer that offers none is assumed to
+   take 536 bytes, which is what RFC 1122 requires of everybody. */
+static void parse_options(struct tcb *c, const uint8 *t, int hlen)
+{
+    const uint8 *o = t + 20, *end = t + hlen;
+    while (o < end) {
+        if (*o == 0) break;                     /* end of option list */
+        if (*o == 1) { o++; continue; }         /* no-op padding */
+        if (o + 1 >= end || o[1] < 2) break;    /* malformed: stop reading */
+        if (o[0] == 2 && o[1] == 4 && o + 4 <= end) {
+            unsigned m = get16(o + 2);
+            if (m >= 128 && m <= 1460)
+                c->peer_mss = m;
+        }
+        o += o[1];
+    }
+}
+
+/* Everything we have sent has been acknowledged. */
+static int all_acked(const struct tcb *c) { return c->snd_una == c->snd_nxt; }
+
+static void enter_time_wait(struct tcb *c)
+{
+    c->state  = T_TIME_WAIT;
+    c->rt_at  = 0;
+    c->tw_at  = unow_ms() + TIME_WAIT_MS;
+    timers_rearm();
+}
+
+static void ack_input(struct tcb *c, uint32 ack)
+{
+    if (seq_gt(ack, c->snd_nxt))
+        return;                                 /* acking what we never sent */
+
+    if (seq_le(ack, c->snd_una)) {
+        /* A duplicate acknowledgement means a segment arrived out of order —
+           which means one before it may be lost. Three of them is the
+           conventional threshold for believing that rather than waiting for
+           the timer, and is most of what makes loss recovery quick. */
+        if (ack == c->snd_una && c->snd_una != c->snd_nxt && ++c->dupacks == 3) {
+            net_puts("  tcp: three duplicate acks — retransmitting at once\n");
+            uint32 flight = c->snd_nxt - c->snd_una;
+            c->ssthresh = flight / 2 > 2 * MSS ? flight / 2 : 2 * MSS;
+            c->cwnd     = c->ssthresh;
+            c->snd_nxt  = c->snd_una;
+            c->fin_sent = 0;
+            c->rtt_timing = 0;
+            tcp_output(c);
+        }
+        return;
+    }
+
+    c->dupacks = 0;
+
+    /* Karn: a round-trip time may only be measured from a segment that was
+       sent once. rtt_timing is cleared by every retransmission. */
+    if (c->rtt_timing && seq_le(c->rtt_seq, ack - 1)) {
+        rtt_update(c, (int)(unow_ms() - c->rtt_at));
+        c->rtt_timing = 0;
+    }
+
+    /* Drop the acknowledged bytes off the front of the send buffer. The SYN
+       and the FIN occupy sequence numbers outside it, so the count has to be
+       clamped to what the buffer actually holds. */
+    if (seq_gt(ack, c->snd_base)) {
+        int d = (int)(ack - c->snd_base);
+        if (d > c->snd_len)
+            d = c->snd_len;
+        if (d > 0) {
+            for (int i = 0; i + d < c->snd_len; i++)
+                c->snd_buf[i] = c->snd_buf[i + d];
+            c->snd_len  -= d;
+            c->snd_base += (uint32)d;
+        }
+    }
+    c->snd_una = ack;
+
+    /* Slow start until ssthresh, then congestion avoidance: one more segment
+       per round trip instead of one more per acknowledgement. On this link
+       neither ever has anything to protect against, which is exactly why the
+       code has to be right by construction rather than by observation. */
+    if (c->cwnd < c->ssthresh)
+        c->cwnd += MSS;
+    else
+        c->cwnd += MSS * MSS / (c->cwnd ? c->cwnd : MSS);
+    if (c->cwnd > 65535)
+        c->cwnd = 65535;
+
+    if (all_acked(c))
+        timer_stop(c);
+    else {
+        c->rt_at = unow_ms() + (uint64)c->rto;  /* restart for what remains */
+        c->rt_tries = 0;
+        timers_rearm();
+    }
+}
+
+static void tcp_segment(const uint8 *sip, const uint8 *t, int seglen)
 {
     unsigned flags = t[13];
     int      hlen  = (t[12] >> 4) * 4;
@@ -744,16 +1084,18 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
         if (!n)
             return;              /* backlog full: drop, and they will retry */
         umemcpy(n->raddr, sip, 4);
-        n->lport   = dport;
-        n->rport   = sport;
-        n->irs     = seq;
-        n->rcv_nxt = seq + 1;                   /* their SYN counts as one */
-        n->iss     = gen_iss();
-        n->snd_una = n->iss;
-        n->snd_nxt = n->iss;
-        n->snd_wnd = get16(t + 14);
-        n->state   = T_SYN_RCVD;
-        seg_send(n, TCP_SYN | TCP_ACK, 0, 0);
+        n->lport    = dport;
+        n->rport    = sport;
+        n->irs      = seq;
+        n->rcv_nxt  = seq + 1;                  /* their SYN counts as one */
+        n->iss      = gen_iss();
+        n->snd_una  = n->iss;
+        n->snd_nxt  = n->iss;
+        n->snd_base = n->iss + 1;
+        n->snd_wnd  = get16(t + 14);
+        n->state    = T_SYN_RCVD;
+        parse_options(n, t, hlen);
+        tcp_output(n);
         net_puts("  tcp: SYN from ");
         ip_puts(sip);
         net_putn(":", (unsigned long)sport, ", accepted; SYN-ACK sent\n");
@@ -774,23 +1116,23 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
         c->irs     = seq;
         c->rcv_nxt = seq + 1;
         c->snd_wnd = get16(t + 14);
+        parse_options(c, t, hlen);
         if (flags & TCP_ACK) {
-            if ((int32)(ack - c->iss) <= 0 || (int32)(ack - c->snd_nxt) > 0) {
+            if (seq_le(ack, c->iss) || seq_gt(ack, c->snd_nxt)) {
                 tcp_reset(sip, sport, dport, flags, seq, ack, dlen);
                 return;
             }
-            c->snd_una = ack;
-            tcp_acked(c, ack);
+            ack_input(c, ack);
             c->state = T_ESTABLISHED;
-            seg_send(c, TCP_ACK, 0, 0);
+            send_ack(c);
             net_puts("  tcp: connection established\n");
             demo_opened(c);
         } else {
             /* Both sides called at once. Rare, and the only reason SYN-RCVD
                is reachable from here. */
-            c->state = T_SYN_RCVD;
+            c->state   = T_SYN_RCVD;
             c->snd_nxt = c->iss;                /* resend the SYN with an ack */
-            seg_send(c, TCP_SYN | TCP_ACK, 0, 0);
+            tcp_output(c);
         }
         return;
     }
@@ -798,10 +1140,8 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
     /* --- everything from SYN-RCVD onwards -------------------------------- */
 
     if (flags & TCP_ACK) {
-        if ((int32)(ack - c->snd_una) > 0 && (int32)(ack - c->snd_nxt) <= 0)
-            c->snd_una = ack;
         c->snd_wnd = get16(t + 14);
-        tcp_acked(c, ack);
+        ack_input(c, ack);
     }
 
     switch (c->state) {
@@ -810,30 +1150,21 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
             return;
         c->state = T_ESTABLISHED;
         net_puts("  tcp: connection established (inbound)\n");
-        /* The demo's one piece of policy, and it is policy: a stack has no
-           business deciding what to say to a caller. It is here because
-           nothing else is listening yet — the program that will read
-           /net/tcp/N and answer for itself is the next stage's work — and
-           without it a call into rvos would show only one direction. */
-        {
-            static const char banner[] =
-                "rvos: you have reached the guest on port 7\n";
-            seg_send(c, TCP_ACK | TCP_PSH, banner, (int)sizeof(banner) - 1);
-        }
+        demo_opened(c);
         break;
     case T_FIN_WAIT_1:
-        if (fin_acked(c))
+        if (c->fin_sent && all_acked(c))
             c->state = T_FIN_WAIT_2;            /* our FIN was taken */
         break;
     case T_CLOSING:
-        if (fin_acked(c)) {
+        if (c->fin_sent && all_acked(c)) {
             enter_time_wait(c);
             net_puts("  tcp: closed (simultaneous)\n");
             return;
         }
         break;
     case T_LAST_ACK:
-        if (fin_acked(c)) {
+        if (c->fin_sent && all_acked(c)) {
             net_puts("  tcp: closed\n");
             tcb_free(c);
             timers_rearm();
@@ -842,40 +1173,20 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
         break;
     case T_TIME_WAIT:
         /* A retransmitted FIN: acknowledge it again and keep waiting. */
-        if (flags & TCP_FIN) {
-            int flen = tcp_build(c->raddr, c->lport, c->rport, c->snd_nxt,
-                                 c->rcv_nxt, TCP_ACK, 0, 0, 0);
-            if (flen > 0)
-                net_transmit(out, flen);
-        }
+        if (flags & TCP_FIN)
+            send_ack(c);
         return;
     default:
         break;
     }
 
-    /* --- data ------------------------------------------------------------
-       In order only. A segment that arrives early is dropped and answered
-       with a duplicate acknowledgement, which asks for the gap to be filled;
-       holding it aside until the gap closes is reassembly, and that is the
-       next thing this stack needs. */
+    /* --- data ------------------------------------------------------------ */
     if (dlen > 0) {
-        if (seq == c->rcv_nxt) {
-            c->rcv_nxt += (uint32)dlen;
-            if (c->http) {
-                /* The demo reads as fast as the bytes arrive, so the window
-                   never shuts and the transfer runs to the end. */
-                demo_received(c, t + hlen, dlen);
-            } else {
-                tcp_queue(c, t + hlen, dlen);
-                net_putn("  tcp: received ", (unsigned long)dlen,
-                         " bytes, queued for readers\n");
-            }
-            seg_send(c, TCP_ACK, 0, 0);
-        } else {
-            net_puts("  tcp: out-of-order segment dropped, re-acking\n");
-            seg_send(c, TCP_ACK, 0, 0);
-            return;
-        }
+        uint32 before = c->rcv_nxt;
+        rcv_data(c, seq, t + hlen, dlen);
+        send_ack(c);                 /* in order or not, say where we are */
+        if (before == c->rcv_nxt && seq != before)
+            return;                  /* held aside: no FIN can follow it yet */
     }
 
     /* --- FIN, but only the one that fits where the stream has got to ----- */
@@ -884,15 +1195,15 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
         switch (c->state) {
         case T_ESTABLISHED:
             c->state = T_CLOSE_WAIT;
-            seg_send(c, TCP_ACK, 0, 0);
+            send_ack(c);
             net_puts("  tcp: peer closed its half\n");
             /* Nobody is holding it open, so there is nothing left to say. */
             if (c->fds == 0)
                 tcp_close(c);
             break;
         case T_FIN_WAIT_1:
-            seg_send(c, TCP_ACK, 0, 0);
-            if (fin_acked(c)) {
+            send_ack(c);
+            if (c->fin_sent && all_acked(c)) {
                 enter_time_wait(c);
                 net_puts("  tcp: closed\n");
             } else {
@@ -900,13 +1211,61 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
             }
             break;
         case T_FIN_WAIT_2:
-            seg_send(c, TCP_ACK, 0, 0);
+            send_ack(c);
             enter_time_wait(c);
             net_puts("  tcp: closed\n");
             break;
         default:
             break;
         }
+    }
+}
+
+/* A second test hook, for the other direction. This link never reorders, so
+   the reassembly path would never run either, and code that never runs is
+   code nobody has checked. The first segment carrying data on an inbound
+   connection is held back and the next one is allowed to overtake it; the
+   stack must then hold the overtaking segment aside and deliver both, in
+   order, once the gap closes.
+
+   It is armed on the listening port rather than on any connection at all,
+   so it disturbs exactly the conversation a reader can drive by hand:
+   `nc localhost 5555`, then two lines. */
+static uint8 hold_buf[2048];
+static uint8 hold_sip[4];
+static int   hold_len;
+static int   reorder_armed = 1;
+
+static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
+{
+    int held_before = hold_len;
+
+    if (reorder_armed && seglen > (t[12] >> 4) * 4 &&
+        seglen <= (int)sizeof(hold_buf) && get16(t + 2) == LISTEN_PORT) {
+        struct tcb *c = tcb_find(sip, get16(t), get16(t + 2));
+        if (c && c->state == T_ESTABLISHED) {
+            reorder_armed = 0;
+            umemcpy(hold_buf, t, (unsigned long)seglen);
+            umemcpy(hold_sip, sip, 4);
+            hold_len = seglen;
+            net_puts("  tcp: [test] holding a segment back so the next overtakes it\n");
+            return;
+        }
+    }
+
+    /* Only something that moves the stream can overtake: a bare
+       acknowledgement leaves no gap behind it, so releasing after one would
+       prove nothing. A FIN counts, or the held segment would never come back
+       at all on a peer that says one thing and hangs up. */
+    int overtakes = seglen > (t[12] >> 4) * 4 || (t[13] & TCP_FIN);
+
+    tcp_segment(sip, t, seglen);
+
+    if (hold_len && held_before && overtakes) {
+        int n = hold_len;
+        hold_len = 0;
+        net_puts("  tcp: [test] releasing the held segment\n");
+        tcp_segment(hold_sip, hold_buf, n);
     }
 }
 
@@ -951,29 +1310,49 @@ void net_timeout(void)
         if (!c->rt_at || c->rt_at > now)
             continue;
 
-        if (c->rt_pending) {
-            unsigned f = c->rt_pending;
-            c->rt_pending = 0;
-            c->rt_at = 0;
-            if (++c->rt_tries > RTO_TRIES) {
-                net_puts("  tcp: no route to the peer, giving up\n");
-                tcb_free(c);
-                continue;
-            }
-            seg_send(c, f, 0, 0);
-            continue;
-        }
-
         if (++c->rt_tries > RTO_TRIES) {
             net_puts("  tcp: giving up after 5 retransmissions\n");
             tcb_free(c);
             continue;
         }
+
+        if (c->rt_pending) {
+            /* Never addressed at all: the ARP answer had not arrived when it
+               was built. Going back through tcp_output rather than resending
+               the bytes keeps the sequence bookkeeping in one place. */
+            unsigned f = c->rt_pending;
+            c->rt_pending = 0;
+            c->rt_at = 0;
+            if (f & TCP_SYN)
+                tcp_output(c);
+            else
+                send_ack(c);
+            if (!c->rt_at)
+                c->rt_at = now + (uint64)c->rto;
+            continue;
+        }
+
+        /* A timeout is the network saying it cannot take this much. Halve the
+           threshold, drop the congestion window to one segment, double the
+           timeout, and go back to the oldest unacknowledged byte. */
+        uint32 flight = c->snd_nxt - c->snd_una;
+        c->ssthresh = flight / 2 > 2 * MSS ? flight / 2 : 2 * MSS;
+        c->cwnd     = MSS;
+        c->rto     *= 2;
+        if (c->rto > RTO_MAX)
+            c->rto = RTO_MAX;
+        c->rtt_timing = 0;                      /* Karn: do not time this one */
+        c->snd_nxt    = c->snd_una;
+        c->fin_sent   = 0;
+        c->rt_at      = 0;
+
         net_putn("  tcp: timeout, retransmitting (attempt ",
                  (unsigned long)c->rt_tries, ")\n");
-        net_transmit(c->rt_frame, c->rt_len);
-        c->rt_rto *= 2;                         /* exponential backoff */
-        c->rt_at = now + (uint64)c->rt_rto;
+        int tries = c->rt_tries;
+        tcp_output(c);
+        c->rt_tries = tries;                    /* the backoff count survives */
+        if (!c->rt_at)
+            c->rt_at = now + (uint64)c->rto;
     }
     timers_rearm();
 }
@@ -1062,7 +1441,7 @@ static int net_status(char *o, int cap)
 
     for (int i = 0; i < NTCB; i++) {
         struct tcb *c = &tcbs[i];
-        if (c->state == T_FREE || n > cap - 80)
+        if (c->state == T_FREE || n > cap - 120)
             continue;
         n = app(o, n, "tcp ");
         n += uutoa((unsigned long)i, o + n);
@@ -1075,8 +1454,23 @@ static int net_status(char *o, int cap)
             n = app_ip(o, n, c->raddr);
             o[n++] = ':';
             n += uutoa((unsigned long)c->rport, o + n);
-            n = app(o, n, "  rx ");
+            /* The numbers the stack decided for itself, rather than the ones
+               written into it: what it measured the path to be, what it will
+               wait before deciding a segment is lost, and how much it is
+               willing to have unacknowledged at once. */
+            n = app(o, n, "\n        rx ");
             n += uutoa((unsigned long)c->rxq_len, o + n);
+            n = app(o, n, "  unacked ");
+            n += uutoa((unsigned long)(c->snd_nxt - c->snd_una), o + n);
+            n = app(o, n, "  srtt ");
+            if (c->srtt < 0)
+                n = app(o, n, "-");
+            else
+                n += uutoa((unsigned long)c->srtt, o + n);
+            n = app(o, n, "ms  rto ");
+            n += uutoa((unsigned long)c->rto, o + n);
+            n = app(o, n, "ms  cwnd ");
+            n += uutoa((unsigned long)c->cwnd, o + n);
         }
         o[n++] = '\n';
     }
@@ -1199,7 +1593,7 @@ void net_vfs(struct vfs_req *r)
                been told to stop will not start until it is told so. A stack
                that skips this update deadlocks a connection it throttled. */
             if (was_shut && n > 0 && c->state == T_ESTABLISHED)
-                seg_send(c, TCP_ACK, 0, 0);
+                send_ack(c);
             r->result = n;
         }
         break;
@@ -1208,24 +1602,16 @@ void net_vfs(struct vfs_req *r)
         struct tcb *c = conn_of(r->fd);
         if (!c || (c->state != T_ESTABLISHED && c->state != T_CLOSE_WAIT)) {
             r->result = -1;                         /* not connected */
-        } else if (c->rt_len) {
-            /* One segment may be in flight at a time, so a write while the
-               last one is unacknowledged moves nothing. Saying so is honest;
-               a send buffer is what removes the restriction. */
-            r->result = 0;
         } else {
-            int n = r->len < MSS ? r->len : MSS;
-            unsigned wnd = c->snd_wnd;
-            if ((unsigned)n > wnd)
-                n = (int)wnd;                       /* the peer's window */
-            if (n <= 0) {
-                r->result = 0;
-            } else {
-                seg_send(c, TCP_ACK | TCP_PSH, r->data, n);
-                net_putn("  tcp: sent ", (unsigned long)n,
-                         " bytes on behalf of a program\n");
-                r->result = n;
-            }
+            /* A write copies into the send buffer and returns; how much of it
+               goes on the wire now is the window's business, not the caller's.
+               A short count means the buffer is full, which is the honest
+               answer and the one a program can act on. */
+            int n = tcp_write(c, r->data, r->len);
+            if (n > 0)
+                net_putn("  tcp: queued ", (unsigned long)n,
+                         " bytes from a program\n");
+            r->result = n;
         }
         break;
     }
@@ -1294,15 +1680,23 @@ static void web_fetch(const uint8 *addr)
 
 static void demo_opened(struct tcb *c)
 {
-    if (!c->http) {
-        if (c->is_client)
-            net_puts("  tcp: /net/tcp is open for business\n");
+    if (c->http) {
+        static const char req[] =
+            "GET / HTTP/1.0\r\nHost: " WEB_HOST "\r\nConnection: close\r\n\r\n";
+        tcp_write(c, req, (int)sizeof(req) - 1);
+        net_puts("  http: GET / -> " WEB_HOST "\n");
         return;
     }
-    static const char req[] =
-        "GET / HTTP/1.0\r\nHost: " WEB_HOST "\r\nConnection: close\r\n\r\n";
-    seg_send(c, TCP_ACK | TCP_PSH, req, (int)sizeof(req) - 1);
-    net_puts("  http: GET / -> " WEB_HOST "\n");
+    if (c->is_client) {
+        net_puts("  tcp: /net/tcp is open for business\n");
+        return;
+    }
+    /* An inbound call. The greeting is the demo's, not the stack's: nothing
+       in the guest is yet running to answer for itself, and without it a call
+       into rvos would show only one direction. */
+    static const char banner[] =
+        "rvos: you have reached the guest on port 7\n";
+    tcp_write(c, banner, (int)sizeof(banner) - 1);
 }
 
 /* Print what the server said, up to a point — the whole page would bury the

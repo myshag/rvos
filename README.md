@@ -321,6 +321,8 @@ $ read the fs server's private data region
 19. the network bound into the namespace: `/net/status`, `/net/tcp`
 20. a connection table and the RFC 793 state machine; passive open, ARP and
     ICMP answered, DNS, and a page fetched from a real server
+21. a send buffer and several segments in flight, out-of-order reassembly,
+    an RTO measured rather than guessed, and congestion control
 
 ## Loading a program
 
@@ -739,17 +741,128 @@ what a file interface means by close, and it happens to be what TCP means by
 it too — with the distinction TCP makes and a file does not: if the peer
 closed first the close is a LAST-ACK, and if we go first it is a FIN-WAIT.
 
+## TCP that is reliable rather than hopeful
+
+The stack could be called, but it kept one segment. A segment was "sent and
+not yet given up on", stored whole, and until the peer acknowledged it nothing
+else could go — a `write` while it was outstanding returned 0 and the program
+was expected to try again. Three things follow from replacing that single slot
+with a buffer, and they are the difference between a stack that works on a
+quiet link and one that works.
+
+**The send side is a byte stream now.** `snd_una` is the oldest unacknowledged
+byte, `snd_nxt` the first not yet sent; what lies between them is in flight
+and what lies after it is waiting for room. The SYN takes the sequence number
+just below the buffer and the FIN the one just above the last byte, so a
+handshake and a close take part in the same arithmetic as the data — which is
+what lets one routine, `tcp_output`, decide what may go, whether it is being
+called after a write, after an acknowledgement, or after a timeout. First
+transmission and retransmission stop being different code:
+
+```c
+c->snd_nxt = c->snd_una;    /* a timeout is just "go back and send again" */
+tcp_output(c);
+```
+
+A program sees the difference immediately:
+
+```
+[hello] wrote to /net/tcp
+tcp: queued 12 bytes from a program
+tcp: queued 11 bytes from a program
+[hello] two more writes, neither waiting on the first
+```
+
+All three arrive at the host. Under the old scheme the second returned 0.
+
+**The receive side reassembles.** A segment that arrives before the one in
+front of it is not an error and not a loss — it is what a network that
+reorders does. Dropping it costs a round trip to fetch again something already
+in hand. So a segment ahead of `rcv_nxt` is held aside, and every time the gap
+in front closes, the held segments that now fit are folded in.
+
+This needed a test hook of its own, for the same reason retransmission did:
+the virtual link never reorders, and code that never runs is code nobody has
+checked. The first data segment of an inbound connection is held back and the
+next one allowed to overtake it. Type two lines into `nc localhost 5555`:
+
+```
+tcp: [test] holding a segment back so the next overtakes it
+tcp: segment ahead of the stream, held aside (4 bytes)
+tcp: [test] releasing the held segment
+tcp: received 4 bytes, queued for readers
+tcp: gap closed, 4 held bytes delivered
+```
+
+and the reader gets them the right way round:
+
+```
+rvos$ cat /net/tcp/1
+one
+two
+```
+
+**The timeout is measured, not guessed.** 300 ms was a number in the source.
+Jacobson's estimator keeps a smoothed round-trip time and its variation and
+sets the timeout to `srtt + 4·rttvar`, because what matters is not the average
+delay but how far past the average a sample can reasonably fall. Karn's rule
+comes with it: a round-trip time may only be measured from a segment sent
+once, so every retransmission cancels the measurement in progress — otherwise
+a retransmitted segment's ack is credited to the wrong transmission and the
+estimate collapses in exactly the conditions that need it most.
+
+`cwnd` and `ssthresh` arrive at the same time, since the send loop has to
+consult something: slow start until the threshold, congestion avoidance after
+it, and on a timeout the threshold halves and the window drops to one segment.
+Three duplicate acknowledgements retransmit at once rather than waiting for
+the timer.
+
+None of these numbers can be checked by reading the code, so they are in the
+status file:
+
+```
+rvos$ cat /net/status
+tcp 0 listen       :7
+tcp 1 established  :7 <-> 10.0.2.2:42982
+        rx 8  unacked 0  srtt 2ms  rto 200ms  cwnd 4096
+```
+
+`srtt 2ms` is measured — the estimator ran. `rto 200ms` is the floor, because
+`srtt + 4·rttvar` on a link this fast comes out below it. `cwnd 4096` is two
+increments of slow start above where it started.
+
+**One option is sent and one is read.** A SYN now carries a maximum segment
+size, which is why the TCP header length is a field rather than the constant
+20 it had been. A peer that offers none is assumed to take 536 bytes, as
+RFC 1122 requires; the capture shows both sides declaring:
+
+```
+34 TCP 10.0.2.2:42982 -> 10.0.2.15:7 SYN     win=65535 mss=1460
+35 TCP 10.0.2.15:7 -> 10.0.2.2:42982 SYN|ACK win=2048  mss=1024
+```
+
+### What this still does not do
+
+Honest limits, since the point of the exercise is not to claim more than the
+code does. Congestion control and fast retransmit are written and are correct
+by construction, but this link loses nothing that was not deliberately dropped,
+so neither has been *observed* doing its job — the deliberate loss exercises
+the timeout path only. The reassembly queue is three segments deep and a
+fourth is dropped. There is no window scaling, no selective acknowledgement,
+no Nagle and no delayed acknowledgement, so a small write becomes a small
+segment and every segment is acknowledged at once.
+
 ## Next steps
 
-- out-of-order reassembly: a segment that arrives early is currently dropped
-  and re-requested with a duplicate ack
-- more than one segment in flight — a send buffer indexed by `snd_una`,
-  instead of one retransmit slot — and an RTO estimated from measured
-  round-trip times rather than fixed at 300 ms
-- congestion control: slow start and congestion avoidance
 - `/net/ctl`, so a program can open a connection or listen on a port instead
   of the stack's demo deciding
-- a blocking `read()`, so a program serving a connection stops polling
+- a blocking `read()`, so a program serving a connection stops polling — and
+  with it a program in the guest that answers the inbound call for itself,
+  instead of the greeting the demo sends
+- delayed acknowledgements and Nagle's algorithm: this stack answers every
+  segment at once and sends every write as its own segment
+- selective acknowledgement, so a loss costs one segment rather than
+  everything after it
 - capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
 - a `virtio-blk` driver, replacing the RAM image with a real disk

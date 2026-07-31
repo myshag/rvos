@@ -89,6 +89,17 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
         hputs(ok ? "  [hello] wrote to /net/tcp\n"
                  : "  [hello] /net/tcp never came up\n");
 
+        /* Two more, back to back and without waiting for either to be
+           acknowledged. Until the stack had a send buffer the second of these
+           moved nothing and returned 0, because one segment could be in
+           flight at a time; now all three are the stack's problem and not
+           this program's. */
+        if (ok) {
+            vfs_write(fd, "second line\n", 12);
+            vfs_write(fd, "third line\n", 11);
+            hputs("  [hello] two more writes, neither waiting on the first\n");
+        }
+
         if (ok) {
             char buf[VFS_DATA_MAX + 1];
             for (int try = 0; try < 4000; try++) {
