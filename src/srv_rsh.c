@@ -1,4 +1,4 @@
-/* srv_rsh.c — the shell, reached over TCP.
+/* srv_rsh.c — the shell, reached over TCP, and by telnet.
 
    `sh.c` reads from /dev/console and writes to it. This reads from a TCP
    connection and writes to it, and is otherwise the same idea: a line, split
@@ -82,18 +82,114 @@ static void put_num(unsigned long v)
     puts_conn(scratch);
 }
 
-/* One line from the connection, without the newline. Returns -1 at end of
+/* ---- telnet ------------------------------------------------------------
+   `nc` sends the bytes you type and nothing else. `telnet` sends the bytes
+   you type *and* a conversation about how to send them, mixed into the same
+   stream and marked by IAC — 255, "interpret as command". Without this the
+   negotiation lands in the line buffer and the shell answers
+
+       rsh: no such command: \xff\xfd\x03\xff\xfb\x18ls
+
+   which is exactly what it did.
+
+   Two rules make the rest small. A literal 255 in the data is sent as two of
+   them, so IAC IAC is one byte of data. And a negotiation is answered only
+   when it is an *offer* — WILL and DO — because answering a refusal with a
+   refusal is how two implementations negotiate for ever.
+
+   Everything is refused, which leaves the connection in the default mode of
+   RFC 854: the client keeps local echo and sends whole lines. That is the
+   same arrangement `nc` gives us by having a terminal do it, so one code path
+   serves both. */
+
+#define IAC  255
+#define SEo  240
+#define SBo  250
+#define WILL 251
+#define WONT 252
+#define DO   253
+#define DONT 254
+
+enum { T_DATA, T_IAC, T_OPT, T_SB, T_SB_IAC };
+static int tstate;
+static unsigned tcmd;
+
+static void telnet_refuse(unsigned cmd, unsigned opt)
+{
+    char r[3];
+    r[0] = (char)IAC;
+    r[1] = (char)(cmd == WILL ? DONT : WONT);
+    r[2] = (char)opt;
+    wr(r, 3);
+}
+
+/* Raw bytes in, data bytes into inbuf, answers straight back out. */
+static void telnet_in(const char *raw, int n)
+{
+    for (int i = 0; i < n; i++) {
+        unsigned c = (unsigned char)raw[i];
+        switch (tstate) {
+        case T_DATA:
+            if (c == IAC) {
+                tstate = T_IAC;
+            } else if (inlen < INBUF) {
+                inbuf[inlen++] = (char)c;
+            }
+            break;
+        case T_IAC:
+            if (c == IAC) {                 /* two of them mean one of them */
+                if (inlen < INBUF)
+                    inbuf[inlen++] = (char)c;
+                tstate = T_DATA;
+            } else if (c == WILL || c == WONT || c == DO || c == DONT) {
+                tcmd = c;
+                tstate = T_OPT;
+            } else if (c == SBo) {
+                tstate = T_SB;
+            } else {
+                tstate = T_DATA;            /* NOP, AYT, break: nothing to do */
+            }
+            break;
+        case T_OPT:
+            if (tcmd == WILL || tcmd == DO)
+                telnet_refuse(tcmd, c);     /* a WONT needs no answer */
+            tstate = T_DATA;
+            break;
+        case T_SB:                          /* a subnegotiation, to be skipped */
+            if (c == IAC)
+                tstate = T_SB_IAC;
+            break;
+        case T_SB_IAC:
+            tstate = (c == SEo) ? T_DATA : T_SB;
+            break;
+        }
+    }
+}
+
+/* One line from the connection, without the ending. Returns -1 at end of
    file. TCP is a stream, so a line may arrive in pieces or two may arrive at
-   once; the leftovers stay in inbuf for the next call. */
+   once; the leftovers stay in inbuf for the next call.
+
+   Line endings are whatever the client believes in: nc sends LF, telnet sends
+   CR LF, and a telnet sending a bare carriage return sends CR NUL. Leading
+   remnants of any of them are dropped rather than reported as empty lines. */
 static int readline(char *out, int cap)
 {
     for (;;) {
+        int skip = 0;
+        while (skip < inlen && (inbuf[skip] == '\n' || inbuf[skip] == '\r' ||
+                                inbuf[skip] == 0))
+            skip++;
+        if (skip) {
+            for (int k = skip; k < inlen; k++)
+                inbuf[k - skip] = inbuf[k];
+            inlen -= skip;
+        }
+
         for (int i = 0; i < inlen; i++) {
-            if (inbuf[i] != '\n')
+            if (inbuf[i] != '\n' && inbuf[i] != '\r')
                 continue;
             int n = i;
-            if (n > 0 && inbuf[n - 1] == '\r')
-                n--;                    /* telnet and nc send CR LF */
             if (n > cap - 1)
                 n = cap - 1;
             umemcpy(out, inbuf, (unsigned long)n);
@@ -109,10 +205,11 @@ static int readline(char *out, int cap)
             out[0] = 0;
             return 0;
         }
-        int n = vfs_read(conn, inbuf + inlen, INBUF - inlen);
+        char raw[VFS_DATA_MAX];
+        int n = vfs_read(conn, raw, (int)sizeof(raw));
         if (n <= 0)
             return -1;                  /* 0 = the far end closed its half */
-        inlen += n;
+        telnet_in(raw, n);
     }
 }
 
@@ -219,7 +316,8 @@ static void run_command(int argc, char **argv)
 
 static void session(int slot)
 {
-    inlen = 0;
+    inlen  = 0;
+    tstate = T_DATA;
     puts_conn("\nrvos — you are on the guest, over its own TCP stack.\n"
               "type `help`. connection ");
     put_num((unsigned long)slot);

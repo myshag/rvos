@@ -72,7 +72,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/user.c`       | user-mode demo programs |
 | `src/loader.c`     | **ELF loader** — user mode; the kernel never parses ELF |
 | `src/sh.c`         | an interactive shell — reads a line, runs what you typed |
-| `src/srv_rsh.c`    | the same shell, reached over TCP on port 23 |
+| `src/srv_rsh.c`    | the same shell, over TCP on port 23, and over telnet |
 | `prog/lib.h`       | what a disk program has instead of a library: included, not linked |
 | `prog/*.c`         | `ls cat echo mkdir rm cp mv wc ps free` — /BIN, and the services |
 | `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
@@ -372,6 +372,7 @@ $ read the fs server's private data region
     that is not one
 35. the commands leave the shell and become programs in `/BIN`, which needs
     `wait` first
+36. enough of the telnet protocol to be talked to by `telnet`
 
 ## Loading a program
 
@@ -2027,6 +2028,70 @@ build it and is not built. No exit status, because nothing returns one — the
 shell learns only that a task is gone. `mv` is a copy and a delete, since the
 filesystem has no rename; within one directory that is eleven bytes of work
 being done as a whole-file copy.
+
+## Speaking enough telnet
+
+`nc` sends the bytes you type and nothing else. `telnet` sends the bytes you
+type *and a conversation about how to send them*, mixed into the same stream
+and marked by IAC — 255, "interpret as command". Until this stage the shell
+took that conversation for a command line, and said so:
+
+```
+rsh: no such command: \xff\xfd\x03\xff\xfb\x18ls  (try `help`)
+```
+
+Two rules keep the fix small. A literal 255 in the data is sent as two of
+them, so `IAC IAC` is one byte of data. And a negotiation is answered **only
+when it is an offer** — `WILL` and `DO` — because answering a refusal with a
+refusal is how two implementations negotiate for ever.
+
+Everything is refused, which leaves the connection in RFC 854's default mode:
+the client keeps local echo and sends whole lines. That is the same
+arrangement `nc` gives by letting a terminal do it, so one code path serves
+both and the shell needs no idea which is on the other end.
+
+Line endings are then whatever the client believes in — `nc` sends LF, telnet
+sends CR LF, and a telnet sending a bare carriage return sends CR NUL. Leading
+remnants of any of them are dropped rather than reported as empty lines.
+
+```
+$ telnet 100.95.222.7 5556
+Connected to 100.95.222.7.
+
+rvos — you are on the guest, over its own TCP stack.
+type `help`. connection 0
+
+rvos# ls
+HELLO.TXT  (54 bytes)
+README.TXT  (105 bytes)
+DOCS/
+BIN/
+rvos# wc /README.TXT
+4 13 105  /README.TXT
+```
+
+Checked against three clients: GNU `telnet`, `busybox telnet`, and one written
+by hand that sends an offer, a refusal and a subnegotiation interleaved with
+data, to see that the offer is answered, the refusal is not, and the
+subnegotiation is skipped whole.
+
+### Where it listens, which is not a detail
+
+The forwarded ports bind to `127.0.0.1` unless `HOSTIP` says otherwise.
+Writing `hostfwd=tcp::5556-:23` — with the host address left empty — binds to
+every interface, and on a machine with a public address and no firewall that
+puts an unauthenticated shell on the internet, along with a filesystem anyone
+may write to and a `/net/ctl` anyone may use to open outbound connections from
+that address. It did exactly that here for about a day, and it was noticed
+only because somebody asked how to reach the guest from outside.
+
+```
+make run HOSTIP=100.95.222.7      # a private overlay address
+make run HOSTIP=0.0.0.0           # everybody, and you mean it
+```
+
+The right answer for wanting it reachable is authentication, which this still
+does not have.
 
 ## Next steps
 - each driver mapped only its own virtio slot, which needs a device tree
