@@ -73,7 +73,24 @@ static int wr(const char *s, int n)
     return off;
 }
 
-static int puts_conn(const char *s) { return wr(s, rlen(s)); }
+/* The shell's own text, with the line endings a terminal on the far end
+   expects. `wr` stays raw: telnet's own bytes must not be rewritten. */
+static int puts_conn(const char *s)
+{
+    char buf[128];
+    int k = 0;
+    for (; *s; s++) {
+        if (k > (int)sizeof(buf) - 2) {
+            if (wr(buf, k) < 0)
+                return -1;
+            k = 0;
+        }
+        if (*s == '\n')
+            buf[k++] = '\r';
+        buf[k++] = *s;
+    }
+    return k ? wr(buf, k) : 0;
+}
 
 static void put_num(unsigned long v)
 {

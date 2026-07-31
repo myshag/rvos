@@ -223,19 +223,37 @@ static inline void vfs_say(const char *s)
             _ecall1(SYS_PUTC, (unsigned char)s[i]);
         return;
     }
-    int off = 0;
-    while (off < n) {
-        int k = vfs_write(say_fd, s + off, n - off);
-        if (k < 0) {                        /* whatever it was is gone */
-            for (int i = off; i < n; i++)
-                _ecall1(SYS_PUTC, (unsigned char)s[i]);
+    /* Line endings are CR LF on the way out. A terminal reached over a
+       connection is in whatever mode its owner left it, and one that does not
+       translate turns a bare newline into a staircase: each line starts where
+       the last one ended. RFC 854 says CR LF for exactly this reason, and the
+       serial console — which adds its own CR — is unbothered by the extra
+       one, since returning to column zero twice looks the same as once. */
+    char buf[128];
+    int off = 0, k = 0;
+    for (;;) {
+        if (k > (int)sizeof(buf) - 2 || (off >= n && k)) {
+            int done = 0;
+            while (done < k) {
+                int w = vfs_write(say_fd, buf + done, k - done);
+                if (w < 0) {                /* whatever it was is gone */
+                    for (int i = off; i < n; i++)
+                        _ecall1(SYS_PUTC, (unsigned char)s[i]);
+                    return;
+                }
+                if (w == 0) {               /* a full send buffer: wait */
+                    _ecall1(SYS_YIELD, 0);
+                    continue;
+                }
+                done += w;
+            }
+            k = 0;
+        }
+        if (off >= n)
             return;
-        }
-        if (k == 0) {                       /* a full send buffer: wait */
-            _ecall1(SYS_YIELD, 0);
-            continue;
-        }
-        off += k;
+        if (s[off] == '\n')
+            buf[k++] = '\r';
+        buf[k++] = s[off++];
     }
 }
 
