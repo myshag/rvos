@@ -79,6 +79,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
 | `prog/netd.c`      | a program that owns TCP port 7 and answers callers |
 | `prog/get.c`       | an HTTP client: resolve, connect, fetch — all through files |
+| `prog/mc.c`        | two panels in colour, over the serial line or over telnet |
 | `prog/exportfs.c`  | hands this machine's namespace to whoever connects |
 | `prog/import.c`    | mounts another machine's namespace into this one |
 | `src/fsproto.h`    | the file protocol on a wire: explicit fields, not a struct |
@@ -379,6 +380,8 @@ $ read the fs server's private data region
 38. a closed receive, because a reply is not an event
 39. `ping` and `bench`: what a message costs, and which module stopped
     answering
+40. a directory listing a program can read, and a two-panel file manager in
+    colour that reads it
 
 ## Loading a program
 
@@ -2372,6 +2375,89 @@ mounted remote namespace is suspiciously close to the 20 ms retry deadline the
 network server arms when a reply is refused. That suggests every remote round
 trip is waiting for one, which would be worth chasing.
 
+## Two panels, in colour
+
+```
+ /                                       /BIN
+ HELLO.TXT                          54  /..
+ README.TXT                        105   CAT.ELF                          5608
+/DOCS                                    CP.ELF                           5792
+/BIN                                     ECHO.ELF                         5256
+                                         EXPORTFS.ELF                     8776
+                                         GET.ELF                          6528
+                                         MC.ELF                          12872
+
+ /BIN/CAT.ELF
+ arrows move  tab panel  enter open  v view  c copy  k delete  r reread  q quit
+```
+
+`/BIN/MC.ELF` is an ordinary program on the disk. It opens `/dev/console` and
+reads and writes it; it opens directories and reads them. Those are the same
+five calls `cat` uses, and nothing in it is privileged.
+
+What makes it full-screen rather than scrolling is that **a terminal is also
+just bytes**. Cursor positions and colours are escape sequences, and they
+travel unchanged through every layer here — the console server, the TCP stack,
+telnet's framing — because none of those layers has an opinion about what the
+bytes mean. That was checked before a line of it was written: `0x1b[1;31m`
+goes in one end and comes out the other, and `0x1b` cannot collide with
+telnet's `0xff` any more than it can with UTF-8.
+
+### The listing had to become regular first
+
+A directory used to read as `README.TXT  (105 bytes)`, which is pleasant to
+look at and unpleasant to parse — and names can contain spaces and brackets
+now. It reads as this instead:
+
+```
+- 105 README.TXT
+d 0 DOCS
+```
+
+Two fields and then the name to the end of the line, which needs no rules at
+all. Making it pretty moved into `ls`, which is where presentation belongs.
+The screen above is `mc` reading exactly those lines.
+
+### Two things it had to arrange
+
+**Character mode.** A terminal reached over telnet is in *line* mode: the
+client keeps local echo and sends nothing until Enter, so an arrow key would
+arrive only after one, if at all. Two telnet options fix that, and the program
+sends them **itself** — it can, because `/dev/console` *is* the connection, so
+a negotiation is only more bytes. It withdraws them on the way out, and the
+shell finds things as it left them.
+
+**Knowing whether to.** On the serial line there is no telnet and those bytes
+would be printed as rubbish. So the program asks:
+
+```c
+sys_resolve("/dev/console", real, sizeof real, 0);
+/* if `real` begins with /net/tcp/, the console is a connection */
+```
+
+Resolution reports not only which server answers for a name but *what name to
+ask it about*, and only a connection is called `/net/tcp/N`. That is the
+namespace answering a question about itself, and it is the alternative to
+guessing. Verified from both ends: over TCP the negotiation goes out; on the
+serial console the stream contains no `0xff` at all.
+
+### A message is ninety microseconds, and it shows
+
+One character written is one message. A screen is about two thousand of them,
+which at the measured cost would be a fifth of a second per keystroke. So the
+screen is built in a buffer and sent in a handful of calls — and that is the
+first place in this project where the number from `bench` changed how
+something was written rather than merely describing it.
+
+### What it does not do
+
+It assumes 80×24. Telnet carries the real size in the NAWS subnegotiation,
+which this skips whole. It cannot run anything: a program loaded from the disk
+cannot start another, because `spawn` lives in the shared user text of the
+kernel image — so the panels can copy, delete and view, and the shell is still
+where you run things. And one session at a time, which by now is a familiar
+sentence.
+
 ## Next steps
 - each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
@@ -2383,6 +2469,7 @@ trip is waiting for one, which would be worth chasing.
   proportion — everything above is an emulator describing itself
 - why a round trip through a remote mount takes 25 ms when the link is
   loopback: the 20 ms retry deadline is the obvious suspect
+- the terminal's real size, which telnet already sends and this ignores
 - a pseudo-terminal: the shell serving its children's `/dev/console`, so that
   output is ordered and line endings are added in one place. It was attempted
   before the closed receive existed and failed four different ways

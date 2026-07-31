@@ -121,7 +121,7 @@ static void proc_do_open(struct vfs_req *r, int caller)
     /* "/proc/" and "/proc" name the directory itself, and a directory that
        will not say what is in it is no use in a union. */
     if (r->path[5] == 0 || r->path[6] == 0)
-        n = append(f->data, 0, "tasks\nmounts\npagetable\n");
+        n = append(f->data, 0, "- 0 tasks\n- 0 mounts\n- 0 pagetable\n");
     else if (ustr_has_prefix(r->path, "/proc/tasks"))
         n = format_tasks(f->data, PROC_BUFSZ);
     else if (ustr_has_prefix(r->path, "/proc/mounts"))

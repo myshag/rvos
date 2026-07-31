@@ -30,7 +30,18 @@ struct fs_file {
 static struct fs_file fs_tab[FS_MAXFD];
 
 /* Any directory, not just the root: a listing is what read() returns for one,
-   and which directory it is has stopped being interesting to this file. */
+   and which directory it is has stopped being interesting to this file.
+
+   One line per entry, and the shape is regular on purpose:
+
+       d 0 DOCS
+       - 105 README.TXT
+
+   It used to be "README.TXT  (105 bytes)", which reads nicely and parses
+   badly — and a name can contain spaces and brackets now. Type and size first
+   and the name last means a reader needs no rules at all: two fields, then
+   everything to the end of the line. Making it pretty is `ls`'s job, which is
+   where presentation belongs. */
 static int fs_format_dir(const char *path, char *out, int cap)
 {
     /* Static, not on the stack: a long name is 96 bytes and two dozen of them
@@ -40,17 +51,14 @@ static int fs_format_dir(const char *path, char *out, int cap)
     if (n < 0)
         return -1;
     int o = 0;
-    for (int i = 0; i < n && o < cap - 40; i++) {
+    for (int i = 0; i < n && o < cap - (FAT_NAME_MAX + 24); i++) {
+        out[o++] = ents[i].is_dir ? 'd' : '-';
+        out[o++] = ' ';
+        o += uutoa(ents[i].size, out + o);
+        out[o++] = ' ';
         int l = (int)ustrlen(ents[i].name);
         umemcpy(out + o, ents[i].name, (unsigned long)l);
         o += l;
-        if (ents[i].is_dir) {
-            out[o++] = '/';
-        } else {
-            umemcpy(out + o, "  (", 3); o += 3;
-            o += uutoa(ents[i].size, out + o);
-            umemcpy(out + o, " bytes)", 7); o += 7;
-        }
         out[o++] = '\n';
     }
     return o;
