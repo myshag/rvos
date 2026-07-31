@@ -175,6 +175,7 @@ void smain(void)
         extern char __ufs_bss_start[],   __ufs_bss_end[];
         extern char __uproc_bss_start[], __uproc_bss_end[];
         extern char __udev_bss_start[],  __udev_bss_end[];
+        extern char __utty_bss_start[],  __utty_bss_end[];
         extern char __uload_bss_start[], __uload_bss_end[];
         extern char __ush_bss_start[],   __ush_bss_end[];
         extern char __ursh_bss_start[],  __ursh_bss_end[];
@@ -184,6 +185,7 @@ void smain(void)
             { __ufs_bss_start,   __ufs_bss_end   },
             { __uproc_bss_start, __uproc_bss_end },
             { __udev_bss_start,  __udev_bss_end  },
+            { __utty_bss_start,  __utty_bss_end  },
             { __uload_bss_start, __uload_bss_end },
             { __ush_bss_start,   __ush_bss_end   },
             { __ursh_bss_start,  __ursh_bss_end  },
@@ -306,10 +308,12 @@ void smain(void)
        named by a constant that is its position in this list. This one is
        named by the pointer it was just handed, which is the better way and
        would be a pleasant afternoon's work to make general. */
-    struct task *devt;
+    struct task *devt, *ttyt;
     {
         extern char __udev_start[], __udev_end[];
+        extern char __utty_start[], __utty_end[];
         devt = task_create_user("dev", dev_server, __udev_start, __udev_end);
+        ttyt = task_create_user("tty", tty_server, __utty_start, __utty_end);
     }
 
     vfs_mount("/",      FS_TASK_ID, MREPL);
@@ -324,6 +328,12 @@ void smain(void)
     vfs_mount("/dev/console", CONSOLE_TASK_ID, MREPL);
     /* And the same server publishes what the others say about themselves. */
     vfs_mount("/doc/", devt ? devt->id : PROC_TASK_ID, MREPL);
+    if (ttyt)
+        vfs_mount("/tty/", ttyt->id, MREPL);
+    /* Устройство под своим именем: терминал должен уметь назвать то, что он
+       оборачивает, не полагаясь на то, что дескриптор открыт до перепривязки
+       /dev/console. */
+    vfs_mount("/dev/rawcons", CONSOLE_TASK_ID, MREPL);
 
     kprintf("[boot] 4 user servers, 3 kernel apps, 2 user programs, %d pages.\n",
             pmm_free_count());

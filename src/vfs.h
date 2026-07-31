@@ -65,6 +65,10 @@ enum {
        from it because they are different kinds of fact: DOC is what a server
        accepts, this is what it can hold. */
     IOCTL_CONF,
+    /* Сырой режим против варёного, на терминале: `len` = 1 сырой, 0 варёный.
+       В сыром байты отдаются как пришли, без эха и без правки строки — это
+       то, что нужно полноэкранной программе. */
+    IOCTL_TTYMODE,
 };
 
 /* Long names need somewhere to fit. 32 was enough while every name was 8.3;

@@ -909,10 +909,32 @@ static inline void cur__rawmode(int on)
     cur__flush();
 }
 
-static inline int cbreak(void)   { cur__rawmode(1); return OK; }
-static inline int noecho(void)   { return OK; }   /* the same negotiation */
+/* Two ways of asking for the same thing, because the far end may be either.
+
+   If a line discipline is in the path, this is what tells it to stop editing
+   and stop echoing: characters as they arrive is precisely what cbreak means.
+   The ioctl fails harmlessly when /dev/console is a device rather than a
+   terminal, which is the case on the serial line.
+
+   And if the far end is a telnet client, the negotiation says the same thing
+   to it. A full-screen program may be behind one, the other, both or
+   neither, and asking twice costs nothing. */
+static inline int cbreak(void)
+{
+    vfs_ioctl_arg(cur__fd, IOCTL_TTYMODE, 1);
+    cur__rawmode(1);
+    return OK;
+}
+
+static inline int noecho(void)   { return OK; }   /* the same two requests */
 static inline int echo(void)     { return OK; }
-static inline int nocbreak(void) { cur__rawmode(0); return OK; }
+
+static inline int nocbreak(void)
+{
+    vfs_ioctl_arg(cur__fd, IOCTL_TTYMODE, 0);
+    cur__rawmode(0);
+    return OK;
+}
 static inline int raw(void)      { return cbreak(); }
 static inline int noraw(void)    { return nocbreak(); }
 
@@ -1008,6 +1030,7 @@ static inline int endwin(void)
         return ERR;
     cur__str("\x1b[0m\x1b[?25h\x1b[2J\x1b[H");
     cur__flush();
+    vfs_ioctl_arg(cur__fd, IOCTL_TTYMODE, 0);   /* the discipline, if any */
     cur__rawmode(0);
     vfs_close(cur__fd);
     cur__fd = -1;

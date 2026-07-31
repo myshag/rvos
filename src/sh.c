@@ -23,16 +23,6 @@ int spawn(const char *path, int argc, char *const argv[]);   /* loader.c */
    with nothing to read is kept until a key arrives, and this call simply does
    not return until then. The loop is left in place for the case where a
    second reader is told 0, and it no longer runs. */
-static int getc_blocking(int fd)
-{
-    for (;;) {
-        char c;
-        int n = vfs_read(fd, &c, 1);
-        if (n > 0)
-            return (unsigned char)c;
-        _ecall1(SYS_YIELD, 0);
-    }
-}
 
 static int streq(const char *a, const char *b)
 {
@@ -102,7 +92,7 @@ static int find_program(const char *word, char *out, int cap)
    shell of external commands usable at all: without it the prompt comes back
    in the middle of the program's output, which was tolerable when `cat` was a
    builtin and is not now that it is not. */
-static void run_command(int argc, char **argv)
+static void run_command(int con, int argc, char **argv)
 {
     int background = 0;
     if (argc > 1 && streq(argv[argc - 1], "&")) {
@@ -129,10 +119,49 @@ static void run_command(int argc, char **argv)
     } else {
         /* The terminal is told who is in front of it, so that Ctrl-C has
            something to mean while this shell is not reading anything. */
-        vfs_ioctl_path_arg("/dev/console", IOCTL_INTR, tid);
+        /* По дескриптору, а не по имени: линию терминала именует дескриптор,
+           и ioctl с fd = -1 не про неё. Пока за именем стоял драйвер с одной
+           единственной консолью, разницы не было — с терминалами появилась. */
+        vfs_ioctl_arg(con, IOCTL_INTR, tid);
         sys_wait(tid);
-        vfs_ioctl_path_arg("/dev/console", IOCTL_INTR, 0);
+        vfs_ioctl_arg(con, IOCTL_INTR, 0);
     }
+}
+
+/* Написать команду в управляющий файл и прочитать ответ — та же форма, что у
+   /net/ctl, потому что это тот же интерфейс. */
+static int ctl_write(const char *path, const char *cmd, char *answer, int cap)
+{
+    int fd = vfs_open(path);
+    if (fd < 0)
+        return -1;
+    int l = 0;
+    while (cmd[l]) l++;
+    if (vfs_write(fd, cmd, l) < 0) {
+        vfs_close(fd);
+        return -1;
+    }
+    int n = vfs_read(fd, answer, cap - 1);
+    vfs_close(fd);
+    if (n <= 0)
+        return -1;
+    answer[n] = 0;
+    return n;
+}
+
+static int slot_of(const char *answer)
+{
+    if (answer[0] != 'o' || answer[1] != 'k')
+        return -1;
+    const char *p = answer + 2;
+    while (*p == ' ')
+        p++;
+    if (*p < '0' || *p > '9')
+        return -1;
+    int v = 0;
+    while (*p >= '0' && *p <= '9')
+        v = v * 10 + (*p++ - '0');
+    return v;
 }
 
 void sh_main(void)
@@ -140,7 +169,33 @@ void sh_main(void)
     unsigned long go;
     sys_recv(&go, (int)sizeof(go));
 
-    int con = vfs_open("/dev/console");
+    /* Обернуть последовательную линию терминалом — тем же, что стоит за
+       сессиями по сети. Дисциплина одна на всю систему, а не по одной у
+       каждого читателя, и backspace тут больше не разбирается.
+
+       Своё пространство имён обязательно: привязка /dev/console в корневом
+       поменяла бы смысл имени для всех, кто его наследует. Если терминала нет
+       — работаем напрямую с устройством, потому что оболочка, которая не
+       запустилась, хуже оболочки без правки строки. */
+    int con = -1;
+    {
+        char answer[64];
+        if (ctl_write("/tty/ctl", "new /dev/rawcons", answer,
+                      (int)sizeof(answer)) > 0 && slot_of(answer) >= 0) {
+            char path[24];
+            int k = 0;
+            for (const char *a = "/tty/"; *a; a++)
+                path[k++] = *a;
+            k += uutoa((unsigned long)slot_of(answer), path + k);
+            path[k] = 0;
+            sys_nsclone();
+            con = vfs_open(path);
+            if (con >= 0)
+                sys_bind(path, "/dev/console", MREPL);
+        }
+    }
+    if (con < 0)
+        con = vfs_open("/dev/console");
     if (con < 0) {
         uputs("sh: no console\n");
         sys_exit();
@@ -151,32 +206,13 @@ void sh_main(void)
 
     for (;;) {
         uputs("\nrvos$ ");
-        int len = 0;
-        for (;;) {
-            int c = getc_blocking(con);
-            if (c == '\r' || c == '\n') {
-                uputs("\n");
-                break;
-            }
-            /* Nobody is nominated while the shell is the one reading, so the
-               interrupt character arrives here as a byte and means the only
-               thing it can mean: forget the line. */
-            if (c == 3) {
-                uputs("^C\n");
-                len = 0;
-                break;
-            }
-            if ((c == 8 || c == 127) && len > 0) {   /* backspace */
-                len--;
-                uputs("\b \b");
-                continue;
-            }
-            if (c >= ' ' && len < LINEMAX - 1) {
-                line[len++] = (char)c;
-                char e[2] = { (char)c, 0 };
-                uputs(e);
-            }
-        }
+        /* Строка приходит уже отредактированной: backspace, ^U, ^W и ^D
+           разбирает сервер терминала. Здесь остаётся чтение. */
+        int len = vfs_read(con, line, LINEMAX - 1);
+        if (len < 0)
+            len = 0;
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            len--;
         line[len] = 0;
         if (len == 0)
             continue;
@@ -255,6 +291,6 @@ void sh_main(void)
 
         /* The other builtin, because it answers the question a loader raises:
            does running programs cost memory permanently? */
-                run_command(argc, argv);
+                run_command(con, argc, argv);
     }
 }

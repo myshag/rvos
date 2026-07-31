@@ -3800,6 +3800,90 @@ fired — with nobody nominated the byte is ordinary data, which is how Ctrl-C
 cancels a half-typed line when no program is running.
 
 
+## The line discipline, as a server
+
+Everything a terminal does to what you type was written three times here: the
+local shell parsed its own input, the remote shell parsed its own, and curses
+parsed a third. Telnet's negotiation was decoded twice, backspace three times,
+the interrupt character twice — and `^U`, `^W` and `^D` nowhere at all.
+
+`src/srv_tty.c` is the missing middle.
+
+```
+/tty/ctl        write "new /net/tcp/0"  -> "ok 3"
+/tty/3          read  — a whole line, editing already done
+                write — passes through to the device
+```
+
+A session does `bind /tty/3 /dev/console` and everything it starts gets cooked
+input without knowing. And it can refuse: bind `/dev/console` to the device
+instead and the discipline is not in the path. **That choice belongs to
+whoever starts the program, not to the program** — which is the entire reason
+this is a server and not a header. `IOCTL_TTYMODE` is the other half of the
+same idea: `cbreak()` in curses now asks for raw mode *and* negotiates with
+telnet, because the far end may be either.
+
+### Why it needed threads
+
+A server cannot block reading from another server: it would stop answering
+everyone else. This is what killed the first attempt at a pseudo-terminal
+several stages ago, and it was not a bug in the code — the mechanism was
+missing. Each line now has a thread that blocks on the device, runs the
+discipline, and wakes the main loop when a line is complete.
+
+The main loop is what answers the parked reader, and that is not a detail: the
+client waits in a **closed** receive, which names the task it sent to. A reply
+from the thread would sit in the queue unclaimed for ever.
+
+### Six things it got wrong first
+
+Each one is a fair description of what the middle of a system does to you.
+
+**`ls /tty` hung the shell.** The control file had no position, so a read
+always answered with the whole listing and `ls`, which reads until it gets
+nothing, never got nothing.
+
+**A closed descriptor tore down the terminal.** `mc` closes `/dev/console` on
+the way out, and the session died with it. Closing a descriptor on a line is
+not closing the line — the line goes when `close N` is written to ctl, when
+its device ends, or when the task that asked for it is gone.
+
+**The interrupt was nominated by name.** `vfs_ioctl_path_arg("/dev/console",
+INTR, tid)` sends `fd = -1`, and a line is named by a descriptor. It had
+worked for as long as the name led to a driver with exactly one console.
+
+**Two `^C` again**, because the terminal echoes it and the shell printed it as
+well. The shell's copy is gone: `^C` reaches the screen the way every other
+typed character does.
+
+**A dropped connection left its program running for ever**, writing into
+nothing, its output turning up in the next session. The terminal kills the
+nominated task when its device ends — which is what `SIGHUP` is for, and the
+nomination a shell already makes is exactly the list of who to tell.
+
+**Sixteen kilobytes a session leaked**, the reader thread's stack. It cannot
+be freed by the closer — a thread is standing on it — nor by the thread, which
+would be freeing the ground under itself. It belongs to the slot now and the
+next line reuses it: eight slots, and that is the whole budget.
+
+### What it cost
+
+Measured, and the interesting part is which number moved.
+
+| | before | after |
+|---|--------|-------|
+| message round trip (`ping /`) | 100–133 µs | 100–133 µs |
+| `mc`'s first screen | 7554 B | 7567 B |
+| keystroke to redrawn | 2.6 ms | 3.1 ms |
+| five sessions, warm | — | 0 pages |
+
+The round trip is unchanged because the terminal is not in that path at all.
+The half-millisecond on a keystroke is the extra hop on the way out, and it is
+the price of the discipline being a server: a descriptor names one server, so
+a write cannot skip it. The first sessions pay for the slot pool; after that a
+session costs nothing permanent.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

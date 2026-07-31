@@ -30,6 +30,7 @@ SECTIONS
         *srv_blk.o(.text .text.*)
         *srv_proc.o(.text .text.*)
         *srv_dev.o(.text .text.*)
+        *srv_tty.o(.text .text.*)
         *loader.o(.text .text.*)
         */sh.o(.text .text.*)
         *srv_rsh.o(.text .text.*)
@@ -47,6 +48,7 @@ SECTIONS
         *srv_blk.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_proc.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_dev.o(.rodata .rodata.* .srodata .srodata.*)
+        *srv_tty.o(.rodata .rodata.* .srodata .srodata.*)
         *loader.o(.rodata .rodata.* .srodata .srodata.*)
         */sh.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_rsh.o(.rodata .rodata.* .srodata .srodata.*)
@@ -113,6 +115,21 @@ SECTIONS
     __udev_bss_end = .;
     . = ALIGN(4096);
     __udev_end = .;
+
+    /* the terminal server (its lines and their queues) */
+    __utty_start = .;
+    .utty_data : {
+        *srv_tty.o(.data .data.* .sdata .sdata.*)
+    }
+    . = ALIGN(8);
+    __utty_bss_start = .;
+    .utty_bss : {
+        *srv_tty.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __utty_bss_end = .;
+    . = ALIGN(4096);
+    __utty_end = .;
 
     /* the ELF loader (its file buffer) */
     __uload_start = .;

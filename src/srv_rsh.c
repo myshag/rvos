@@ -31,14 +31,11 @@
    друг друга на первой же строке ввода. Структура выделяется на соединение и
    передаётся указателем; больше в этом файле общего состояния нет. */
 struct session {
-    int      conn;
-    int      slot;
+    int      conn;                  /* дескриптор терминала, не соединения */
+    int      slot;                  /* номер соединения, для приветствия */
+    int      slot_tty;              /* номер линии, чтобы свернуть её */
     char     line[LINEMAX];
     char    *argv[8];
-    char     inbuf[INBUF];
-    int      inlen;
-    int      tstate;                /* разбор telnet — тоже своё у каждого */
-    unsigned tcmd;
     char     scratch[64];
     char    *stack;                 /* её же, освобождает она сама */
 };
@@ -106,147 +103,29 @@ static void put_num(struct session *S, unsigned long v)
     puts_conn(S, S->scratch);
 }
 
-/* ---- telnet ------------------------------------------------------------
-   `nc` sends the bytes you type and nothing else. `telnet` sends the bytes
-   you type *and* a conversation about how to send them, mixed into the same
-   stream and marked by IAC — 255, "interpret as command". Without this the
-   negotiation lands in the line buffer and the shell answers
+static int ctl_write(const char *path, const char *cmd, char *answer, int cap);
+static int slot_of(const char *answer);
 
-       rsh: no such command: \xff\xfd\x03\xff\xfb\x18ls
+/* ---- reading a line ----------------------------------------------------
 
-   which is exactly what it did.
+   There used to be four hundred bytes of telnet parser and line assembly
+   here. They are in the terminal server now — with the backspace handling
+   that was written three times in this system, the interrupt character that
+   was written twice, and ^U, ^W and ^D that were written nowhere.
 
-   Two rules make the rest small. A literal 255 in the data is sent as two of
-   them, so IAC IAC is one byte of data. And a negotiation is answered only
-   when it is an *offer* — WILL and DO — because answering a refusal with a
-   refusal is how two implementations negotiate for ever.
-
-   Everything is refused, which leaves the connection in the default mode of
-   RFC 854: the client keeps local echo and sends whole lines. That is the
-   same arrangement `nc` gives us by having a terminal do it, so one code path
-   serves both. */
-
-#define IAC  255
-#define SEo  240
-#define SBo  250
-#define WILL 251
-#define WONT 252
-#define DO   253
-#define DONT 254
-
-enum { T_DATA, T_IAC, T_OPT, T_SB, T_SB_IAC };
-
-static void telnet_refuse(struct session *S, unsigned cmd, unsigned opt)
-{
-    char r[3];
-    r[0] = (char)IAC;
-    r[1] = (char)(cmd == WILL ? DONT : WONT);
-    r[2] = (char)opt;
-    wr(S, r, 3);
-}
-
-/* Raw bytes in, data bytes into inbuf, answers straight back out. */
-static void telnet_in(struct session *S, const char *raw, int n)
-{
-    for (int i = 0; i < n; i++) {
-        unsigned c = (unsigned char)raw[i];
-        switch (S->tstate) {
-        case T_DATA:
-            if (c == IAC) {
-                S->tstate = T_IAC;
-            } else if (S->inlen < INBUF) {
-                S->inbuf[S->inlen++] = (char)c;
-            }
-            break;
-        case T_IAC:
-            if (c == IAC) {                 /* two of them mean one of them */
-                if (S->inlen < INBUF)
-                    S->inbuf[S->inlen++] = (char)c;
-                S->tstate = T_DATA;
-            } else if (c == WILL || c == WONT || c == DO || c == DONT) {
-                S->tcmd = c;
-                S->tstate = T_OPT;
-            } else if (c == SBo) {
-                S->tstate = T_SB;
-            } else {
-                S->tstate = T_DATA;            /* NOP, AYT, break: nothing to do */
-            }
-            break;
-        case T_OPT:
-            if (S->tcmd == WILL || S->tcmd == DO)
-                telnet_refuse(S, S->tcmd, c);     /* a WONT needs no answer */
-            S->tstate = T_DATA;
-            break;
-        case T_SB:                          /* a subnegotiation, to be skipped */
-            if (c == IAC)
-                S->tstate = T_SB_IAC;
-            break;
-        case T_SB_IAC:
-            S->tstate = (c == SEo) ? T_DATA : T_SB;
-            break;
-        }
-    }
-}
-
-/* One line from the connection, without the ending. Returns -1 at end of
-   file. TCP is a stream, so a line may arrive in pieces or two may arrive at
-   once; the leftovers stay in S->inbuf for the next call.
-
-   Line endings are whatever the client believes in: nc sends LF, telnet sends
-   CR LF, and a telnet sending a bare carriage return sends CR NUL. Leading
-   remnants of any of them are dropped rather than reported as empty lines. */
+   What is left is a read. The terminal delivers one whole line, already
+   edited, with the newline a reader expects. */
 static int readline(struct session *S, char *out, int cap)
 {
-    for (;;) {
-        int skip = 0;
-        while (skip < S->inlen && (S->inbuf[skip] == '\n' || S->inbuf[skip] == '\r' ||
-                                S->inbuf[skip] == 0))
-            skip++;
-        if (skip) {
-            for (int k = skip; k < S->inlen; k++)
-                S->inbuf[k - skip] = S->inbuf[k];
-            S->inlen -= skip;
-        }
-
-        /* Nobody is nominated while this shell is the one reading, so the
-           interrupt character arrives here as a byte and means the only thing
-           it can mean: forget the line. */
-        for (int i = 0; i < S->inlen; i++) {
-            if (S->inbuf[i] == 3) {
-                S->inlen = 0;
-                out[0] = 0;
-                puts_conn(S, "^C\n");
-                return 0;
-            }
-            if (S->inbuf[i] != '\n' && S->inbuf[i] != '\r')
-                continue;
-            int n = i;
-            if (n > cap - 1)
-                n = cap - 1;
-            umemcpy(out, S->inbuf, (unsigned long)n);
-            out[n] = 0;
-            int rest = S->inlen - (i + 1);
-            for (int k = 0; k < rest; k++)
-                S->inbuf[k] = S->inbuf[i + 1 + k];
-            S->inlen = rest;
-            return n;
-        }
-        if (S->inlen >= INBUF) {           /* a line longer than we will take */
-            S->inlen = 0;
-            out[0] = 0;
-            return 0;
-        }
-        char raw[VFS_DATA_MAX];
-        int n = vfs_read(S->conn, raw, (int)sizeof(raw));
-        if (n <= 0)
-            return -1;                  /* 0 = the far end closed its half */
-        telnet_in(S, raw, n);
-    }
+    int n = vfs_read(S->conn, out, cap - 1);
+    if (n <= 0)
+        return -1;                      /* end of file: they hung up */
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+        n--;
+    out[n] = 0;
+    return n;
 }
 
-/* Words, with quotes — which stopped being optional the moment a file could
-   be called "a rather long file name.txt". Only double quotes, and no escape
-   inside them: enough to name a file, and not the beginning of a language. */
 static int split(char *s, char **out, int max)
 {
     int n = 0;
@@ -353,10 +232,13 @@ static void run_command(struct session *S, int argc, char **argv)
     } else {
         /* The connection is told who is in front of it, so that Ctrl-C has
            something to mean while this shell is not reading anything. */
+        /* Терминалу называют задачу переднего плана, и всё: `^C` на экран
+           печатает он сам, эхом, как печатает любой другой введённый символ.
+           Здесь стояла вторая такая печать, и на одно нажатие приходило два
+           `^C` — ровно то, чем кончаются две реализации одной мысли. */
         vfs_ioctl_arg(S->conn, IOCTL_INTR, tid);
         sys_wait(tid);
-        if (vfs_ioctl_arg(S->conn, IOCTL_INTR, 0) > 0)
-            puts_conn(S, "^C\n");
+        vfs_ioctl_arg(S->conn, IOCTL_INTR, 0);
     }
 }
 
@@ -369,8 +251,6 @@ static void run_command(struct session *S, int argc, char **argv)
 
 static void session(struct session *S)
 {
-    S->inlen  = 0;
-    S->tstate = T_DATA;
     puts_conn(S, "\nrvos — you are on the guest, over its own TCP stack.\n"
               "type `help`. connection ");
     put_num(S, (unsigned long)S->slot);
@@ -476,7 +356,31 @@ static void session_thread(long arg)
        счётчик не доходит до нуля, и соединение навсегда остаётся в
        close-wait. Ровно это и случилось при первой сборке — три висящих
        соединения при пяти вошедших и вышедших. */
-    S->conn = vfs_open(S->scratch);
+    /* Обернуть соединение терминалом и дальше говорить только с ним. Само
+       соединение эта задача не открывает вовсе: его держит сервер терминала,
+       и закроется оно, когда закроется линия. */
+    char answer[64], tty[24];
+    int k = 0;
+    const char *n1 = "new ";
+    while (*n1) tty[k++] = *n1++;
+    for (int q = 0; S->scratch[q] && k < (int)sizeof(tty) - 1; q++)
+        tty[k++] = S->scratch[q];
+    tty[k] = 0;
+    if (ctl_write("/tty/ctl", tty, answer, sizeof(answer)) < 0 ||
+        slot_of(answer) < 0) {
+        char *st = S->stack;
+        free(S);
+        free(st);
+        sys_exit();
+    }
+    S->slot_tty = slot_of(answer);
+    k = 0;
+    const char *n2 = "/tty/";
+    while (*n2) tty[k++] = *n2++;
+    k += uutoa((unsigned long)S->slot_tty, tty + k);
+    tty[k] = 0;
+
+    S->conn = vfs_open(tty);
     if (S->conn < 0) {
         char *st = S->stack;
         free(S);
@@ -486,13 +390,25 @@ static void session_thread(long arg)
 
     /* Своё пространство имён: нити делят память, но не обязаны делить смысл
        имён — потому две сессии и могут привязать /dev/console каждая к своему
-       соединению. Всё, что запустит эта сессия, унаследует её пространство. */
+       терминалу. Всё, что запустит эта сессия, унаследует её пространство. */
     sys_nsclone();
-    sys_bind(S->scratch, "/dev/console", MREPL);
+    sys_bind(tty, "/dev/console", MREPL);
 
     session(S);
 
-    vfs_close(S->conn);                 /* последний дескриптор: и соединение */
+    /* Свернуть линию: закрытие дескриптора её не разрушает, и это нарочно —
+       иначе всякая полноэкранная программа, закрывая свою консоль, уносила бы
+       терминал вместе с сессией. Устройство закроет сервер терминала. */
+    vfs_close(S->conn);
+    {
+        char cmd[24], ans[64];
+        int k = 0;
+        const char *c = "close ";
+        while (*c) cmd[k++] = *c++;
+        k += uutoa((unsigned long)S->slot_tty, cmd + k);
+        cmd[k] = 0;
+        ctl_write("/tty/ctl", cmd, ans, sizeof(ans));
+    }
     uputs("  [rsh] they logged out\n");
     char *stack = S->stack;
     free(S);
@@ -506,9 +422,9 @@ static void session_thread(long arg)
 
 /* Write one command to /net/ctl and read the answer. Identical in shape to
    what netd does, because it is the same interface. */
-static int ctl(const char *cmd, char *answer, int cap)
+static int ctl_write(const char *path, const char *cmd, char *answer, int cap)
 {
-    int fd = vfs_open("/net/ctl");
+    int fd = vfs_open(path);
     if (fd < 0)
         return -1;
     if (vfs_write(fd, cmd, rlen(cmd)) < 0) {
@@ -521,6 +437,11 @@ static int ctl(const char *cmd, char *answer, int cap)
         return -1;
     answer[n] = 0;
     return n;
+}
+
+static int ctl(const char *cmd, char *answer, int cap)
+{
+    return ctl_write("/net/ctl", cmd, answer, cap);
 }
 
 static int slot_of(const char *answer)
