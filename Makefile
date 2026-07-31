@@ -42,9 +42,25 @@ DRIVE   := -drive file=$(DISK),if=none,format=raw,id=hd0 \
 # driver speaks virtio 1.x, so the transport has to be the modern one.
 # hostfwd is what makes the guest reachable at all: QEMU's user-mode network
 # is a NAT, so nothing on the host can open a connection inward unless a port
-# is forwarded. 5555 becomes 10.0.2.15:7 — the port /BIN/NETD.ELF takes once
-# you start it — 5556 becomes port 23, where the shell listens from boot, and
-# 5564 becomes 564, where /BIN/EXPORTFS.ELF hands out the namespace.
+# is forwarded. Inside the guest the numbers are the standard ones already:
+# 7 is echo, where /BIN/NETD.ELF listens once you start it; 23 is telnet, where
+# the shell listens from boot; 564 is 9P, where /BIN/EXPORTFS.ELF hands out the
+# namespace. Only the host side is renumbered, and only because a port below
+# 1024 needs privilege that QEMU should not be given.
+#
+#   make run TELNETPORT=23            # if you have the privilege; see below
+#
+# Three ways to have the standard number on the host, in the order of how
+# little they cost:
+#
+#   tailscale serve --bg --tcp 23 tcp://$(HOSTIP):5556
+#       tailscaled already runs as root and binds 23 on the overlay interface
+#       only. Nothing on the host changes, and `tailscale serve --tcp 23 off`
+#       puts it back.
+#   sudo setcap cap_net_bind_service=+ep $$(which qemu-system-riscv64)
+#       lets that binary bind low ports, for every user, until it is upgraded.
+#   sudo sysctl net.ipv4.ip_unprivileged_port_start=23
+#       lets every program on the machine bind 23 and up.
 #
 # HOSTIP is the address they listen on, and the default is not decoration.
 # Writing `hostfwd=tcp::5556-:23`, with the host address left empty, binds to
@@ -54,11 +70,15 @@ DRIVE   := -drive file=$(DISK),if=none,format=raw,id=hd0 \
 #
 #   make run HOSTIP=100.95.222.7      # a private overlay address
 #   make run HOSTIP=0.0.0.0           # everybody, and you mean it
-HOSTIP  ?= 127.0.0.1
+HOSTIP      ?= 127.0.0.1
+ECHOPORT    ?= 5555
+TELNETPORT  ?= 5556
+EXPORTPORT  ?= 5564
 QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic \
            -global virtio-mmio.force-legacy=false -kernel $(ELF) \
-           -netdev user,id=n0,hostfwd=tcp:$(HOSTIP):5555-:7,\
-hostfwd=tcp:$(HOSTIP):5556-:23,hostfwd=tcp:$(HOSTIP):5564-:564 \
+           -netdev user,id=n0,hostfwd=tcp:$(HOSTIP):$(ECHOPORT)-:7,\
+hostfwd=tcp:$(HOSTIP):$(TELNETPORT)-:23,\
+hostfwd=tcp:$(HOSTIP):$(EXPORTPORT)-:564 \
            -device virtio-net-device,netdev=n0 $(DRIVE)
 
 .PHONY: all run rundisk runpcap disk prog clean

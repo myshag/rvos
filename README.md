@@ -2064,7 +2064,8 @@ sends CR LF, and a telnet sending a bare carriage return sends CR NUL. Leading
 remnants of any of them are dropped rather than reported as empty lines.
 
 ```
-$ telnet 100.95.222.7 5556
+$ telnet 100.95.222.7
+Trying 100.95.222.7...
 Connected to 100.95.222.7.
 
 rvos — you are on the guest, over its own TCP stack.
@@ -3099,6 +3100,41 @@ whoever moved into the slot. `cat /proc/999/mounts` says it cannot open it.
 stack and the UART, so `cat /proc/4/pagetable` shows the heap page the kernel
 maps at task creation — the one that makes an allocator with no variables of
 its own possible.
+
+
+### The standard port
+
+`telnet 100.95.222.7` with no number after it now reaches the guest, which is
+worth a paragraph because of *where* the difficulty was.
+
+It was never in the guest. The shell has listened on port 23 since the day it
+existed — inside, the numbers are all the standard ones: 7 for echo, 23 for
+telnet, 564 for 9P. The renumbering is entirely on the host, and its cause is
+that a port below 1024 needs a privilege, and giving that privilege to a whole
+emulator so that one of its guest's ports can have a nicer number is a poor
+trade.
+
+Three ways out, and the one taken is the cheapest:
+
+```
+tailscale serve --bg --tcp 23 tcp://100.95.222.7:5556
+```
+
+`tailscaled` already runs as root and already owns the overlay interface, so
+it binds 23 *there* and forwards to the unprivileged port QEMU has. Nothing on
+the host's port policy changes, nothing else on the machine gains a right it
+did not have, and `tailscale serve --tcp 23 off` undoes it. The alternatives —
+`setcap cap_net_bind_service` on the QEMU binary, or lowering
+`net.ipv4.ip_unprivileged_port_start` — both grant something permanent and
+machine-wide to solve something temporary and local.
+
+The Makefile takes the host-side numbers as variables now, so if you do have
+the privilege, `make run TELNETPORT=23` is the whole of it.
+
+None of this changes what is on the other end. **The shell still has no
+authentication of any kind**, and a standard port number is a better-known
+door rather than a stronger one. It is reachable on a private overlay because
+`HOSTIP` says so, and that is the only thing keeping it private.
 
 
 ## Next steps
