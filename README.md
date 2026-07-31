@@ -61,7 +61,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/ipc.c`        | synchronous rendezvous `send`/`recv` |
 | `src/vfs.h`        | **the one interface** + client wrappers |
 | `src/vfs.c`        | the namespace: `mount` and Plan 9 `bind`, longest-prefix routing |
-| `src/srv_fs.c`     | filesystem server — **user mode**, owns the disk |
+| `src/srv_fs.c`     | filesystem server — **user mode**, owns the disk, reads and writes |
 | `src/srv_blk.c`    | **virtio-blk driver** — user mode, in the fs server's task |
 | `src/srv_console.c`| console server — **user mode**, drives the UART itself |
 | `src/srv_proc.c`   | kernel state as files — **user mode**, asks via syscalls |
@@ -364,6 +364,8 @@ $ read the fs server's private data region
     other's control files through a mounted namespace
 32. a virtio-blk driver: the RAM image becomes a disk the filesystem server
     drives itself
+33. writing to it: `create` and `rm`, whole-file rewrites, both FAT copies
+    kept in step, checked with `fsck.fat`
 
 ## Loading a program
 
@@ -1784,9 +1786,77 @@ That was a temporary probe rather than something the system does — `blk_write`
 is there and correct, and nothing calls it yet, because FAT16 writes are their
 own piece of work.
 
-## Next steps
+## Writing to the disk
 
-- FAT16 writes, now that there is something to write to
+The filesystem has been read-only since stage 4. What makes writing different
+from reading is worth stating: a read that goes wrong returns the wrong bytes,
+and a write that goes wrong leaves a volume that no longer describes itself.
+Three structures have to agree — the directory entry, the allocation chain and
+the data — and the FAT is duplicated on the volume precisely because it is the
+one thing nobody can reconstruct. Lose a chain and the data is still there and
+unreachable. So every change to it is made to both copies.
+
+**Whole files, not edits.** A file is read into a buffer and written back from
+one, never modified in place, which matches the read side and removes an
+entire class of bug: there is no partial state to be interrupted in. The cost
+is that a file must fit in the buffer, which is the same 16 KiB limit that has
+always been there.
+
+**Order matters.** A rewrite allocates a fresh chain, writes the bytes, points
+the directory entry at it, and only then frees the old chain. Interrupted
+anywhere, the volume has a stale entry rather than one pointing at clusters
+already handed to something else.
+
+`create` is its own operation rather than a flag on `open`, because `open` has
+no flags and giving it some would mean every server growing an opinion about
+them. A server that cannot create anything answers -1 and nothing else
+changes. Deleting goes through `ioctl`, which is what that call is for.
+
+```
+rvos$ create /A.TXT first file
+rvos$ create /A.TXT overwritten, and shorter
+rvos$ cat /A.TXT
+overwritten, and shorter
+rvos$ rm /B.TXT
+```
+
+### Checked by things that did not write it
+
+The guest's own `cat` proves nothing about a filesystem. Three readers on the
+host do:
+
+```
+$ mtype -i build/fat16.img ::/A.TXT
+overwritten, and shorter
+$ fsck.fat -n build/fat16.img
+build/fat16.img: 13 files, 88/16223 clusters       <- no complaints
+```
+
+`fsck.fat` is the interesting one: it compares the two FAT copies against each
+other and against the directory, and would say so if rvos had updated one and
+not the other, or left a cluster allocated to nothing.
+
+And the raw table, read by hand, for a file large enough to need a chain:
+
+```
+entry: first cluster 83, size 2652
+chain in FAT #1: [83, 85, 86, 87, 88, 89] -> terminator 0xffff
+FAT #2 agrees: True
+```
+
+It skips 84 because 84 was taken: the allocator looks for a free entry, not
+the next one.
+
+### The test that had not been run
+
+Every file written up to that point was under 512 bytes — one cluster — so the
+*links* in a chain had never been written at all. Each file's FAT entry was a
+lone end-of-chain marker. `fsck` approved of them, `mtools` read them back,
+and none of it said anything about the line that joins one cluster to the
+next. The multi-cluster file above exists because that gap was noticed while
+writing this paragraph, not while writing the code.
+
+## Next steps
 - each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
   pointed at a network anybody else is on

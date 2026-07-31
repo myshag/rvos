@@ -202,6 +202,8 @@ static void do_help(void)
               "                     join what is there instead of replacing it\n"
               "  mount [-a|-b] <pfx> <task> put a server behind a name\n"
               "  unmount <name>     take a name back\n"
+              "  create <path> [text...]      make a file and put text in it\n"
+              "  rm <path>          delete a file\n"
               "  import <ip> <port> <prefix>  mount a namespace from another\n"
               "                     machine at <prefix>\n"
               "  net            interface, ARP, connections (/net/status)\n"
@@ -274,6 +276,42 @@ static void session(int slot)
                     puts_conn("mount: no room in the mount table\n");
             } else if (sys_bind(argv[a], argv[a + 1], f) < 0) {
                 puts_conn("bind: no room in the mount table\n");
+            }
+        } else if (streq(argv[0], "create")) {
+            if (argc < 2) {
+                puts_conn("usage: create <path> [text...]\n");
+            } else {
+                char msg[LINEMAX];
+                int k = 0;
+                for (int i = 2; i < argc; i++) {
+                    if (i > 2)
+                        msg[k++] = ' ';
+                    for (const char *q = argv[i]; *q && k < LINEMAX - 2; q++)
+                        msg[k++] = *q;
+                }
+                if (k)
+                    msg[k++] = '\n';
+                int fd = vfs_create(argv[1]);
+                if (fd < 0) {
+                    puts_conn("create: refused\n");
+                } else {
+                    if (k && vfs_write(fd, msg, k) < 0)
+                        puts_conn("create: write refused\n");
+                    vfs_close(fd);
+                }
+            }
+        } else if (streq(argv[0], "rm")) {
+            if (argc < 2) {
+                puts_conn("usage: rm <path>\n");
+            } else {
+                int fd = vfs_open(argv[1]);
+                if (fd < 0) {
+                    puts_conn("rm: no such file\n");
+                } else {
+                    if (vfs_ioctl(fd, IOCTL_REMOVE) < 0)
+                        puts_conn("rm: refused\n");
+                    vfs_close(fd);
+                }
             }
         } else if (streq(argv[0], "import")) {
             /* Two steps and nothing else: start the proxy, and mount it. It

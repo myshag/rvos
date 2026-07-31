@@ -172,7 +172,7 @@ static void from_client(int who, struct vfs_req *r)
     m.fd    = r->fd;
     m.count = r->len;
     m.ioctl = r->ioctl_cmd;
-    if (r->op == VFS_OPEN) {
+    if (r->op == VFS_OPEN || r->op == VFS_CREATE) {
         /* "/r/README.TXT" under a mount at "/r/" is "/README.TXT" over there. */
         const char *q = r->path;
         const char *pp = prefix;

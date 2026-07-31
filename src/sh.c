@@ -132,6 +132,48 @@ void sh_main(void)
             continue;
         }
 
+        if (streq(argv[0], "create")) {
+            if (argc < 2) {
+                uputs("usage: create <path> [text...]\n");
+                continue;
+            }
+            char msg[LINEMAX];
+            int k = 0;
+            for (int i = 2; i < argc; i++) {
+                if (i > 2)
+                    msg[k++] = ' ';
+                for (const char *q = argv[i]; *q && k < LINEMAX - 2; q++)
+                    msg[k++] = *q;
+            }
+            if (k)
+                msg[k++] = '\n';
+            int fd = vfs_create(argv[1]);
+            if (fd < 0) {
+                uputs("create: refused\n");
+                continue;
+            }
+            if (k && vfs_write(fd, msg, k) < 0)
+                uputs("create: write refused\n");
+            vfs_close(fd);
+            continue;
+        }
+
+        if (streq(argv[0], "rm")) {
+            if (argc < 2) {
+                uputs("usage: rm <path>\n");
+                continue;
+            }
+            int fd = vfs_open(argv[1]);
+            if (fd < 0) {
+                uputs("rm: no such file\n");
+                continue;
+            }
+            if (vfs_ioctl(fd, IOCTL_REMOVE) < 0)
+                uputs("rm: refused\n");
+            vfs_close(fd);
+            continue;
+        }
+
         /* Text to a file, which is how a control file is spoken to. Not a
            redirection — there are no pipes here — just the write a program
            would do, available from the prompt. */

@@ -15,11 +15,16 @@
    module (a pipe, a socket, /proc) never touches the kernel — it's just
    another task answering vfs_req, bound into the namespace at runtime. */
 
-enum { VFS_OPEN = 1, VFS_READ, VFS_WRITE, VFS_IOCTL, VFS_CLOSE };
+enum { VFS_OPEN = 1, VFS_READ, VFS_WRITE, VFS_IOCTL, VFS_CLOSE, VFS_CREATE };
+
+/* create is its own operation rather than a flag on open, and the reason is
+   that open has no flags and giving it some would mean every server growing
+   an opinion about them. A server that cannot create anything answers -1 to
+   this and nothing else changes. */
 
 /* Generic ioctls. IOCTL_GETSIZE reports a file's size without slurping its
    bytes. New commands plug in here without changing the transport. */
-enum { IOCTL_GETSIZE = 1 };   /* answer comes back in `result` */
+enum { IOCTL_GETSIZE = 1, IOCTL_REMOVE };  /* answer in `result` */
 
 #define VFS_PATH_MAX 32
 #define VFS_DATA_MAX 512
@@ -123,6 +128,21 @@ static inline int vfs_open_at(int srv, const char *real)
    With a union there is a third: *which* of them has it. The search is here,
    in the client, rather than in the kernel, because only an open can answer
    it — the kernel holds the table but not the files. */
+/* Open, or make an empty one. Same shape as open — the op is the difference. */
+static inline int vfs_create(const char *path)
+{
+    char real[VFS_PATH_MAX];
+    int srv = sys_resolve(path, real, (int)sizeof(real), 0);
+    if (srv < 0)
+        return -1;
+    struct vfs_req r;
+    r.op = VFS_CREATE;
+    vfs__scpy(r.path, real);
+    if (vfs_call(srv, &r) < 0)
+        return -1;
+    return (srv << 16) | (r.result & 0xffff);
+}
+
 static inline int vfs_open(const char *path)
 {
     char real[VFS_PATH_MAX];

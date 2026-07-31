@@ -127,9 +127,10 @@ static void serve(struct fs_msg *m)
     m->result = -1;
 
     switch (m->op) {
-    case VFS_OPEN: {
+    case VFS_OPEN:
+    case VFS_CREATE: {
         m->path[m->pathlen < VFS_PATH_MAX ? m->pathlen : VFS_PATH_MAX - 1] = 0;
-        int fd = vfs_open(m->path);
+        int fd = m->op == VFS_CREATE ? vfs_create(m->path) : vfs_open(m->path);
         if (fd < 0)
             break;
         int h = tab_alloc(fd);
