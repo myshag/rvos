@@ -33,8 +33,10 @@ static struct fs_file fs_tab[FS_MAXFD];
    and which directory it is has stopped being interesting to this file. */
 static int fs_format_dir(const char *path, char *out, int cap)
 {
-    struct dirent ents[24];
-    int n = fat16_list(path, ents, 24);
+    /* Static, not on the stack: a long name is 96 bytes and two dozen of them
+       is more than a task's stack wants to carry. */
+    static struct dirent ents[32];
+    int n = fat16_list(path, ents, 32);
     if (n < 0)
         return -1;
     int o = 0;

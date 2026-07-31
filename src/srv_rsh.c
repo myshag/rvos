@@ -213,6 +213,9 @@ static int readline(char *out, int cap)
     }
 }
 
+/* Words, with quotes — which stopped being optional the moment a file could
+   be called "a rather long file name.txt". Only double quotes, and no escape
+   inside them: enough to name a file, and not the beginning of a language. */
 static int split(char *s, char **out, int max)
 {
     int n = 0;
@@ -221,9 +224,18 @@ static int split(char *s, char **out, int max)
             *s++ = 0;
         if (!*s)
             break;
-        out[n++] = s;
-        while (*s && *s != ' ')
-            s++;
+        if (*s == '"') {
+            *s++ = 0;
+            out[n++] = s;
+            while (*s && *s != '"')
+                s++;
+            if (*s)
+                *s++ = 0;
+        } else {
+            out[n++] = s;
+            while (*s && *s != ' ')
+                s++;
+        }
     }
     return n;
 }

@@ -373,6 +373,8 @@ $ read the fs server's private data region
 35. the commands leave the shell and become programs in `/BIN`, which needs
     `wait` first
 36. enough of the telnet protocol to be talked to by `telnet`
+37. VFAT long names: UTF-16 on disk, UTF-8 in the system, and quotes in the
+    shells because a file can have a space in it now
 
 ## Loading a program
 
@@ -2092,6 +2094,98 @@ make run HOSTIP=0.0.0.0           # everybody, and you mean it
 
 The right answer for wanting it reachable is authentication, which this still
 does not have.
+
+## Long names
+
+An 8.3 name is eleven bytes of an alphabet chosen in 1981. `ПРИВЕТ.TXT` came
+out of it as `ПРИВ.TXT` — truncated at eight *bytes*, which is four Cyrillic
+letters — and the host, decoding those bytes as a code page, showed
+`ðƒðáðÿðÆ`.
+
+A long name is stored beside the short one, in the entries *immediately
+before* it, marked with attribute `0x0F`: read-only, hidden, system and volume
+label at once, a combination no real file has and that every driver written
+before 1996 already skipped. That is the whole trick. The extension is
+invisible to code that does not know about it, which is why the format could
+grow one without becoming a different format.
+
+Three details are easy to get wrong and all three are load-bearing:
+
+- **the entries are stored in reverse.** The one flagged `0x40` comes first on
+  disk and carries the *last* thirteen characters of the name;
+- **a checksum of the eleven-byte short name is repeated in every long
+  entry.** An old driver that renames a file the old way leaves a chain that
+  no longer matches, and it is then correctly ignored rather than believed;
+- **unused character slots after the terminator are `0xFFFF`**, not zero.
+
+Anything above the basic plane is a surrogate pair, which is how a format
+built around UCS-2 carries a code point invented after it.
+
+```
+rvos$ cp /README.TXT "/копия с кириллицей и emoji 🚀.txt"
+rvos$ ls
+a rather long file name.txt  (35 bytes)
+копия с кириллицей и emoji 🚀.txt  (35 bytes)
+```
+
+Short names are still generated, because every reader expects one, but they
+are *derived*: the printable ASCII of the long name, upper-cased, cut to six,
+then `~1`, `~2` … until unique. A name with nothing ASCII in it becomes
+underscores, so two Cyrillic names are told apart only by the tail —
+`______~1` and `______~2`, which is honest about what the old alphabet can
+hold. A name that fits 8.3 exactly gets no long entries at all, so a volume of
+ordinary names looks exactly as it did before this stage.
+
+Directories are walked a *slot* at a time now — entry `i` is at sector
+`i/16`, offset `(i%16)*32` — which makes every scan, lookup and allocation
+linear instead of a nest of sector loops. One cached sector is what keeps that
+from costing sixteen reads per sector.
+
+Two things had to move out of the way. `VFS_PATH_MAX` was 32, and
+`/DOCS/длинное имя.txt` is 40 bytes before it starts; it is 128 now. And both
+shells learned quotes, which stopped being optional the moment a file could be
+called `a rather long file name.txt`.
+
+### Checked against an implementation that is not this one
+
+`mtools` has its own LFN code, and the test is that each side reads what the
+other wrote:
+
+```
+$ mcopy -i build/fat16.img f "::/a rather long file name.txt"
+rvos$ cat "/a rather long file name.txt"
+written by mtools with a long name
+
+rvos$ cp /README.TXT "/только кириллица без эмодзи.txt"
+$ mtype -i build/fat16.img "::/только кириллица без эмодзи.txt"
+rvos readme
+$ fsck.fat -n build/fat16.img
+build/fat16.img: 23 files, 197/16223 clusters
+```
+
+and the chain itself, read out of the image by hand:
+
+```
+LFN seq=3 LAST sum=48 " 🚀.txt"
+LFN seq=2      sum=48 "лицей и emoji"
+LFN seq=1      sum=48 "копия с кирил"
+SFN b'______~1TXT'  sum=48 size=35
+```
+
+Reverse order, one checksum through all four entries, and the surrogate pair
+intact. `mtools` shows that name as `копия с кириллицей и emoji __.txt` and
+cannot open it by name — it converts to the local code page, where U+1F680
+does not exist. That is mtools' display, not the disk: the raw dump above
+decodes the pair correctly.
+
+### What it does not do
+
+A directory does not grow. Long names take several entries each, so a
+directory fills sooner than it used to, and when it is full a create fails
+rather than allocating another cluster for it. Names are held to 96 bytes of
+UTF-8, and one longer is refused rather than quietly shortened. Case folding
+is ASCII-only, which is exactly what a FAT volume promises: `Файл.txt` and
+`файл.txt` are two names.
 
 ## Next steps
 - each driver mapped only its own virtio slot, which needs a device tree

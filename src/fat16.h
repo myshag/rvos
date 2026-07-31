@@ -10,8 +10,13 @@
    directory in FAT16 — it is a fixed run of sectors with no chain and no
    entry describing it — and that difference is confined to one function. */
 
+/* Long enough for a name a person would write, and short enough that a
+   listing of one fits in a message. A name longer than this is refused
+   rather than silently shortened. */
+#define FAT_NAME_MAX 96
+
 struct dirent {
-    char   name[13];    /* 8.3, null-terminated */
+    char   name[FAT_NAME_MAX];  /* UTF-8, null-terminated */
     uint32 size;
     int    is_dir;
 };

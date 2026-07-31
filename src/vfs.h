@@ -26,7 +26,9 @@ enum { VFS_OPEN = 1, VFS_READ, VFS_WRITE, VFS_IOCTL, VFS_CLOSE, VFS_CREATE };
    bytes. New commands plug in here without changing the transport. */
 enum { IOCTL_GETSIZE = 1, IOCTL_REMOVE, IOCTL_MKDIR };  /* answer in `result` */
 
-#define VFS_PATH_MAX 32
+/* Long names need somewhere to fit. 32 was enough while every name was 8.3;
+   a path like /DOCS/длинное имя.txt is 40 bytes of UTF-8 before it starts. */
+#define VFS_PATH_MAX 128
 #define VFS_DATA_MAX 512
 
 /* The whole request travels by value. It used to carry a `void *buf` into
