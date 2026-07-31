@@ -24,15 +24,19 @@ struct fs_file {
     uint32 size;
     uint32 pos;
     int    dirty;               /* written to, and not yet on the disk */
-    char   name[16];            /* what to write it back as */
+    char   name[VFS_PATH_MAX];  /* what to write it back as */
     char   data[FS_BUFSZ];
 };
 static struct fs_file fs_tab[FS_MAXFD];
 
-static int fs_format_root(char *out, int cap)
+/* Any directory, not just the root: a listing is what read() returns for one,
+   and which directory it is has stopped being interesting to this file. */
+static int fs_format_dir(const char *path, char *out, int cap)
 {
-    struct dirent ents[16];
-    int n = fat16_list_root(ents, 16);
+    struct dirent ents[24];
+    int n = fat16_list(path, ents, 24);
+    if (n < 0)
+        return -1;
     int o = 0;
     for (int i = 0; i < n && o < cap - 40; i++) {
         int l = (int)ustrlen(ents[i].name);
@@ -59,12 +63,12 @@ static int fs_alloc(void)
 }
 
 /* The 8.3 name, without the leading slash the namespace uses. */
+/* The whole path, since the driver walks it. */
 static void fs_keep_name(struct fs_file *f, const char *path)
 {
-    const char *p = path + (path[0] == '/' ? 1 : 0);
     int i = 0;
-    while (p[i] && i < 15) {
-        f->name[i] = p[i];
+    while (path[i] && i < (int)sizeof(f->name) - 1) {
+        f->name[i] = path[i];
         i++;
     }
     f->name[i] = 0;
@@ -76,15 +80,14 @@ static void fs_do_open(struct vfs_req *r, int create)
     if (fd < 0) { r->result = -1; return; }
     struct fs_file *f = &fs_tab[fd];
 
+    /* A directory answers read() with its listing and a file with its bytes,
+       and the only way to tell them apart is to ask. Listing first: a name
+       that is a directory is never also a file. */
     int n;
-    if (r->path[0] == '/' && r->path[1] == 0) {
-        if (create) { r->result = -1; return; }     /* not a file */
-        n = fs_format_root(f->data, FS_BUFSZ);
-    } else if (create) {
+    if (create)
         n = 0;                                      /* a new, empty file */
-    } else {
-        n = fat16_read(r->path + (r->path[0] == '/' ? 1 : 0), f->data, FS_BUFSZ);
-    }
+    else if ((n = fs_format_dir(r->path, f->data, FS_BUFSZ)) < 0)
+        n = fat16_read(r->path, f->data, FS_BUFSZ);
 
     if (n < 0) { r->result = -1; return; }
     f->used  = 1;
@@ -170,7 +173,11 @@ void fs_server(void)
         case VFS_CREATE: fs_do_open(r, 1); break;
         case VFS_READ:  fs_do_read(r);  break;
         case VFS_IOCTL:
-            if (r->ioctl_cmd == IOCTL_REMOVE) {
+            if (r->ioctl_cmd == IOCTL_MKDIR) {
+                /* On the path, not on the descriptor: there is nothing to
+                   open yet. The fd is ignored and the path carries it. */
+                r->result = fat16_mkdir(r->path);
+            } else if (r->ioctl_cmd == IOCTL_REMOVE) {
                 if (r->fd >= 0 && r->fd < FS_MAXFD && fs_tab[r->fd].used) {
                     struct fs_file *f = &fs_tab[r->fd];
                     f->dirty = 0;               /* do not write back what we

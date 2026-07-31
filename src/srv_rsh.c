@@ -203,7 +203,8 @@ static void do_help(void)
               "  mount [-a|-b] <pfx> <task> put a server behind a name\n"
               "  unmount <name>     take a name back\n"
               "  create <path> [text...]      make a file and put text in it\n"
-              "  rm <path>          delete a file\n"
+              "  mkdir <path>       make a directory\n"
+              "  rm <path>          delete a file or an empty directory\n"
               "  import <ip> <port> <prefix>  mount a namespace from another\n"
               "                     machine at <prefix>\n"
               "  net            interface, ARP, connections (/net/status)\n"
@@ -300,6 +301,11 @@ static void session(int slot)
                     vfs_close(fd);
                 }
             }
+        } else if (streq(argv[0], "mkdir")) {
+            if (argc < 2)
+                puts_conn("usage: mkdir <path>\n");
+            else if (vfs_ioctl_path(argv[1], IOCTL_MKDIR) < 0)
+                puts_conn("mkdir: refused\n");
         } else if (streq(argv[0], "rm")) {
             if (argc < 2) {
                 puts_conn("usage: rm <path>\n");

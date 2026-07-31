@@ -158,6 +158,14 @@ void sh_main(void)
             continue;
         }
 
+        if (streq(argv[0], "mkdir")) {
+            if (argc < 2)
+                uputs("usage: mkdir <path>\n");
+            else if (vfs_ioctl_path(argv[1], IOCTL_MKDIR) < 0)
+                uputs("mkdir: refused\n");
+            continue;
+        }
+
         if (streq(argv[0], "rm")) {
             if (argc < 2) {
                 uputs("usage: rm <path>\n");

@@ -66,7 +66,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/srv_console.c`| console server — **user mode**, drives the UART itself |
 | `src/srv_proc.c`   | kernel state as files — **user mode**, asks via syscalls |
 | `src/srv_null.c`   | the bit bucket — **user mode** |
-| `src/fat16.c`      | read-only FAT16 over a RAM-backed block device |
+| `src/fat16.c`      | FAT16: paths, directories, reading and writing |
 | `src/uart.c`       | NS16550 driver + tiny `kprintf` |
 | `src/ulib.c`       | the user side's own libc (kernel's is unreachable) |
 | `src/user.c`       | user-mode demo programs |
@@ -366,6 +366,8 @@ $ read the fs server's private data region
     drives itself
 33. writing to it: `create` and `rm`, whole-file rewrites, both FAT copies
     kept in step, checked with `fsck.fat`
+34. directories: walking a path, listing any of them, `mkdir`, and the root
+    that is not one
 
 ## Loading a program
 
@@ -1856,6 +1858,86 @@ and none of it said anything about the line that joins one cluster to the
 next. The multi-cluster file above exists because that gap was noticed while
 writing this paragraph, not while writing the code.
 
+## Directories
+
+The filesystem has seen only the root since stage 4. FAT16 has one structural
+oddity that makes adding the rest more interesting than it sounds: **the root
+directory is not a directory**. Every other one is an ordinary file — a
+cluster chain whose contents happen to be 32-byte entries — but the root is a
+fixed run of sectors outside the data area, with no chain and no entry
+anywhere describing it.
+
+So the driver is written against one function, "the n-th sector of a
+directory", where a first cluster of 0 means the root. That is the only place
+the difference is known, and every walk, listing, lookup and allocation is
+written once rather than twice:
+
+```c
+static int dir_sector(uint16 dir, uint32 n, uint32 *lba)
+{
+    if (dir == 0) { ... fs.root_start + n ... }      /* not a chain */
+    ... follow the chain n / sec_per_clus links ...
+}
+```
+
+Walking a path is then what it should be: each interior component must exist
+and be a directory, and a file cannot be walked through. `/DOCS` and `/DOCS/`
+name the same thing.
+
+A directory answers `read()` with its listing and a file with its bytes, and
+the only way to tell which a name is, is to ask. The server tries the listing
+first — a name that is a directory is never also a file.
+
+```
+rvos$ cat /DOCS
+./
+../
+NOTE.TXT  (23 bytes)
+rvos$ cat /DOCS/NOTE.TXT
+a nested note in /DOCS
+```
+
+`.` and `..` are shown rather than hidden. They are what is on the disk.
+
+**Making one.** A directory is a file whose contents are entries and which
+begins by describing itself and its parent. The parent of a directory in the
+root is written as cluster **0** — the root has no entry anywhere for `..` to
+point at, and this is the same 0-means-root that `dir_sector` uses. Read out
+of the image afterwards:
+
+```
+SUB at cluster 82
+  entry 0: b'.          ' attr 0x10 first 82
+  entry 1: b'..         ' attr 0x10 first 0
+```
+
+Removing one requires it to be empty, and empty means nothing besides those
+two entries.
+
+### Checked in both directions
+
+The test worth having is not that rvos can read its own work. It is that rvos
+wrote into a directory **mtools** created, and mtools read a directory **rvos**
+created:
+
+```
+rvos$ mkdir /SUB
+rvos$ create /SUB/DEEP.TXT written into a directory rvos made
+rvos$ create /DOCS/EXTRA.TXT added to a directory mkdisk made
+```
+```
+$ mdir -i build/fat16.img ::/SUB
+.            <DIR>     1980-01-01
+..           <DIR>     1980-01-01
+DEEP     TXT        35 1980-01-01
+$ mtype -i build/fat16.img ::/DOCS/EXTRA.TXT
+added to a directory mkdisk made
+$ fsck.fat -n build/fat16.img
+build/fat16.img: 13 files, 83/16223 clusters      <- no complaints
+```
+
+and after deleting them again, `fsck` counts the clusters back down.
+
 ## Next steps
 - each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
@@ -1875,7 +1957,6 @@ writing this paragraph, not while writing the code.
   everything after it
 - capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
-- subdirectory traversal in the filesystem
 - run under OpenSBI in supervisor mode
 
 ## License

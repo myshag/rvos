@@ -24,7 +24,7 @@ enum { VFS_OPEN = 1, VFS_READ, VFS_WRITE, VFS_IOCTL, VFS_CLOSE, VFS_CREATE };
 
 /* Generic ioctls. IOCTL_GETSIZE reports a file's size without slurping its
    bytes. New commands plug in here without changing the transport. */
-enum { IOCTL_GETSIZE = 1, IOCTL_REMOVE };  /* answer in `result` */
+enum { IOCTL_GETSIZE = 1, IOCTL_REMOVE, IOCTL_MKDIR };  /* answer in `result` */
 
 #define VFS_PATH_MAX 32
 #define VFS_DATA_MAX 512
@@ -235,6 +235,22 @@ static inline void vfs_say(const char *s)
         }
         off += k;
     }
+}
+
+/* An ioctl about a *name* rather than an open file: there is nothing to open
+   when the thing does not exist yet. */
+static inline int vfs_ioctl_path(const char *path, unsigned long cmd)
+{
+    char real[VFS_PATH_MAX];
+    int srv = sys_resolve(path, real, (int)sizeof(real), 0);
+    if (srv < 0)
+        return -1;
+    struct vfs_req r;
+    r.op = VFS_IOCTL;
+    r.fd = -1;
+    r.ioctl_cmd = cmd;
+    vfs__scpy(r.path, real);
+    return vfs_call(srv, &r);
 }
 
 static inline int vfs_close(int fd)

@@ -1,9 +1,15 @@
-/* fat16.c — minimal read-only FAT16. Parses the BPB, walks the root directory
-   and follows cluster chains through the FAT. Block device is a flat region of
+/* fat16.c — a small FAT16, read and write, with directories. Block device is a flat region of
    a real disk, one sector at a time, through the virtio-blk driver next to it
    in the same task. It used to be a memcpy from a window of guest RAM that
    QEMU had filled with the image; the shape of the code barely changed, which
-   is the whole argument for having had a blk_read() at all. */
+   is the whole argument for having had a blk_read() at all.
+
+   The one structural oddity of FAT16 is that the root directory is not a
+   directory. Every other one is an ordinary file — a cluster chain whose
+   contents happen to be 32-byte entries — but the root is a fixed run of
+   sectors outside the data area, with no chain and no entry describing it.
+   Everything below is written against "the n-th sector of a directory", which
+   is the one place that difference has to be known, and nowhere else. */
 #include "fat16.h"
 #include "blk.h"
 #include "ulib.h"
@@ -111,13 +117,158 @@ static int usable_entry(const uint8 *d)
     return 1;
 }
 
-int fat16_list_root(struct dirent *out, int max)
+
+/* ---- directories --------------------------------------------------------
+   `dir` is a first cluster, and 0 means the root — a number no real directory
+   can have, since clusters 0 and 1 are reserved by the format. */
+
+static int dir_sector(uint16 dir, uint32 n, uint32 *lba)
 {
-    if (!fs.ok) return -1;
-    int n = 0;
-    for (uint32 s = 0; s < fs.root_sectors && n < max; s++) {
+    if (dir == 0) {
+        if (n >= fs.root_sectors)
+            return -1;
+        *lba = fs.root_start + n;
+        return 0;
+    }
+    uint32 per = fs.sec_per_clus;
+    uint16 c = dir;
+    for (uint32 skip = n / per; skip; skip--) {
+        c = fat_next(c);
+        if (c < 2 || c >= 0xFFF8)
+            return -1;                  /* past the end of the chain */
+    }
+    *lba = fs.data_start + (uint32)(c - 2) * per + (n % per);
+    return 0;
+}
+
+/* Find an entry by its on-disk 11-byte name. Also reports the first slot that
+   could hold a new one, so a caller that means to create something does not
+   have to walk the directory twice. */
+static int dir_find(uint16 dir, const char *want11, uint32 *sec_out,
+                    int *off_out, int *existing)
+{
+    uint32 free_sec = 0;
+    int    free_off = -1;
+    uint32 lba;
+
+    for (uint32 n = 0; dir_sector(dir, n, &lba) == 0; n++) {
         uint8 buf[SECSZ];
-        blk_read(fs.root_start + s, buf);
+        if (blk_read(lba, buf) < 0)
+            return -1;
+        for (int e = 0; e < SECSZ; e += 32) {
+            uint8 *d = buf + e;
+            if (d[0] == 0x00 || d[0] == 0xE5) {
+                if (free_off < 0) {
+                    free_sec = lba;
+                    free_off = e;
+                }
+                if (d[0] == 0x00)
+                    goto done;          /* nothing beyond here is in use */
+                continue;
+            }
+            if (d[11] == 0x0F || (d[11] & 0x08))
+                continue;               /* long-name fragment, or the label */
+            if (umemcmp(d, want11, 11) == 0) {
+                if (sec_out) *sec_out = lba;
+                if (off_out) *off_out = e;
+                if (existing) *existing = 1;
+                return 0;
+            }
+        }
+    }
+done:
+    if (!existing)
+        return -1;                      /* the caller only wanted a match */
+    if (free_off < 0)
+        return -1;                      /* full, and no room to grow it */
+    if (sec_out) *sec_out = free_sec;
+    if (off_out) *off_out = free_off;
+    *existing = 0;
+    return 0;
+}
+
+/* Walk a path down to the directory that should contain its last component.
+   "/DOCS/NOTE.TXT" leaves `dir` at DOCS and `leaf` as NOTE.TXT; "/DOCS/" and
+   "/DOCS" leave `dir` at DOCS with no leaf at all, which is how a caller
+   learns it was handed a directory rather than a file. */
+static int resolve(const char *path, uint16 *dir, char leaf[11], int *has_leaf)
+{
+    if (!fs.ok)
+        return -1;
+    *dir = 0;
+    *has_leaf = 0;
+
+    const char *p = path;
+    while (*p == '/')
+        p++;
+
+    while (*p) {
+        char comp[64];
+        int n = 0;
+        while (*p && *p != '/' && n < 63)
+            comp[n++] = *p++;
+        comp[n] = 0;
+        while (*p == '/')
+            p++;
+
+        if (!*p) {                      /* the last component */
+            to_83(comp, leaf);
+            *has_leaf = 1;
+            return 0;
+        }
+
+        /* An interior component has to be a directory that exists. */
+        char want[11];
+        to_83(comp, want);
+        uint32 sec;
+        int off;
+        if (dir_find(*dir, want, &sec, &off, 0) < 0)
+            return -1;
+        uint8 buf[SECSZ];
+        if (blk_read(sec, buf) < 0)
+            return -1;
+        if (!(buf[off + 11] & 0x10))
+            return -1;                  /* a file cannot be walked through */
+        *dir = rd16(buf + off + 26);
+    }
+    return 0;                           /* the path named a directory */
+}
+
+/* If the leaf names a directory, hand back its cluster: that is what makes
+   "/DOCS" and "/DOCS/" the same thing. */
+static int as_dir(const char *path, uint16 *dir)
+{
+    char leaf[11];
+    int  has_leaf;
+    if (resolve(path, dir, leaf, &has_leaf) < 0)
+        return -1;
+    if (!has_leaf)
+        return 0;                       /* already a directory */
+    uint32 sec;
+    int off;
+    if (dir_find(*dir, leaf, &sec, &off, 0) < 0)
+        return -1;
+    uint8 buf[SECSZ];
+    if (blk_read(sec, buf) < 0)
+        return -1;
+    if (!(buf[off + 11] & 0x10))
+        return -1;                      /* it is a file */
+    *dir = rd16(buf + off + 26);
+    return 0;
+}
+
+int fat16_list(const char *path, struct dirent *out, int max)
+{
+    uint16 dir;
+    if (as_dir(path, &dir) < 0)
+        return -1;
+
+    int n = 0;
+    uint32 lba;
+    for (uint32 i = 0; dir_sector(dir, i, &lba) == 0 && n < max; i++) {
+        uint8 buf[SECSZ];
+        if (blk_read(lba, buf) < 0)
+            return n;
         for (int e = 0; e < SECSZ && n < max; e += 32) {
             uint8 *d = buf + e;
             if (d[0] == 0x00)
@@ -133,75 +284,66 @@ int fat16_list_root(struct dirent *out, int max)
     return n;
 }
 
-int fat16_read(const char *name, void *out, int maxlen)
+int fat16_read(const char *path, void *out, int maxlen)
 {
-    if (!fs.ok) return -1;
-    char want[11];
-    to_83(name, want);
+    uint16 dir;
+    char   leaf[11];
+    int    has_leaf;
+    if (resolve(path, &dir, leaf, &has_leaf) < 0 || !has_leaf)
+        return -1;
 
-    for (uint32 s = 0; s < fs.root_sectors; s++) {
-        uint8 buf[SECSZ];
-        blk_read(fs.root_start + s, buf);
-        for (int e = 0; e < SECSZ; e += 32) {
-            uint8 *d = buf + e;
-            if (d[0] == 0x00)
-                return -1;
-            if (!usable_entry(d) || (d[11] & 0x10))
-                continue;                          /* skip dirs */
-            if (umemcmp(d, want, 11) != 0)
-                continue;
+    uint32 sec;
+    int    off;
+    if (dir_find(dir, leaf, &sec, &off, 0) < 0)
+        return -1;
+    uint8 dbuf[SECSZ];
+    if (blk_read(sec, dbuf) < 0)
+        return -1;
+    uint8 *d = dbuf + off;
+    if (d[11] & 0x10)
+        return -1;                      /* a directory is not read this way */
 
-            uint32 size = rd32(d + 28);
-            uint16 clus = rd16(d + 26);
-            /* A file that does not fit is an error, not a short answer. This
-               used to hand back whatever fitted and say nothing, so a caller
-               got a truncated file it had no way to recognise as truncated —
-               which is exactly what happened to a program one byte over the
-               limit: it loaded, and only a bounds check in the ELF loader
-               stopped it from running as garbage. */
-            if (size > (uint32)maxlen)
-                return -1;
-            int cap = (int)size;
-            int got = 0;
-            while (clus >= 2 && clus < 0xFFF8 && got < cap) {
-                uint32 base = fs.data_start + (uint32)(clus - 2) * fs.sec_per_clus;
-                for (int sc = 0; sc < fs.sec_per_clus && got < cap; sc++) {
-                    uint8 cb[SECSZ];
-                    blk_read(base + sc, cb);
-                    int chunk = SECSZ;
-                    if (chunk > cap - got)
-                        chunk = cap - got;
-                    umemcpy((uint8 *)out + got, cb, chunk);
-                    got += chunk;
-                }
-                clus = fat_next(clus);
-            }
-            return got;
+    uint32 size = rd32(d + 28);
+    uint16 clus = rd16(d + 26);
+    /* A file that does not fit is an error, not a short answer. This used to
+       hand back whatever fitted and say nothing, so a caller got a truncated
+       file it had no way to recognise as truncated. */
+    if (size > (uint32)maxlen)
+        return -1;
+
+    int cap = (int)size, got = 0;
+    while (clus >= 2 && clus < 0xFFF8 && got < cap) {
+        uint32 base = fs.data_start + (uint32)(clus - 2) * fs.sec_per_clus;
+        for (uint32 sc = 0; sc < fs.sec_per_clus && got < cap; sc++) {
+            uint8 cb[SECSZ];
+            if (blk_read(base + sc, cb) < 0)
+                return got;
+            int chunk = SECSZ;
+            if (chunk > cap - got)
+                chunk = cap - got;
+            umemcpy((uint8 *)out + got, cb, chunk);
+            got += chunk;
         }
+        clus = fat_next(clus);
     }
-    return -1;
+    return got;
 }
 
 /* ---- writing ------------------------------------------------------------
-   Everything above reads. What follows is the other half, and it is worth
-   saying what makes writing a filesystem different from reading one: a read
-   that goes wrong returns the wrong bytes, and a write that goes wrong leaves
-   a volume that no longer describes itself. Three structures have to agree —
+   What makes writing a filesystem different from reading one: a read that
+   goes wrong returns the wrong bytes, and a write that goes wrong leaves a
+   volume that no longer describes itself. Three structures have to agree —
    the directory entry, the allocation chain, and the data — and the FAT is
    duplicated on the volume precisely because it is the one nobody can
    reconstruct. So every change to it is made to both copies.
 
    The model is whole-file, matching the read side: a file is replaced, not
-   edited in place. That is a real limit (a file must fit in the caller's
-   buffer) and it buys the absence of an entire class of bug, since there is
-   no partial state to be interrupted in. */
+   edited in place. That is a real limit and it buys the absence of an entire
+   class of bug, since there is no partial state to be interrupted in. */
 
 #define FAT_FREE  0x0000
 #define FAT_EOC   0xFFFF
 
-/* Both copies, always. A FAT16 volume carries two, and the reason is that
-   this is the only structure on it that cannot be reconstructed from what is
-   left: lose the chain and the data is still there but unreachable. */
 static void fat_set(uint16 clus, uint16 val)
 {
     uint32 off = (uint32)clus * 2;
@@ -215,16 +357,9 @@ static void fat_set(uint16 clus, uint16 val)
     }
 }
 
-static uint32 fat_entries(void)
-{
-    return fs.sec_per_fat * SECSZ / 2;
-}
-
-/* The first free cluster at or after `from`. Cluster 0 and 1 are reserved by
-   the format and are not candidates. */
 static uint16 fat_alloc_from(uint16 from)
 {
-    uint32 n = fat_entries();
+    uint32 n = fs.sec_per_fat * SECSZ / 2;
     for (uint32 c = from < 2 ? 2 : from; c < n; c++) {
         uint32 off = c * 2;
         uint8  buf[SECSZ];
@@ -245,70 +380,43 @@ static void fat_free_chain(uint16 clus)
     }
 }
 
-/* Find a directory entry by name, or the first slot that can hold a new one.
-   Returns the sector and offset, and whether it was a match or a free slot. */
-static int dir_slot(const char *want11, uint32 *sec_out, int *off_out,
-                    int *existing)
-{
-    uint32 free_sec = 0;
-    int    free_off = -1;
+/* There is no clock this filesystem trusts, so every file gets the same date
+   — but it has to be a *valid* one. Zeroes decode as day zero of month zero,
+   and a tool reading the volume shows 1980-00-00, which is not "no date" but
+   a wrong one. 0x0021 is 1980-01-01, the epoch of the format itself. */
+#define FAT_EPOCH 0x0021
 
-    for (uint32 s = 0; s < fs.root_sectors; s++) {
-        uint8 buf[SECSZ];
-        if (blk_read(fs.root_start + s, buf) < 0)
-            return -1;
-        for (int e = 0; e < SECSZ; e += 32) {
-            uint8 *d = buf + e;
-            if (d[0] == 0x00 || d[0] == 0xE5) {
-                if (free_off < 0) {
-                    free_sec = fs.root_start + s;
-                    free_off = e;
-                }
-                if (d[0] == 0x00)
-                    goto done;          /* nothing beyond here is in use */
-                continue;
-            }
-            if (d[11] == 0x0F || (d[11] & 0x08))
-                continue;               /* long-name fragment, or the label */
-            if (umemcmp(d, want11, 11) == 0) {
-                *sec_out  = fs.root_start + s;
-                *off_out  = e;
-                *existing = 1;
-                return 0;
-            }
-        }
-    }
-done:
-    if (free_off < 0)
-        return -1;                      /* the root directory is full */
-    *sec_out  = free_sec;
-    *off_out  = free_off;
-    *existing = 0;
-    return 0;
+static void set_entry(uint8 *d, const char *name11, uint8 attr,
+                      uint16 first, uint32 size)
+{
+    umemcpy(d, name11, 11);
+    d[11] = attr;
+    for (int i = 12; i < 26; i++)
+        d[i] = 0;
+    wr16(d + 16, FAT_EPOCH);            /* created */
+    wr16(d + 18, FAT_EPOCH);            /* last accessed */
+    wr16(d + 24, FAT_EPOCH);            /* last written */
+    wr16(d + 26, first);
+    wr32(d + 28, size);
 }
 
-/* Replace a file: allocate a fresh chain, write the bytes, then point the
-   directory entry at it and free the old chain. In that order, so that a
-   volume interrupted in the middle has a stale entry rather than one that
-   points at clusters already handed to something else. */
-int fat16_write(const char *name, const void *buf, int len)
+int fat16_write(const char *path, const void *buf, int len)
 {
-    if (!fs.ok || len < 0)
+    uint16 dir;
+    char   leaf[11];
+    int    has_leaf;
+    if (len < 0 || resolve(path, &dir, leaf, &has_leaf) < 0 || !has_leaf)
         return -1;
-
-    char want[11];
-    to_83(name, want);
 
     uint32 sec;
     int    off, existing;
-    if (dir_slot(want, &sec, &off, &existing) < 0)
+    if (dir_find(dir, leaf, &sec, &off, &existing) < 0)
         return -1;
 
     uint32 clus_size = (uint32)fs.sec_per_clus * SECSZ;
     uint32 need = ((uint32)len + clus_size - 1) / clus_size;
 
-    uint16 first = 0, prev = 0;
-    uint16 search = 2;
+    uint16 first = 0, prev = 0, search = 2;
     const uint8 *p = buf;
     uint32 done_bytes = 0;
 
@@ -353,54 +461,125 @@ int fat16_write(const char *name, const void *buf, int len)
         return -1;
     }
     uint8 *d = dbuf + off;
+    if (existing && (d[11] & 0x10)) {   /* refuse to overwrite a directory */
+        fat_free_chain(first);
+        return -1;
+    }
     uint16 old = existing ? rd16(d + 26) : 0;
-    uint32 oldsz = existing ? rd32(d + 28) : 0;
-    (void)oldsz;
 
-    umemcpy(d, want, 11);
-    d[11] = 0x20;                       /* an ordinary file */
-    for (int i = 12; i < 26; i++)
-        d[i] = 0;
-    /* There is no clock this filesystem trusts, so every file gets the same
-       date — but it has to be a *valid* one. Zeroes decode as day zero of
-       month zero, and tools that read the volume show 1980-00-00, which is
-       not "no date" but a wrong one. 0x0021 is 1980-01-01, the epoch of the
-       format itself. */
-    wr16(d + 16, 0x0021);               /* created */
-    wr16(d + 18, 0x0021);               /* last accessed */
-    wr16(d + 24, 0x0021);               /* last written */
-    wr16(d + 26, first);
-    wr32(d + 28, (uint32)len);
+    /* Point the entry at the new chain first, and free the old one only after
+       that has landed: interrupted anywhere, the volume has a stale entry
+       rather than one aimed at clusters already handed to something else. */
+    set_entry(d, leaf, 0x20, first, (uint32)len);
     if (blk_write(sec, dbuf) < 0) {
         fat_free_chain(first);
         return -1;
     }
     if (existing && old >= 2)
-        fat_free_chain(old);            /* only now is it certainly unused */
+        fat_free_chain(old);
     return len;
 }
 
-int fat16_remove(const char *name)
+int fat16_remove(const char *path)
 {
-    if (!fs.ok)
+    uint16 dir;
+    char   leaf[11];
+    int    has_leaf;
+    if (resolve(path, &dir, leaf, &has_leaf) < 0 || !has_leaf)
         return -1;
-    char want[11];
-    to_83(name, want);
 
     uint32 sec;
     int    off, existing = 0;
-    if (dir_slot(want, &sec, &off, &existing) < 0 || !existing)
+    if (dir_find(dir, leaf, &sec, &off, &existing) < 0 || !existing)
         return -1;
 
     uint8 dbuf[SECSZ];
     if (blk_read(sec, dbuf) < 0)
         return -1;
-    uint16 first = rd16(dbuf + off + 26);
-    dbuf[off] = 0xE5;                   /* the slot is free; the name is not
+    uint8 *d = dbuf + off;
+    uint16 first = rd16(d + 26);
+
+    if (d[11] & 0x10) {
+        /* A directory only goes if it is empty, and "empty" means nothing but
+           the two entries every directory carries about itself. */
+        struct dirent e[4];
+        int n = 0;
+        uint32 lba;
+        for (uint32 i = 0; dir_sector(first, i, &lba) == 0 && n < 4; i++) {
+            uint8 b[SECSZ];
+            if (blk_read(lba, b) < 0)
+                break;
+            for (int k = 0; k < SECSZ && n < 4; k += 32) {
+                if (b[k] == 0x00)
+                    goto counted;
+                if (!usable_entry(b + k))
+                    continue;
+                fmt_name(b + k, e[n].name);
+                if (e[n].name[0] == '.' &&
+                    (e[n].name[1] == 0 || (e[n].name[1] == '.' && e[n].name[2] == 0)))
+                    continue;           /* itself and its parent */
+                n++;
+            }
+        }
+counted:
+        if (n > 0)
+            return -1;                  /* not empty */
+    }
+
+    d[0] = 0xE5;                        /* the slot is free; the name is not
                                            erased, which is why deleted files
                                            can be recovered on these volumes */
     if (blk_write(sec, dbuf) < 0)
         return -1;
     fat_free_chain(first);
+    return 0;
+}
+
+/* A directory is a file whose contents are entries, and which begins by
+   describing itself and its parent. The parent of a directory in the root is
+   written as cluster 0 — the root has no entry anywhere to point at. */
+int fat16_mkdir(const char *path)
+{
+    uint16 dir;
+    char   leaf[11];
+    int    has_leaf;
+    if (resolve(path, &dir, leaf, &has_leaf) < 0 || !has_leaf)
+        return -1;
+
+    uint32 sec;
+    int    off, existing;
+    if (dir_find(dir, leaf, &sec, &off, &existing) < 0 || existing)
+        return -1;                      /* taken */
+
+    uint16 c = fat_alloc_from(2);
+    if (c == 0)
+        return -1;
+    fat_set(c, FAT_EOC);
+
+    uint32 base = fs.data_start + (uint32)(c - 2) * fs.sec_per_clus;
+    for (uint32 sc = 0; sc < fs.sec_per_clus; sc++) {
+        uint8 b[SECSZ];
+        for (int k = 0; k < SECSZ; k++)
+            b[k] = 0;
+        if (sc == 0) {
+            set_entry(b,      ".          ", 0x10, c,   0);
+            set_entry(b + 32, "..         ", 0x10, dir, 0);
+        }
+        if (blk_write(base + sc, b) < 0) {
+            fat_set(c, FAT_FREE);
+            return -1;
+        }
+    }
+
+    uint8 dbuf[SECSZ];
+    if (blk_read(sec, dbuf) < 0) {
+        fat_set(c, FAT_FREE);
+        return -1;
+    }
+    set_entry(dbuf + off, leaf, 0x10, c, 0);
+    if (blk_write(sec, dbuf) < 0) {
+        fat_set(c, FAT_FREE);
+        return -1;
+    }
     return 0;
 }
