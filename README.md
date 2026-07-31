@@ -3116,22 +3116,29 @@ that a port below 1024 needs a privilege, and giving that privilege to a whole
 emulator so that one of its guest's ports can have a nicer number is a poor
 trade.
 
-Three ways out, and the one taken is the cheapest:
+Three ways out. The one running here is the middle one:
 
 ```
-tailscale serve --bg --tcp 23 tcp://100.95.222.7:5556
+sudo setcap cap_net_bind_service=+ep $(which qemu-system-riscv64)
+make run TELNETPORT=23
 ```
 
-`tailscaled` already runs as root and already owns the overlay interface, so
-it binds 23 *there* and forwards to the unprivileged port QEMU has. Nothing on
-the host's port policy changes, nothing else on the machine gains a right it
-did not have, and `tailscale serve --tcp 23 off` undoes it. The alternatives —
-`setcap cap_net_bind_service` on the QEMU binary, or lowering
-`net.ipv4.ip_unprivileged_port_start` — both grant something permanent and
-machine-wide to solve something temporary and local.
+That gives one binary one capability — the right to bind a low port, and
+nothing else — and QEMU then forwards 23 to 23 with nobody in between. It is
+narrow but it is *persistent*: the capability stays on the file until the
+package is upgraded, and it applies to every user of that binary.
 
-The Makefile takes the host-side numbers as variables now, so if you do have
-the privilege, `make run TELNETPORT=23` is the whole of it.
+The other two are worth knowing for what they cost. `tailscale serve --bg
+--tcp 23 tcp://$(HOSTIP):5556` puts the listener in `tailscaled`, which
+already runs as root and already owns the overlay interface — nothing about
+the host changes and one command undoes it, at the price of a second process
+in the path. `sudo sysctl net.ipv4.ip_unprivileged_port_start=23` is the
+broadest: every program on the machine gains the right, and it is the only one
+of the three that does not survive a reboot.
+
+The Makefile takes the host-side numbers as variables — `ECHOPORT`,
+`TELNETPORT`, `EXPORTPORT` — so where the privilege exists, that second line
+is the whole of it.
 
 None of this changes what is on the other end. **The shell still has no
 authentication of any kind**, and a standard port number is a better-known

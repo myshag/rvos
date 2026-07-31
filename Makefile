@@ -50,17 +50,18 @@ DRIVE   := -drive file=$(DISK),if=none,format=raw,id=hd0 \
 #
 #   make run TELNETPORT=23            # if you have the privilege; see below
 #
-# Three ways to have the standard number on the host, in the order of how
-# little they cost:
+# Three ways to have the standard number on the host:
 #
+#   sudo setcap cap_net_bind_service=+ep $$(which qemu-system-riscv64)
+#       one binary, one capability, nobody in the path. Persistent: it stays
+#       on the file until the package is upgraded. This is what runs here.
 #   tailscale serve --bg --tcp 23 tcp://$(HOSTIP):5556
 #       tailscaled already runs as root and binds 23 on the overlay interface
-#       only. Nothing on the host changes, and `tailscale serve --tcp 23 off`
-#       puts it back.
-#   sudo setcap cap_net_bind_service=+ep $$(which qemu-system-riscv64)
-#       lets that binary bind low ports, for every user, until it is upgraded.
+#       only. Nothing on the host changes and one command undoes it, at the
+#       price of a second process in the path.
 #   sudo sysctl net.ipv4.ip_unprivileged_port_start=23
-#       lets every program on the machine bind 23 and up.
+#       every program on the machine gains the right; the only one of the
+#       three that does not survive a reboot.
 #
 # HOSTIP is the address they listen on, and the default is not decoration.
 # Writing `hostfwd=tcp::5556-:23`, with the host address left empty, binds to
