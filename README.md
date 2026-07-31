@@ -2494,7 +2494,7 @@ which is worth remembering the *next* time something only looks broken.
 
 It cannot run anything: a program loaded from the disk cannot start another,
 because `spawn` lives in the shared user text of the kernel image — so the
-panels can copy, delete, make directories and view, and the shell is still
+panels copy, delete, make directories, view and edit, and the shell is still
 where you run things. The menu bar along the top is painted, not wired; the
 keys under it are the ones on the strip. And one session at a time, which by
 now is a familiar sentence.
@@ -2643,6 +2643,67 @@ permissions. The filesystem server holds a whole file in one buffer and the
 loaders read a whole ELF into another; both were 16 KiB, which is the largest
 file this system could open. Both are 32 KiB now. It is the same coupled pair
 of numbers with nothing enforcing it, only twice as large.
+
+
+## A viewer and an editor, because there is nowhere to put them
+
+MC runs its viewer and its editor as separate programs. This one cannot: a
+program loaded from the disk has no way to start another. So F3 and F4 open
+something that lives inside `mc` — and they are one piece of code, of which
+the viewer is the half that does not change anything. F4 hands the other half
+over, even from inside the viewer.
+
+```
+ Edit /README.TXT *   4/6
+rvos readme
+===========
+EduHELLO from the editor.
+  приветcational RISC-V microkernel with FAT16.
+Stages: boot, timer, IPC, filesystem.
+
+2Save 7Search 10Quit
+```
+
+Arrows, PgUp, PgDn, Home and End; F7 searches and wraps round the end once;
+F2 writes; F10 leaves, and asks first if there is anything to lose. Typing
+inserts, Backspace and Delete remove, Enter splits a line. The `*` in the
+title bar is the only thing standing between you and the disk.
+
+The model is the filesystem's own: **the whole file in one buffer**. That is
+what the server does with it anyway — there is no seek here and no partial
+write-back — so an editor built on anything cleverer would be pretending to an
+interface this system does not have. An edit is therefore a `memmove` and a
+rebuild of the line index, which for sixteen kilobytes at the measured 861
+MIPS is about twenty microseconds. A gap buffer would be a data structure
+carried around for a saving nobody could perceive. Saving is `create`, which
+truncates, then the bytes, then `close`, which is what puts them on the disk —
+the same three facts `cp` is built on.
+
+A file too big for the buffer opens read-only and says so in the title bar,
+because the alternative is an editor that silently cuts a file off at sixteen
+kilobytes and calls it saving.
+
+### The byte that is not a character
+
+Point a viewer at an executable and the difficulty appears at once. In an
+ELF file a byte over 0x7f is a byte, not the beginning of anything, and
+decoding it as UTF-8 swallows the two or three after it — so the display stops
+lining up with the file, which is worse than merely ugly. A sequence counts as
+a character here only if its continuation bytes really are continuation bytes;
+anything else is one byte, shown as a dot. Then `/BIN/CP.ELF` opens with
+`.ELF` in the first four columns and `usage: cp <src> <dst>` findable with F7,
+which is the test that it is reading the file rather than a theory about it.
+
+Long lines are not wrapped — a 5 KiB line of machine code is one row, and the
+arrow keys scroll the window sideways eight columns at a time. In the viewer
+they move the window; in the editor they move the cursor. Moving something
+invisible looks like nothing happening, and the viewer hides its cursor.
+
+Verified from outside, which is the only verification worth the name: text
+typed into `/README.TXT` through a telnet session came back through `mtype` on
+the host reading the raw FAT16 image, Cyrillic and all, and `HELLO.TXT` — the
+one edited and then abandoned at the "save? y / n" question — was byte for
+byte what it had been.
 
 
 ## Next steps

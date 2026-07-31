@@ -279,20 +279,20 @@ static void draw_menu(void)
     fill_to(stdscr, COLS);
 }
 
-static void draw_keys(void)
+/* The strip along the bottom. It is the only documentation a full-screen
+   program gets to show, so it lists what the keys actually do here and not
+   what they do in the program this one is imitating. */
+struct fkey { const char *n, *l; };
+
+static void draw_strip(const struct fkey *k, int n)
 {
-    static const char *lab[] = { "Help", "Menu", "View", "Edit", "Copy",
-                                 "RenMov", "Mkdir", "Delete", "PullDn",
-                                 "Quit" };
     int y, x;
     move(LINES - 1, 0);
-    for (int i = 0; i < 10; i++) {
-        char n[4];
-        num_into(n, (unsigned long)(i + 1));
+    for (int i = 0; i < n; i++) {
         attrset(C_NUM);
-        addstr(n);
+        addstr(k[i].n);
         attrset(C_BAR);
-        addstr(lab[i]);
+        addstr(k[i].l);
         addch(' ');
         getyx(stdscr, y, x);
         (void)y;
@@ -301,6 +301,15 @@ static void draw_keys(void)
     }
     attrset(C_BAR);
     fill_to(stdscr, COLS);
+}
+
+static void draw_keys(void)
+{
+    static const struct fkey k[] = {
+        {"1","Help"}, {"2","Menu"}, {"3","View"}, {"4","Edit"}, {"5","Copy"},
+        {"6","RenMov"}, {"7","Mkdir"}, {"8","Delete"}, {"9","PullDn"},
+        {"10","Quit"} };
+    draw_strip(k, 10);
 }
 
 static void status(const char *msg)
@@ -355,41 +364,7 @@ static void layout(void)
     }
 }
 
-/* ---- actions ----------------------------------------------------------- */
-
-static void view(const char *path)
-{
-    wbkgdset(stdscr, ' ' | A_NORMAL);
-    wattrset(stdscr, A_NORMAL);
-    werase(stdscr);
-    attrset(C_BAR);
-    move(0, 0);
-    addstr(" ");
-    addnstr(path, COLS - 24);
-    addstr("  — any key to return ");
-    fill_to(stdscr, COLS);
-    attrset(A_NORMAL);
-    move(1, 0);
-
-    int fd = vfs_open(path);
-    if (fd >= 0) {
-        for (;;) {
-            char buf[VFS_DATA_MAX];
-            int n = vfs_read(fd, buf, VFS_DATA_MAX);
-            if (n <= 0)
-                break;
-            /* Off the bottom of the window is dropped by the library, so a
-               long file simply stops rather than scrolling; a viewer that
-               pages is a different program. */
-            for (int i = 0; i < n; i++)
-                addch((unsigned char)buf[i]);
-        }
-        vfs_close(fd);
-    }
-    refresh();
-    getch();
-    curses_touchall();              /* the whole screen has to come back */
-}
+/* ---- typing a line ------------------------------------------------------ */
 
 /* A line of text, typed into the status row. The terminal is in character
    mode, so this does its own echo and its own backspace — which is what a
@@ -397,6 +372,8 @@ static void view(const char *path)
 static int prompt(const char *label, char *out, int cap)
 {
     int k = 0;
+    while (out[k])
+        k++;
     curs_set(1);
     for (;;) {
         attrset(C_STAT);
@@ -422,6 +399,463 @@ static int prompt(const char *label, char *out, int cap)
         }
     }
 }
+
+/* ---- the viewer and the editor ------------------------------------------
+
+   MC runs its viewer and its editor as separate programs. This cannot: a
+   program loaded from the disk has no way to start another, because spawn
+   lives in the shared user text of the kernel image and a disk program is not
+   linked against it. So they live here — and they are one piece of code, of
+   which the viewer is the half that does not change anything. F4 hands the
+   other half over.
+
+   The model is the filesystem's own: the whole file in one buffer. That is
+   what the server does with it anyway, so an editor built on anything
+   cleverer would be pretending to a file interface this system does not have
+   — there is no seek and no partial write-back. An edit is therefore a
+   memmove and a rebuild of the line index, which for sixteen kilobytes at the
+   measured 861 MIPS is about twenty microseconds. A gap buffer would be a
+   data structure carried for a saving nobody can perceive.                */
+
+#define ED_MAX   16384          /* half of what the fs server will hold */
+#define ED_LINES 1024
+
+static char ed_buf[ED_MAX];
+static int  ed_len;
+static int  ed_ls[ED_LINES];    /* where each line starts */
+static int  ed_nl;
+static int  ed_pos;             /* the cursor, as an offset into the file */
+static int  ed_top;             /* first line shown */
+static int  ed_hoff;            /* horizontal scroll, in screen columns */
+static int  ed_dirty;
+static int  ed_big;             /* it did not fit, so saving would truncate */
+
+/* A line ends where the next one starts. A file that ends in a newline has a
+   last line that is empty, which is what it is and what an editor shows. */
+static void ed_index(void)
+{
+    ed_nl = 0;
+    ed_ls[ed_nl++] = 0;
+    for (int i = 0; i < ed_len && ed_nl < ED_LINES; i++)
+        if (ed_buf[i] == '\n')
+            ed_ls[ed_nl++] = i + 1;
+}
+
+static int ed_end(int line)
+{
+    return line + 1 < ed_nl ? ed_ls[line + 1] - 1 : ed_len;
+}
+
+static int ed_lineof(int pos)
+{
+    int lo = 0, hi = ed_nl - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (ed_ls[mid] <= pos) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+/* UTF-8 again, and deliberately not borrowed from the library: curses decodes
+   the strings it is handed, and this walks a buffer that has no terminator
+   and no promise of being text at all.
+
+   That last part is the whole difficulty. A viewer is pointed at an
+   executable sooner or later, and in an executable a byte over 0x7f is a
+   byte, not the start of anything. Decoding it as though it were swallows the
+   two or three bytes after it — so the display stops lining up with the file,
+   which is worse than ugly. A sequence therefore counts as a character only
+   if its continuation bytes are really continuation bytes; anything else is
+   one byte, shown as a dot. */
+static int ulen(int i)
+{
+    unsigned char c = (unsigned char)ed_buf[i];
+    int n = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1;
+    if (n == 1)
+        return 1;
+    if (i + n > ed_len)
+        return 1;
+    for (int k = 1; k < n; k++)
+        if (((unsigned char)ed_buf[i + k] & 0xc0) != 0x80)
+            return 1;
+    return n;
+}
+
+static unsigned int uval(int i, int n)
+{
+    unsigned char c = (unsigned char)ed_buf[i];
+    if (n == 1)
+        return c;
+    unsigned int v = (unsigned int)(c & (0xff >> (n + 1)));
+    for (int k = 1; k < n; k++)
+        v = (v << 6) | ((unsigned char)ed_buf[i + k] & 0x3f);
+    return v;
+}
+
+static int ed_next(int pos)
+{
+    if (pos >= ed_len) return ed_len;
+    int n = ulen(pos);
+    return pos + n > ed_len ? ed_len : pos + n;
+}
+
+static int ed_prev(int pos)
+{
+    if (pos <= 0) return 0;
+    pos--;
+    while (pos > 0 && ((unsigned char)ed_buf[pos] & 0xc0) == 0x80)
+        pos--;
+    return pos;
+}
+
+/* Two ways of counting along a line, and both are needed. Characters are what
+   moving up and down should preserve; screen columns are where the cursor
+   actually has to be drawn, and a tab is one of the first and eight of the
+   second. */
+static int ed_chars(int line, int pos)
+{
+    int n = 0;
+    for (int i = ed_ls[line]; i < pos && i < ed_end(line); i = ed_next(i))
+        n++;
+    return n;
+}
+
+static int ed_scol(int line, int pos)
+{
+    int col = 0;
+    for (int i = ed_ls[line]; i < pos && i < ed_end(line); ) {
+        if (ed_buf[i] == '\t') { col = (col / 8 + 1) * 8; i++; continue; }
+        col++;
+        i = ed_next(i);
+    }
+    return col;
+}
+
+static int ed_at(int line, int chars)
+{
+    int i = ed_ls[line], e = ed_end(line);
+    while (chars-- > 0 && i < e)
+        i = ed_next(i);
+    return i;
+}
+
+static int ed_load(const char *path)
+{
+    ed_len = ed_pos = ed_top = ed_hoff = 0;
+    ed_dirty = ed_big = 0;
+    int fd = vfs_open(path);
+    if (fd < 0)
+        return -1;
+    for (;;) {
+        if (ed_len >= ED_MAX) { ed_big = 1; break; }
+        int n = vfs_read(fd, ed_buf + ed_len, ED_MAX - ed_len);
+        if (n <= 0)
+            break;
+        ed_len += n;
+    }
+    vfs_close(fd);
+    ed_index();
+    return 0;
+}
+
+/* Create truncates and close is what puts the bytes on the disk — the same
+   two facts `cp` relies on. A file that was too big to load is never written
+   back: saving it would silently cut it off at sixteen kilobytes. */
+static int ed_save(const char *path)
+{
+    if (ed_big)
+        return -1;
+    int fd = vfs_create(path);
+    if (fd < 0)
+        return -1;
+    int off = 0;
+    while (off < ed_len) {
+        int n = ed_len - off;
+        if (n > VFS_DATA_MAX)
+            n = VFS_DATA_MAX;
+        int k = vfs_write(fd, ed_buf + off, n);
+        if (k < 0) { vfs_close(fd); return -1; }
+        if (k == 0) { sys_yield(); continue; }
+        off += k;
+    }
+    if (vfs_close(fd) < 0)
+        return -1;
+    ed_dirty = 0;
+    return 0;
+}
+
+static int ed_insert(const char *s, int n)
+{
+    if (ed_len + n > ED_MAX)
+        return -1;
+    for (int i = ed_len - 1; i >= ed_pos; i--)
+        ed_buf[i + n] = ed_buf[i];
+    for (int i = 0; i < n; i++)
+        ed_buf[ed_pos + i] = s[i];
+    ed_len += n;
+    ed_pos += n;
+    ed_dirty = 1;
+    ed_index();
+    return 0;
+}
+
+static void ed_remove(int at, int n)
+{
+    if (at < 0 || n <= 0 || at + n > ed_len)
+        return;
+    for (int i = at; i + n < ed_len; i++)
+        ed_buf[i] = ed_buf[i + n];
+    ed_len -= n;
+    if (ed_pos > ed_len)
+        ed_pos = ed_len;
+    ed_dirty = 1;
+    ed_index();
+}
+
+static int ed_find(const char *needle, int from)
+{
+    int m = 0;
+    while (needle[m]) m++;
+    if (!m)
+        return -1;
+    for (int i = from; i + m <= ed_len; i++) {
+        int j = 0;
+        while (j < m && ed_buf[i + j] == needle[j]) j++;
+        if (j == m)
+            return i;
+    }
+    return -1;
+}
+
+/* Keep the cursor on the screen, both ways. */
+static void ed_follow(int h, int follow_col)
+{
+    int line = ed_lineof(ed_pos);
+    if (line < ed_top) ed_top = line;
+    if (line >= ed_top + h) ed_top = line - h + 1;
+    if (ed_top < 0) ed_top = 0;
+    if (!follow_col)
+        return;                 /* the viewer scrolls sideways by itself */
+    int col = ed_scol(line, ed_pos);
+    if (col < ed_hoff) ed_hoff = col;
+    if (col >= ed_hoff + COLS) ed_hoff = col - COLS + 1;
+}
+
+static void ed_draw(const char *path, int writable, const char *msg)
+{
+    int h = LINES - 2;
+    int line = ed_lineof(ed_pos);
+
+    attrset(C_BAR);
+    move(0, 0);
+    addstr(writable ? " Edit " : " View ");
+    addnstr(path, COLS - 30);
+    if (ed_dirty)
+        addstr(" *");
+    if (ed_big)
+        addstr(" [too big to save]");
+    addstr("   ");
+    char n[24];
+    num_into(n, (unsigned long)(line + 1));
+    addstr(n);
+    addstr("/");
+    num_into(n, (unsigned long)ed_nl);
+    addstr(n);
+    if (msg) {
+        addstr("   ");
+        addstr(msg);
+    }
+    fill_to(stdscr, COLS);
+
+    int cy = 0, cx = 0;
+    for (int r = 0; r < h; r++) {
+        int y = ed_top + r;
+        attrset(C_PANEL);
+        move(r + 1, 0);
+        if (y < ed_nl) {
+            int col = 0, e = ed_end(y);
+            for (int i = ed_ls[y]; i < e; ) {
+                int adv = 1;
+                unsigned int c;
+                if (ed_buf[i] == '\t') {
+                    adv = (col / 8 + 1) * 8 - col;
+                    c = ' ';
+                    i++;
+                } else {
+                    int n2 = ulen(i);
+                    c = uval(i, n2);
+                    /* A control byte is not a character. Showing it as one is
+                       how a viewer of a binary file scrolls the screen
+                       sideways and rings the bell. */
+                    if (c < 32 || c == 127 || (n2 == 1 && c > 126))
+                        c = '.';
+                    i += n2;
+                }
+                for (int k = 0; k < adv; k++, col++)
+                    if (col >= ed_hoff && col - ed_hoff < COLS)
+                        addch(c == ' ' ? ' ' : (k ? ' ' : c));
+                if (col - ed_hoff >= COLS)
+                    break;
+            }
+            if (y == line) {
+                cy = r + 1;
+                cx = ed_scol(y, ed_pos) - ed_hoff;
+            }
+        }
+        fill_to(stdscr, COLS);
+    }
+
+    static const struct fkey view_keys[] = {
+        {"3","Quit"}, {"4","Edit"}, {"7","Search"}, {"10","Quit"} };
+    static const struct fkey edit_keys[] = {
+        {"2","Save"}, {"7","Search"}, {"10","Quit"} };
+    if (writable)
+        draw_strip(edit_keys, 3);
+    else
+        draw_strip(view_keys, 4);
+
+    if (writable && cx >= 0 && cx < COLS)
+        move(cy, cx);
+    else
+        move(0, 0);
+    refresh();
+}
+
+/* One loop for both. Returns non-zero if the file was written, which is the
+   panel's cue to read the directory again: the size in it just changed. */
+static int edit_file(const char *path, int writable)
+{
+    if (ed_load(path) < 0) {
+        draw("cannot open it");
+        return 0;
+    }
+    if (ed_big)
+        writable = 0;
+    int h = LINES - 2, saved = 0;
+    const char *msg = 0;
+    char pattern[64];
+    pattern[0] = 0;
+
+    curs_set(writable ? 1 : 0);
+    for (;;) {
+        ed_follow(h, writable);
+        ed_draw(path, writable, msg);
+        msg = 0;
+
+        int k = getch();
+        int line = ed_lineof(ed_pos);
+
+        if (k == ERR || k == KEY_F(10) ||
+            (!writable && (k == 'q' || k == 27 || k == KEY_F(3))))
+            break;
+
+        switch (k) {
+        case KEY_UP:
+            if (line > 0)
+                ed_pos = ed_at(line - 1, ed_chars(line, ed_pos));
+            continue;
+        case KEY_DOWN:
+            if (line + 1 < ed_nl)
+                ed_pos = ed_at(line + 1, ed_chars(line, ed_pos));
+            continue;
+        /* Sideways means two different things. With a cursor on the screen
+           it means the cursor; without one — the viewer hides it — moving
+           something invisible looks like nothing happening, so it means the
+           window. */
+        case KEY_LEFT:
+            if (writable) ed_pos = ed_prev(ed_pos);
+            else if ((ed_hoff -= 8) < 0) ed_hoff = 0;
+            continue;
+        case KEY_RIGHT:
+            if (writable) ed_pos = ed_next(ed_pos);
+            else ed_hoff += 8;
+            continue;
+        case KEY_HOME:  ed_pos = ed_ls[line]; continue;
+        case KEY_END:   ed_pos = ed_end(line); continue;
+        /* A page moves the text by a page, not merely the cursor: the eye
+           has to land somewhere it recognises. */
+        case KEY_PPAGE: {
+            int col = ed_chars(line, ed_pos);
+            ed_pos = ed_at(line - h < 0 ? 0 : line - h, col);
+            ed_top -= h;
+            if (ed_top < 0) ed_top = 0;
+            continue;
+        }
+        case KEY_NPAGE: {
+            int col = ed_chars(line, ed_pos);
+            ed_pos = ed_at(line + h >= ed_nl ? ed_nl - 1 : line + h, col);
+            ed_top += h;
+            if (ed_top > ed_nl - 1) ed_top = ed_nl - 1;
+            continue;
+        }
+        case KEY_F(7): {
+            if (prompt(" search: ", pattern, (int)sizeof(pattern)) <= 0) {
+                curs_set(writable ? 1 : 0);
+                continue;
+            }
+            curs_set(writable ? 1 : 0);
+            int at = ed_find(pattern, ed_pos + 1);
+            if (at < 0)
+                at = ed_find(pattern, 0);      /* round the end, once */
+            if (at < 0)
+                msg = "not found";
+            else
+                ed_pos = at;
+            continue;
+        }
+        case KEY_F(4):
+            if (!writable && !ed_big) {
+                writable = 1;
+                curs_set(1);
+            } else if (ed_big) {
+                msg = "too big to edit";
+            }
+            continue;
+        case KEY_F(2):
+            if (writable)
+                msg = ed_save(path) < 0 ? "could not write it" : "saved";
+            if (writable && !ed_dirty)
+                saved = 1;
+            continue;
+        }
+
+        if (!writable)
+            continue;
+
+        if (k == 13 || k == 10 || k == KEY_ENTER) {
+            ed_insert("\n", 1);
+        } else if (k == 8 || k == 127 || k == KEY_BACKSPACE) {
+            if (ed_pos > 0) {
+                int p = ed_prev(ed_pos);
+                int n = ed_pos - p;
+                ed_pos = p;
+                ed_remove(p, n);
+            }
+        } else if (k == KEY_DC) {
+            if (ed_pos < ed_len)
+                ed_remove(ed_pos, ed_next(ed_pos) - ed_pos);
+        } else if (k == 9) {
+            ed_insert("\t", 1);
+        } else if (k >= 32 && k < 256) {
+            char c = (char)k;
+            if (ed_insert(&c, 1) < 0)
+                msg = "no room left";
+        }
+    }
+
+    if (writable && ed_dirty) {
+        /* Leaving with changes is a question, not a decision. */
+        ed_draw(path, writable, "save? y / n");
+        int k = getch();
+        if (k == 'y' || k == 'Y')
+            saved = ed_save(path) == 0;
+    }
+    curs_set(0);
+    curses_touchall();
+    return saved;
+}
+
+/* ---- what the panel does with a file ------------------------------------ */
 
 static void do_mkdir(struct panel *p)
 {
@@ -545,14 +979,16 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
                 } else {
                     char full[VFS_PATH_MAX];
                     join(full, p->path, e->name);
-                    view(full);
+                    if (edit_file(full, 0))
+                        load(p);
                 }
             }
-        } else if (k == 'v' || k == KEY_F(3)) {
+        } else if (k == 'v' || k == KEY_F(3) || k == 'e' || k == KEY_F(4)) {
             if (p->n && !p->e[p->sel].isdir) {
                 char full[VFS_PATH_MAX];
                 join(full, p->path, p->e[p->sel].name);
-                view(full);
+                if (edit_file(full, k == 'e' || k == KEY_F(4)))
+                    load(p);
             }
         } else if (k == 'c' || k == KEY_F(5)) {
             copy_over();
