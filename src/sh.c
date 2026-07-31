@@ -20,8 +20,11 @@ static char *argv[8];
 int spawn(const char *path, char *scratch, int scratchsz,
           int argc, char *const argv[]);   /* loader.c */
 
-/* Blocking read of one character: the console server answers immediately
-   with 0 when nothing has been typed, so we yield and ask again. */
+/* One character. This used to spin — read, get 0, yield, read again — because
+   the console server always answered at once. It does not any more: a read
+   with nothing to read is kept until a key arrives, and this call simply does
+   not return until then. The loop is left in place for the case where a
+   second reader is told 0, and it no longer runs. */
 static int getc_blocking(int fd)
 {
     for (;;) {

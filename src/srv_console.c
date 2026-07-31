@@ -57,6 +57,21 @@ static int ring_get(void)
     return c;
 }
 
+/* A read that arrived when nothing had been typed. The driver has been
+   interrupt-driven since stage 14 but its clients were not: the shell spun,
+   asking again and again, because the server always answered at once —
+   with 0 when there was nothing to say.
+
+   Answering later costs nothing and needs no new mechanism. The caller is
+   already blocked in the sys_recv that follows its sys_send, so the server
+   simply keeps the request and replies when a key arrives. Blocking I/O is a
+   server declining to answer yet; the kernel never learns the word.
+
+   One waiter, because two programs sharing a keyboard is not a question this
+   system has to answer; a second reader is told 0 as before. */
+static int             waiter = -1;
+static struct vfs_req  waiting;
+
 void console_server(void)
 {
     uputs("  [console] up (user mode), UART driven by interrupts\n");
@@ -73,6 +88,16 @@ void console_server(void)
             while ((c = con_tryc()) >= 0)   /* drain: the FIFO may hold several */
                 ring_put((char)c);
             sys_irq_ack(UART0_IRQ);
+            if (waiter >= 0) {
+                int k = ring_get();
+                if (k >= 0) {
+                    waiting.data[0] = (char)k;
+                    waiting.result  = 1;
+                    int to = waiter;
+                    waiter = -1;
+                    sys_send(to, &waiting, (int)sizeof(waiting));
+                }
+            }
             continue;
         }
 
@@ -88,12 +113,16 @@ void console_server(void)
             break;
         }
         case VFS_READ: {
-            int c = ring_get();                 /* non-blocking */
-            if (c < 0) {
-                r->result = 0;
-            } else {
+            int c = ring_get();
+            if (c >= 0) {
                 r->data[0] = (char)c;
                 r->result = 1;
+            } else if (waiter < 0) {
+                waiter  = from;                 /* keep it; answer on a key */
+                waiting = *r;
+                continue;                       /* no reply, on purpose */
+            } else {
+                r->result = 0;                  /* somebody is already waiting */
             }
             break;
         }

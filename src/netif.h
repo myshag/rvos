@@ -18,4 +18,10 @@ void net_input(uint8 *frame, int len);           /* net_ip.c: a frame arrived */
 void net_timeout(void);                          /* net_ip.c: the alarm fired */
 
 struct vfs_req;
-void net_vfs(struct vfs_req *r);                 /* net_ip.c: serve a client */
+/* Serve one client request. Returns 1 if the answer is in *r and should go
+   back now, 0 if the request has been parked — a read with nothing to read,
+   an accept with nothing to accept — and will be answered later through
+   net_reply(). That is all "blocking" is here: a server declining to reply
+   yet, while the caller sits in the sys_recv it already had to make. */
+int  net_vfs(int from, struct vfs_req *r);       /* net_ip.c */
+void net_reply(int to, struct vfs_req *r);       /* srv_net.c */

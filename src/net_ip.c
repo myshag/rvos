@@ -457,6 +457,15 @@ static int seq_lt(uint32 a, uint32 b) { return (int32)(a - b) <  0; }
 static int seq_le(uint32 a, uint32 b) { return (int32)(a - b) <= 0; }
 static int seq_gt(uint32 a, uint32 b) { return (int32)(a - b) >  0; }
 
+/* A request that has been received but not answered. See "parking a request"
+   below: this is the whole of blocking I/O in this system. */
+struct parked {
+    int used;
+    int task;                     /* who is waiting */
+    int fd;
+    int len;                      /* how much they asked for */
+};
+
 struct tcb {
     int      state;
     uint8    raddr[4];
@@ -507,6 +516,11 @@ struct tcb {
     } ooo[NOOO];
 
     uint64   tw_at;               /* TIME-WAIT expiry, absolute ms */
+
+    /* On a connection: a read waiting for bytes. On a listener: an accept
+       waiting for somebody to call. */
+    struct parked reader;
+    int      accepted;            /* handed to a program by accept */
 
     int      fds;                 /* how many programs hold this open */
     int      is_client;           /* the one /net/tcp names */
@@ -921,6 +935,7 @@ static void rcv_data(struct tcb *c, uint32 seq, const uint8 *data, int len)
 /* ---- TCP: input --------------------------------------------------------- */
 
 static void demo_opened(struct tcb *c);
+static void net_wakeups(void);       /* answer anyone whose wait is over */
 
 /* A segment for a connection that does not exist. RFC 793 is specific about
    what a reset carries: if the offending segment had an ACK, the reset takes
@@ -1267,6 +1282,12 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
         net_puts("  tcp: [test] releasing the held segment\n");
         tcp_segment(hold_sip, hold_buf, n);
     }
+
+    /* Whatever that segment did — queued bytes, closed a half, completed a
+       handshake — somebody may have been waiting for it. Doing this once at
+       the end rather than at each of the places that could unblock a caller
+       keeps replies out of the middle of segment processing. */
+    net_wakeups();
 }
 
 /* ---- timers ------------------------------------------------------------
@@ -1359,6 +1380,8 @@ void net_timeout(void)
 
 /* ---- the network as files ---------------------------------------------
      /net/status   read: the interface, the ARP cache and the whole table
+     /net/ctl      write a command, read the answer: connect, listen,
+                   accept, close
      /net/tcp      the connection this system opened
      /net/tcp/N    connection N, by slot — including the ones it answered
 
@@ -1477,20 +1500,23 @@ static int net_status(char *o, int cap)
     return n;
 }
 
-/* Descriptors: a slot per open of the status file, and slot+CONN0 for a
-   connection, so the fd a program holds says which conversation it means.
+/* Descriptors: a slot per open of a rendered file (status, ctl) and
+   slot+CONN0 for a connection, so the fd a program holds says which
+   conversation it means.
 
-   The status file needs a slot of its own because it needs an *offset*. A
+   A rendered file needs a slot of its own because it needs an *offset*. A
    caller that reads until read() returns nothing — which is what `cat` is —
-   never stops if every read hands back the whole text again. A rendered
-   report is still a file, and a file ends. */
-#define NSTATFD 4
-enum { FD_STATUS0 = 1, FD_CONN0 = 16 };
+   never stops if every read hands back the whole text again. A report is
+   still a file, and a file ends. */
+#define NPFD 4
+enum { FD_STATUS0 = 1, FD_CTL0 = 8, FD_CONN0 = 16 };
 
 static struct {
-    int used;
-    int off;
-} statfd[NSTATFD];
+    int  used;
+    int  off;
+    int  len;                       /* ctl only: bytes of answer waiting */
+    char answer[64];
+} pfd[NPFD];
 
 static struct tcb *conn_of(int fd)
 {
@@ -1511,7 +1537,6 @@ static int client_slot(void)
 
 static int path_slot(const char *p)
 {
-    /* /net/tcp/N */
     const char *s = p + ustrlen("/net/tcp/");
     if (*s < '0' || *s > '9')
         return -1;
@@ -1521,17 +1546,275 @@ static int path_slot(const char *p)
     return v < NTCB ? v : -1;
 }
 
-void net_vfs(struct vfs_req *r)
+/* ---- parking a request -------------------------------------------------
+   A read with nothing to read, and an accept with nothing to accept, are
+   answered by not answering. The caller is already blocked in the sys_recv
+   that follows its sys_send, so nothing has to be invented: the reply simply
+   comes later, from whichever event makes an answer possible.
+
+   That is the whole of blocking I/O here, and it needs no help from the
+   kernel — which is the point. A microkernel that had to grow a "wait for
+   data" primitive for every kind of data would not be minimal for long. */
+
+static void reply_read(struct parked *p, const char *data, int n)
+{
+    struct vfs_req r;
+    umemset(&r, 0, sizeof(r));
+    r.op     = VFS_READ;
+    r.fd     = p->fd;
+    r.len    = p->len;
+    r.result = n;
+    if (n > 0)
+        umemcpy(r.data, data, (unsigned long)n);
+    p->used = 0;
+    net_reply(p->task, &r);
+}
+
+/* An answer that carries no payload, only a result — the reply to the write
+   that asked the question. What the answer says is left in the ctl slot's
+   buffer, where the caller's next read will find it, exactly as if the
+   command had been carried out on the spot. */
+static void reply_done(int task, int fd, int op, int result)
+{
+    struct vfs_req r;
+    umemset(&r, 0, sizeof(r));
+    r.op     = op;
+    r.fd     = fd;
+    r.result = result;
+    net_reply(task, &r);
+}
+
+/* How much a reader may take now, and whether "nothing" means "wait". A
+   connection whose peer has closed and whose queue is empty is at end of
+   file, and a reader must be told so rather than parked for ever. */
+static int conn_eof(const struct tcb *c)
+{
+    return c->rxq_len == 0 &&
+           (c->state == T_CLOSE_WAIT || c->state == T_LAST_ACK ||
+            c->state == T_CLOSING    || c->state == T_TIME_WAIT);
+}
+
+static int conn_take(struct tcb *c, char *dst, int want)
+{
+    int was_shut = rcv_window(c) == 0;
+    int n = c->rxq_len < want ? c->rxq_len : want;
+    if (n <= 0)
+        return 0;
+    umemcpy(dst, c->rxq, (unsigned long)n);
+    c->rxq_len -= n;
+    for (int i = 0; i < c->rxq_len; i++)        /* shift the remainder down */
+        c->rxq[i] = c->rxq[i + n];
+    /* Draining the queue opens the window again, and a peer that has been
+       told to stop will not start until it is told so. A stack that skips
+       this update deadlocks a connection it throttled. */
+    if (was_shut && c->state == T_ESTABLISHED)
+        send_ack(c);
+    return n;
+}
+
+/* Called whenever something might unblock somebody: data queued, a peer
+   closing, a connection reaching ESTABLISHED. */
+static void net_wakeups(void)
+{
+    for (int i = 0; i < NTCB; i++) {
+        struct tcb *c = &tcbs[i];
+        if (c->state == T_FREE || !c->reader.used)
+            continue;
+        if (c->rxq_len > 0) {
+            char buf[VFS_DATA_MAX];
+            int n = conn_take(c, buf, c->reader.len);
+            reply_read(&c->reader, buf, n);
+        } else if (conn_eof(c)) {
+            reply_read(&c->reader, 0, 0);       /* end of file, not a wait */
+        }
+    }
+
+    /* An accept waiting on a listener, and a connection on that port that
+       nobody has been given yet. */
+    for (int i = 0; i < NTCB; i++) {
+        struct tcb *l = &tcbs[i];
+        if (l->state != T_LISTEN || !l->reader.used)
+            continue;
+        for (int k = 0; k < NTCB; k++) {
+            struct tcb *c = &tcbs[k];
+            if (c == l || c->state == T_FREE || c->lport != l->lport)
+                continue;
+            if (c->state != T_ESTABLISHED || c->accepted)
+                continue;
+            c->accepted = 1;
+
+            struct parked p = l->reader;
+            l->reader.used = 0;
+
+            int pi = p.fd - FD_CTL0;
+            char *o = pfd[pi].answer;
+            int   n = 0;
+            n = app(o, n, "ok ");
+            n += uutoa((unsigned long)k, o + n);
+            o[n++] = '\n';
+            pfd[pi].len = n;
+            pfd[pi].off = 0;
+            reply_done(p.task, p.fd, VFS_WRITE, p.len);
+            break;
+        }
+    }
+}
+
+/* ---- /net/ctl ----------------------------------------------------------
+   Write a line, read the answer. Everything the demo used to decide for
+   itself — which port to listen on, which host to call — a program can now
+   decide instead, which is the difference between a stack with a demo bolted
+   on and a stack with an interface.
+
+     connect <a.b.c.d> <port>     -> ok <slot>
+     listen  <port>               -> ok <slot>
+     accept  <slot>               -> ok <slot>, when someone calls
+     close   <slot>               -> ok
+*/
+
+static const char *skip_spaces(const char *s)
+{
+    while (*s == ' ' || *s == '\t')
+        s++;
+    return s;
+}
+
+static const char *parse_uint(const char *s, unsigned *out)
+{
+    if (*s < '0' || *s > '9')
+        return 0;
+    unsigned v = 0;
+    while (*s >= '0' && *s <= '9')
+        v = v * 10 + (unsigned)(*s++ - '0');
+    *out = v;
+    return s;
+}
+
+static const char *parse_ip(const char *s, uint8 *ip)
+{
+    for (int i = 0; i < 4; i++) {
+        unsigned v;
+        s = parse_uint(s, &v);
+        if (!s || v > 255)
+            return 0;
+        ip[i] = (uint8)v;
+        if (i < 3) {
+            if (*s != '.')
+                return 0;
+            s++;
+        }
+    }
+    return s;
+}
+
+static int word_is(const char **s, const char *word)
+{
+    const char *p = *s;
+    while (*word) {
+        if (*p != *word)
+            return 0;
+        p++; word++;
+    }
+    if (*p && *p != ' ' && *p != '\t')
+        return 0;
+    *s = skip_spaces(p);
+    return 1;
+}
+
+/* Returns 1 if the answer is ready in `slot`, 0 if the caller has been
+   parked (accept, with nobody calling yet). */
+static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
+{
+    char *o = pfd[pi].answer;
+    int   n = 0;
+    const char *s = skip_spaces(cmd);
+
+    if (word_is(&s, "connect")) {
+        uint8 ip[4];
+        unsigned port;
+        const char *p = parse_ip(s, ip);
+        if (!p || !parse_uint(skip_spaces(p), &port))
+            n = app(o, n, "error syntax\n");
+        else {
+            struct tcb *c = tcp_connect(ip, port);
+            if (!c)
+                n = app(o, n, "error no free connection\n");
+            else {
+                n = app(o, n, "ok ");
+                n += uutoa((unsigned long)(c - tcbs), o + n);
+                o[n++] = '\n';
+            }
+        }
+    } else if (word_is(&s, "listen")) {
+        unsigned port;
+        if (!parse_uint(s, &port))
+            n = app(o, n, "error syntax\n");
+        else {
+            struct tcb *c = tcp_listen(port);
+            if (!c)
+                n = app(o, n, "error no free connection\n");
+            else {
+                n = app(o, n, "ok ");
+                n += uutoa((unsigned long)(c - tcbs), o + n);
+                o[n++] = '\n';
+            }
+        }
+    } else if (word_is(&s, "accept")) {
+        unsigned slot;
+        if (!parse_uint(s, &slot) || slot >= NTCB ||
+            tcbs[slot].state != T_LISTEN) {
+            n = app(o, n, "error not a listener\n");
+        } else {
+            struct tcb *l = &tcbs[slot];
+            if (l->reader.used) {
+                n = app(o, n, "error already accepting\n");
+            } else {
+                /* Park it, then look: net_wakeups answers at once if a
+                   connection is already sitting there unclaimed. */
+                l->reader.used = 1;
+                l->reader.task = from;
+                l->reader.fd   = fd;
+                l->reader.len  = wlen;   /* what to report to the write */
+                net_wakeups();
+                return 0;                /* parked, or answered inside there */
+            }
+        }
+    } else if (word_is(&s, "close")) {
+        unsigned slot;
+        if (!parse_uint(s, &slot) || slot >= NTCB ||
+            tcbs[slot].state == T_FREE)
+            n = app(o, n, "error no such connection\n");
+        else {
+            tcp_close(&tcbs[slot]);
+            n = app(o, n, "ok\n");
+        }
+    } else {
+        n = app(o, n, "error unknown command\n");
+    }
+
+    pfd[pi].len = n;
+    pfd[pi].off = 0;
+    return 1;
+}
+
+int net_vfs(int from, struct vfs_req *r)
 {
     switch (r->op) {
-    case VFS_OPEN:
-        if (ustr_has_prefix(r->path, "/net/status")) {
+    case VFS_OPEN: {
+        int base = -1;
+        if (ustr_has_prefix(r->path, "/net/status"))
+            base = FD_STATUS0;
+        else if (ustr_has_prefix(r->path, "/net/ctl"))
+            base = FD_CTL0;
+
+        if (base >= 0) {
             r->result = -1;
-            for (int i = 0; i < NSTATFD; i++)
-                if (!statfd[i].used) {
-                    statfd[i].used = 1;
-                    statfd[i].off  = 0;
-                    r->result = FD_STATUS0 + i;
+            for (int i = 0; i < NPFD; i++)
+                if (!pfd[i].used) {
+                    pfd[i].used = 1;
+                    pfd[i].off  = 0;
+                    pfd[i].len  = 0;
+                    r->result = base + i;
                     break;
                 }
         } else if (ustr_has_prefix(r->path, "/net/tcp/")) {
@@ -1554,11 +1837,12 @@ void net_vfs(struct vfs_req *r)
             r->result = -1;
         }
         break;
+    }
 
     case VFS_READ:
-        if (r->fd >= FD_STATUS0 && r->fd < FD_STATUS0 + NSTATFD) {
+        if (r->fd >= FD_STATUS0 && r->fd < FD_STATUS0 + NPFD) {
             int i = r->fd - FD_STATUS0;
-            if (!statfd[i].used) {
+            if (!pfd[i].used) {
                 r->result = -1;
                 break;
             }
@@ -1567,14 +1851,26 @@ void net_vfs(struct vfs_req *r)
                short enough that one read takes all of it. */
             static char page[VFS_DATA_MAX];
             int len = net_status(page, (int)sizeof(page));
-            int n = len - statfd[i].off;
+            int n = len - pfd[i].off;
             if (n > r->len)
                 n = r->len;
             if (n <= 0) {
                 r->result = 0;                          /* end of file */
             } else {
-                umemcpy(r->data, page + statfd[i].off, (unsigned long)n);
-                statfd[i].off += n;
+                umemcpy(r->data, page + pfd[i].off, (unsigned long)n);
+                pfd[i].off += n;
+                r->result = n;
+            }
+        } else if (r->fd >= FD_CTL0 && r->fd < FD_CTL0 + NPFD) {
+            int i = r->fd - FD_CTL0;
+            int n = pfd[i].len - pfd[i].off;
+            if (n > r->len)
+                n = r->len;
+            if (n <= 0) {
+                r->result = 0;
+            } else {
+                umemcpy(r->data, pfd[i].answer + pfd[i].off, (unsigned long)n);
+                pfd[i].off += n;
                 r->result = n;
             }
         } else {
@@ -1583,43 +1879,56 @@ void net_vfs(struct vfs_req *r)
                 r->result = -1;
                 break;
             }
-            int was_shut = rcv_window(c) == 0;
-            int n = c->rxq_len < r->len ? c->rxq_len : r->len;
-            umemcpy(r->data, c->rxq, (unsigned long)n);
-            c->rxq_len -= n;
-            for (int i = 0; i < c->rxq_len; i++)     /* shift the remainder */
-                c->rxq[i] = c->rxq[i + n];
-            /* Draining the queue opens the window again, and a peer that has
-               been told to stop will not start until it is told so. A stack
-               that skips this update deadlocks a connection it throttled. */
-            if (was_shut && n > 0 && c->state == T_ESTABLISHED)
-                send_ack(c);
-            r->result = n;
+            int n = conn_take(c, r->data, r->len);
+            if (n > 0) {
+                r->result = n;
+            } else if (conn_eof(c)) {
+                r->result = 0;                  /* the peer is done talking */
+            } else if (c->reader.used) {
+                r->result = -1;                 /* one reader per connection */
+            } else {
+                c->reader.used = 1;             /* park it */
+                c->reader.task = from;
+                c->reader.fd   = r->fd;
+                c->reader.len  = r->len;
+                return 0;
+            }
         }
         break;
 
-    case VFS_WRITE: {
-        struct tcb *c = conn_of(r->fd);
-        if (!c || (c->state != T_ESTABLISHED && c->state != T_CLOSE_WAIT)) {
-            r->result = -1;                         /* not connected */
+    case VFS_WRITE:
+        if (r->fd >= FD_CTL0 && r->fd < FD_CTL0 + NPFD) {
+            int i = r->fd - FD_CTL0;
+            char cmd[VFS_DATA_MAX + 1];
+            int len = r->len < VFS_DATA_MAX ? r->len : VFS_DATA_MAX;
+            umemcpy(cmd, r->data, (unsigned long)len);
+            cmd[len] = 0;
+            for (int k = 0; k < len; k++)
+                if (cmd[k] == '\n' || cmd[k] == '\r')
+                    cmd[k] = 0;
+            if (!ctl_command(i, from, r->fd, r->len, cmd))
+                return 0;              /* accept: parked, or answered already */
+            r->result = r->len;
         } else {
-            /* A write copies into the send buffer and returns; how much of it
-               goes on the wire now is the window's business, not the caller's.
-               A short count means the buffer is full, which is the honest
-               answer and the one a program can act on. */
-            int n = tcp_write(c, r->data, r->len);
-            if (n > 0)
-                net_putn("  tcp: queued ", (unsigned long)n,
-                         " bytes from a program\n");
-            r->result = n;
+            struct tcb *c = conn_of(r->fd);
+            if (!c || (c->state != T_ESTABLISHED && c->state != T_CLOSE_WAIT)) {
+                r->result = -1;                 /* not connected */
+            } else {
+                /* A write copies into the send buffer and returns; how much
+                   of it goes on the wire now is the window's business, not
+                   the caller's. A short count means the buffer is full, which
+                   is the honest answer and the one a program can act on. */
+                r->result = tcp_write(c, r->data, r->len);
+            }
         }
         break;
-    }
 
-    case VFS_CLOSE: {
-        if (r->fd >= FD_STATUS0 && r->fd < FD_STATUS0 + NSTATFD) {
-            statfd[r->fd - FD_STATUS0].used = 0;
-        } else {
+    case VFS_CLOSE:
+        if (r->fd >= FD_STATUS0 && r->fd < FD_STATUS0 + NPFD)
+            pfd[r->fd - FD_STATUS0].used = 0;
+        else if (r->fd >= FD_CTL0 && r->fd < FD_CTL0 + NPFD)
+            pfd[r->fd - FD_CTL0].used = 0;
+        else {
             /* Closing the last descriptor closes the connection. That is what
                a file interface means by close, and it is what TCP means by it
                too — a program that has stopped reading and writing has said
@@ -1632,13 +1941,14 @@ void net_vfs(struct vfs_req *r)
         }
         r->result = 0;
         break;
-    }
 
     default:
         r->result = -1;
         break;
     }
+    return 1;
 }
+
 
 /* ---- the demo ----------------------------------------------------------
    Everything below this line is policy, not protocol: which host to talk to,
@@ -1687,16 +1997,12 @@ static void demo_opened(struct tcb *c)
         net_puts("  http: GET / -> " WEB_HOST "\n");
         return;
     }
-    if (c->is_client) {
+    if (c->is_client)
         net_puts("  tcp: /net/tcp is open for business\n");
-        return;
-    }
-    /* An inbound call. The greeting is the demo's, not the stack's: nothing
-       in the guest is yet running to answer for itself, and without it a call
-       into rvos would show only one direction. */
-    static const char banner[] =
-        "rvos: you have reached the guest on port 7\n";
-    tcp_write(c, banner, (int)sizeof(banner) - 1);
+    /* An inbound call gets nothing from here. It used to get a greeting,
+       because nothing in the guest was running to answer for itself; now
+       /NETD.ELF is, and deciding what to say to a caller was never the
+       stack's business. */
 }
 
 /* Print what the server said, up to a point — the whole page would bury the
@@ -1728,11 +2034,13 @@ static void demo_received(struct tcb *c, const uint8 *data, int dlen)
 
 void net_start(void)
 {
-    tcp_listen(LISTEN_PORT);
-    /* Both hardware addresses are asked for at once. Nothing can be sent to
+    /* No listener here any more: a port is opened by whoever wants to answer
+       on it, through /net/ctl.
+
+       Both hardware addresses are asked for at once. Nothing can be sent to
        either host until its answer arrives, and a UDP query has no
-       retransmission to fall back on, so the query waits for the reply
-       rather than the other way round. */
+       retransmission to fall back on, so the query waits for the reply rather
+       than the other way round. */
     arp_request(gw_ip);
     arp_request(dns_ip);
 }

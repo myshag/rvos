@@ -3,7 +3,8 @@
 # (no mount / no root needed). The image is loaded into guest RAM at boot.
 set -euo pipefail
 IMG="${1:-build/fat16.img}"
-PROG="${2:-}"
+shift || true
+PROGS=("$@")
 mkdir -p "$(dirname "$IMG")"
 
 # 8 MiB raw image, FAT16 with 512-byte clusters (16k clusters -> valid FAT16).
@@ -22,10 +23,13 @@ printf 'a nested note in /DOCS\n' > "$tmp"
 mcopy -i "$IMG" "$tmp" ::/DOCS/NOTE.TXT
 rm -f "$tmp"
 
-# A real executable on the volume, for the loader to find at run time.
-if [ -n "$PROG" ] && [ -f "$PROG" ]; then
-    mcopy -i "$IMG" "$PROG" ::/HELLO.ELF
-fi
+# Real executables on the volume, for the loader to find at run time. The
+# 8.3 name FAT16 stores is the basename upper-cased: build/netd.elf -> NETD.ELF.
+for p in "${PROGS[@]:-}"; do
+    [ -n "$p" ] && [ -f "$p" ] || continue
+    name="$(basename "$p" | tr '[:lower:]' '[:upper:]')"
+    mcopy -i "$IMG" "$p" "::/$name"
+done
 
 echo "built $IMG"
 mdir -i "$IMG" ::/ | sed 's/^/  /'

@@ -19,9 +19,11 @@ OBJ     := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(CSRC)) \
 
 ELF     := $(BUILD)/kernel.elf
 
-# A standalone program: its own ELF, linked at a fixed user address, put on
+# Standalone programs: their own ELFs, linked at a fixed user address, put on
 # the FAT16 volume and loaded at run time. Not part of kernel.elf.
 PROG    := $(BUILD)/hello.elf
+NETD    := $(BUILD)/netd.elf
+PROGS   := $(PROG) $(NETD)
 PCFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany \
            -ffreestanding -nostdlib -fno-common -fno-builtin \
            -Wall -Wextra -Os -I$(SRCDIR)
@@ -66,17 +68,18 @@ $(ELF): $(OBJ) $(SRCDIR)/kernel.ld
 $(BUILD):
 	mkdir -p $(BUILD)
 
-# Build a 4 MiB FAT16 image and populate it with sample files.
-$(PROG): prog/hello.c prog/hello.ld | $(BUILD)
+# Every program is linked the same way: one C file, the shared program link
+# script, no libc.
+$(BUILD)/%.elf: prog/%.c prog/hello.ld | $(BUILD)
 	$(CC) $(PCFLAGS) -nostdlib -T prog/hello.ld -Wl,--build-id=none -o $@ $<
 	$(CROSS)strip $@
 	$(CROSS)size $@
 
-prog: $(PROG)
+prog: $(PROGS)
 
 disk: $(DISK)
-$(DISK): scripts/mkdisk.sh $(PROG) | $(BUILD)
-	scripts/mkdisk.sh $(DISK) $(PROG)
+$(DISK): scripts/mkdisk.sh $(PROGS) | $(BUILD)
+	scripts/mkdisk.sh $(DISK) $(PROGS)
 
 run: $(ELF)
 	$(QEMU) $(QFLAGS)

@@ -39,6 +39,10 @@ static void say_num(const char *l, unsigned long v, const char *t)
 void net_puts(const char *s) { say(s); }
 void net_putn(const char *l, unsigned long v, const char *t) { say_num(l, v, t); }
 
+/* Answer a request that was parked earlier. The destination is blocked in the
+   sys_recv that followed its sys_send, so this rendezvous completes at once. */
+void net_reply(int to, struct vfs_req *r) { sys_send(to, r, (int)sizeof(*r)); }
+
 static void say_hex2(unsigned v)
 {
     const char *d = "0123456789abcdef";
@@ -317,7 +321,10 @@ void net_server(void)
             continue;
         }
 
-        net_vfs(&req);                 /* a client */
-        sys_send(from, &req, (int)sizeof(req));
+        /* A client. If the protocol layer parks the request there is nothing
+           to send: the caller stays in its sys_recv until whatever it is
+           waiting for arrives, and net_reply() answers it then. */
+        if (net_vfs(from, &req))
+            sys_send(from, &req, (int)sizeof(req));
     }
 }

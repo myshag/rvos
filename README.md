@@ -217,11 +217,15 @@ rvos$ mem
 rvos$ cat /net/status
 ```
 
-The guest is reachable while it runs — port 5555 on the host is forwarded to
-the port the stack listens on:
+The guest is reachable while it runs. Port 5555 on the host is forwarded
+inward, but nothing answers on it until a program in the guest asks for the
+port — so start one, then call it:
 
+```
+rvos$ /NETD.ELF
+```
 ```bash
-nc localhost 5555
+nc localhost 5555            # on the host: talks to /NETD.ELF in the guest
 ```
 
 Exit QEMU with `Ctrl-A` then `X`.
@@ -323,6 +327,8 @@ $ read the fs server's private data region
     ICMP answered, DNS, and a page fetched from a real server
 21. a send buffer and several segments in flight, out-of-order reassembly,
     an RTO measured rather than guessed, and congestion control
+22. blocking reads as a server declining to answer; `/net/ctl`, and a program
+    on the disk that owns a port and serves callers itself
 
 ## Loading a program
 
@@ -852,13 +858,146 @@ fourth is dropped. There is no window scaling, no selective acknowledgement,
 no Nagle and no delayed acknowledgement, so a small write becomes a small
 segment and every segment is acknowledged at once.
 
+## A program that owns a port
+
+Everything so far has been the stack talking to itself. It listened on port 7
+because a line in `net_start` said so, and it greeted callers because nothing
+else would. Both of those are policy, and neither belongs to a protocol stack.
+Handing them to a program needed two things.
+
+### Blocking is a server declining to answer
+
+The console driver has been interrupt-driven since stage 14, but its clients
+were not. The shell spun:
+
+```c
+for (;;) {
+    int n = vfs_read(fd, &c, 1);
+    if (n > 0) return c;
+    yield();                    /* ask again, and again */
+}
+```
+
+because the server always answered at once — with 0 when there was nothing to
+say. The fix needs no new mechanism and no kernel change at all. The caller is
+*already* blocked, in the `sys_recv` that follows its `sys_send`; a server that
+simply does not reply leaves it there. So a read with nothing to read is kept,
+and answered when a key arrives:
+
+```c
+case VFS_READ:
+    c = ring_get();
+    if (c >= 0)          { r->data[0] = c; r->result = 1; }
+    else if (waiter < 0) { waiter = from; waiting = *r; continue; }  /* no reply */
+```
+
+That `continue` is the whole of blocking I/O in this system. It is worth
+noticing what did *not* happen: the kernel did not learn what a network is,
+what a keyboard is, or what "wait for data" means. A microkernel that needed a
+blocking primitive per kind of data would not stay small for long.
+
+The network server does the same, with one more case: a connection whose peer
+has closed and whose queue is empty is at end of file, and a reader must be
+told 0 rather than parked forever.
+
+### /net/ctl
+
+A file to write commands to and read the answer from. Four of them:
+
+| command | answer |
+|---------|--------|
+| `connect <a.b.c.d> <port>` | `ok <slot>` |
+| `listen <port>` | `ok <slot>` |
+| `accept <slot>` | `ok <slot>`, when somebody calls |
+| `close <slot>` | `ok` |
+
+`accept` is the interesting one, and it needed nothing that reads did not
+already need: it parks the caller until a connection on that listener reaches
+ESTABLISHED, or answers at once if one is already sitting there unclaimed.
+
+### netd
+
+`prog/netd.c` is a second ELF on the FAT16 volume. It listens on port 7,
+accepts, greets, echoes, and goes back to accepting:
+
+```c
+ctl("listen 7", answer, sizeof answer);
+for (;;) {
+    ctl(accept_cmd, answer, sizeof answer);      /* sleeps here */
+    int fd = vfs_open(conn_path);                /* /net/tcp/N */
+    vfs_write(fd, hello, len);
+    for (;;) {
+        int n = vfs_read(fd, buf, sizeof buf);   /* and here */
+        if (n <= 0) break;                       /* 0 = the peer is done */
+        vfs_write(fd, buf, n);
+    }
+    vfs_close(fd);
+}
+```
+
+There is no polling and no yielding in it, and there is no networking in it
+either: no ethernet, no ARP, no sequence numbers, no windows, no
+retransmission. It opens files, writes bytes and reads bytes — the five calls
+it would use for a file on the disk or for the console. The stack, for its
+part, no longer contains a port number or a greeting.
+
+```
+rvos$ /NETD.ELF
+  tcp: listening on port 7
+  [netd] listening on port 7; try nc localhost 5555 from the host
+```
+
+and from the host:
+
+```
+$ nc localhost 5555
+rvos: netd here. type something and I will send it back.
+hello netd
+hello netd
+again
+again
+```
+
+with the guest reporting, in the same run, that those bytes went through the
+reassembly path on the way in and came back out in the right order anyway:
+
+```
+tcp: SYN from 10.0.2.2:51114, accepted; SYN-ACK sent
+tcp: connection established (inbound)
+tcp: [test] holding a segment back so the next overtakes it
+  [netd] a caller, on /net/tcp/1
+tcp: segment ahead of the stream, held aside (6 bytes)
+tcp: [test] releasing the held segment
+tcp: received 11 bytes, queued for readers
+tcp: gap closed, 6 held bytes delivered
+tcp: peer closed its half
+  [netd] caller hung up
+tcp: closing (peer went first)
+tcp: closed
+```
+
+This is the circle the project has been drawing since stage 5 closing on
+itself. `open`, `read`, `write`, `close` reached a FAT16 file, then a console,
+then `/proc`, then a network interface, and now a TCP connection that a
+program in the guest serves for itself — with the same four calls, and with
+neither side knowing anything about the other.
+
+### Honest limits
+
+One waiter per connection, and one for the console: a second reader is told 0
+rather than queued. A parked task that dies is never noticed, and the reply
+that eventually goes to it will block the server, since `sys_send` is a
+rendezvous — a real system needs the kernel to tell a sender that its
+destination is gone. There is no `poll`, so a program that wants to wait on
+two things at once cannot; `netd` handles one caller at a time for exactly
+that reason.
+
 ## Next steps
 
-- `/net/ctl`, so a program can open a connection or listen on a port instead
-  of the stack's demo deciding
-- a blocking `read()`, so a program serving a connection stops polling — and
-  with it a program in the guest that answers the inbound call for itself,
-  instead of the greeting the demo sends
+- `poll`/`select`, or a second task per connection — either would let `netd`
+  serve more than one caller at a time
+- noticing that a parked task has died, instead of blocking a server forever
+  on a reply nobody will take
 - delayed acknowledgements and Nagle's algorithm: this stack answers every
   segment at once and sends every write as its own segment
 - selective acknowledgement, so a loss costs one segment rather than
