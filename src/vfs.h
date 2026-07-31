@@ -134,6 +134,56 @@ static inline int vfs_ioctl(int fd, unsigned long cmd)
     return vfs_call(fd >> 16, &r);
 }
 
+/* Where a program's output goes.
+
+   Until now every program wrote with SYS_PUTC, which is the console of last
+   resort: one character per trap, straight to the UART, needing no server and
+   reaching nowhere else. That is the right thing for a startup line printed
+   before anything is listening, and the wrong thing for everything after,
+   because a syscall cannot be *bound* to anything. A path can. A program that
+   writes to /dev/console has its output follow whatever that name means in
+   its namespace — which is how a program started from the shell over TCP
+   ends up talking to the connection without containing a line about it.
+
+   The fallback is deliberate and not a nicety: if nothing is bound there, or
+   if the far end has gone, the bytes still come out on the serial line rather
+   than disappearing. */
+static inline void vfs_say(const char *s)
+{
+    /* fd + 1, so that "not opened yet" is zero and this stays in .bss. A
+       program whose only initialised datum is this one would otherwise grow a
+       whole .data page, and these programs are loaded into a fixed buffer. */
+    static int say_fd1;
+    if (say_fd1 == 0) {
+        int f = vfs_open("/dev/console");
+        say_fd1 = f < 0 ? -1 : f + 1;
+    }
+    int say_fd = say_fd1 - 1;               /* -2 if the open failed */
+
+    int n = 0;
+    while (s[n])
+        n++;
+    if (say_fd1 < 0) {
+        for (int i = 0; i < n; i++)
+            _ecall1(SYS_PUTC, (unsigned char)s[i]);
+        return;
+    }
+    int off = 0;
+    while (off < n) {
+        int k = vfs_write(say_fd, s + off, n - off);
+        if (k < 0) {                        /* whatever it was is gone */
+            for (int i = off; i < n; i++)
+                _ecall1(SYS_PUTC, (unsigned char)s[i]);
+            return;
+        }
+        if (k == 0) {                       /* a full send buffer: wait */
+            _ecall1(SYS_YIELD, 0);
+            continue;
+        }
+        off += k;
+    }
+}
+
 static inline int vfs_close(int fd)
 {
     struct vfs_req r;

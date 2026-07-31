@@ -30,11 +30,9 @@ static int glen(const char *s)
     return n;
 }
 
-static void say(const char *s)
-{
-    while (*s)
-        _ecall1(SYS_PUTC, *s++);
-}
+/* To a path, not a syscall: run from the shell over TCP, the page this
+   fetches comes back down the caller's connection. */
+static void say(const char *s) { vfs_say(s); }
 
 static char *append(char *o, const char *s)
 {

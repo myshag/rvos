@@ -11,18 +11,22 @@
    program loaded from FAT16 cannot reach it. Everything else it does, a disk
    program could.
 
-   One honest limit, and it is visible the moment you use it: a program this
-   shell starts writes with SYS_PUTC, which goes to the serial console and not
-   down the connection. Redirecting it means giving a task a notion of where
-   its output goes, and that is a change to how every program writes, not a
-   change here. Until then `run` reports the task id and says where to look. */
+   A program started from here has its output arrive on the connection, and
+   the way that works is worth following, because no part of it knows about
+   any other part. This shell clones its namespace and binds /dev/console to
+   the network server. A task it creates inherits that namespace. The program
+   writes to /dev/console because that is where programs write. The network
+   server, asked to open that name, looks up which connection the asking task
+   was attached to — an association the loader made in the one moment the
+   child existed but had not yet run. Four independent mechanisms, none of
+   them added for this, and the program contains no line about any of it. */
 #include "syscall.h"
 #include "vfs.h"
 #include "ulib.h"
 #include "servers.h"
 
 #define LINEMAX 128
-#define ELFMAX  8192
+#define ELFMAX  16384
 #define INBUF   256
 
 static char line[LINEMAX];
@@ -33,7 +37,7 @@ static int  inlen;
 static char scratch[64];
 
 int spawn(const char *path, char *sc, int scsz,
-          int argc, char *const argv[]);       /* loader.c */
+          int argc, char *const argv[], int console);   /* loader.c */
 
 static int rlen(const char *s)
 {
@@ -166,8 +170,7 @@ static void do_help(void)
               "  mounts         this shell's namespace     (/proc/mounts)\n"
               "  net            interface, ARP, connections (/net/status)\n"
               "  mem            free and total pages\n"
-              "  run <path> ..  start a program (its output goes to the serial\n"
-              "                 console, not here — see the source for why)\n"
+              "  run <path> ..  start a program; its output comes back here\n"
               "  echo <words>   write them back\n"
               "  exit           hang up\n");
 }
@@ -235,15 +238,21 @@ static void session(int slot)
             if (argc < 2) {
                 puts_conn("usage: run <path> [args]\n");
             } else {
-                int tid = spawn(argv[1], elfbuf, ELFMAX, argc - 1, argv + 1);
-                if (tid < 0) {
+                /* Announced *before* it is started, not after. The child
+                   and this shell write the same connection, and the child is
+                   running the instant spawn returns — a line printed
+                   afterwards arrives in the middle of the program's first
+                   one. There is no wait() here and no job control, so the
+                   prompt below still comes back while the program is talking;
+                   `ps` says what is running. */
+                puts_conn("starting ");
+                puts_conn(argv[1]);
+                puts_conn("\n");
+                if (spawn(argv[1], elfbuf, ELFMAX,
+                          argc - 1, argv + 1, slot) < 0) {
                     puts_conn("rsh: cannot run ");
                     puts_conn(argv[1]);
                     puts_conn("\n");
-                } else {
-                    puts_conn("started as task ");
-                    put_num((unsigned long)tid);
-                    puts_conn("; its output goes to the serial console\n");
                 }
             }
         } else {
@@ -304,6 +313,17 @@ void rsh_main(void)
         sys_exit();
     }
     int lslot = slot_of(answer);
+
+    /* Our own view of the tree, so that what we bend does not bend anybody
+       else's — and one binding in it: /dev/console now means the network.
+       Every task we create inherits this, which is the whole mechanism by
+       which a program's output follows it down a connection. */
+    sys_nsclone();                        /* not vfs_ns_clone(): that is the
+                                             kernel's own copy of this, and
+                                             this task may not call into the
+                                             kernel's text at all */
+    sys_bind("/dev/console", NET_TASK_ID);
+
     uputs("  [rsh] a shell is listening on port 23\n");
 
     for (;;) {

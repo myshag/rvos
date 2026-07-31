@@ -25,9 +25,13 @@ PROG    := $(BUILD)/hello.elf
 NETD    := $(BUILD)/netd.elf
 GET     := $(BUILD)/get.elf
 PROGS   := $(PROG) $(NETD) $(GET)
+# -MMD -MP for the same reason the kernel has it: these programs are built
+# from headers in src/, and without dependency tracking a change to vfs.h
+# leaves a stale .elf on the disk image that disagrees with the kernel it is
+# loaded by. That is a bug that hides until one field happens to be non-zero.
 PCFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany \
            -ffreestanding -nostdlib -fno-common -fno-builtin \
-           -Wall -Wextra -Os -I$(SRCDIR)
+           -Wall -Wextra -Os -I$(SRCDIR) -MMD -MP
 
 # FAT16 RAM-disk image, loaded into guest memory (see fs stage).
 DISK    := $(BUILD)/fat16.img
@@ -55,7 +59,7 @@ all: $(ELF)
 # a header rebuilds everything that included it. Without this a stale object
 # can disagree with the rest of the tree about a struct layout — which is
 # exactly the kind of bug that hides until one field happens to be non-zero.
--include $(OBJ:.o=.d)
+-include $(OBJ:.o=.d) $(PROGS:.elf=.d)
 
 $(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@

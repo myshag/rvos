@@ -121,7 +121,14 @@ struct task *task_new_empty(const char *name)
         t->namebuf[k] = name[k];
     t->namebuf[k] = 0;
     t->name     = t->namebuf;      /* the caller's buffer will not outlive us */
-    t->ns       = vfs_root_ns();
+    /* Plan 9's rule: a child sees what its parent sees. It matters as soon as
+       a parent has bent its own view — a shell reached over TCP binds
+       /dev/console to the network, and the program it starts inherits that
+       and writes to the connection without knowing it has. Before this, a new
+       task got the root namespace and no arrangement its parent made could
+       reach it. vfs_ns_clone() is still there for a child that wants to
+       diverge. */
+    t->ns       = current ? current->ns : vfs_root_ns();
     t->state    = T_UNUSED;            /* not runnable until started */
     return t;
 }

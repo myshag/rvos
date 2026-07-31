@@ -17,11 +17,11 @@ static int hlen(const char *s)
     return n;
 }
 
-static void hputs(const char *s)
-{
-    while (*s)
-        _ecall1(SYS_PUTC, *s++);
-}
+/* Output goes to a *path*, not to a syscall, so it follows whatever
+   /dev/console means where this program was started: the serial line from the
+   local shell, the caller's connection from the one over TCP. This program
+   contains no way of telling which, which is the point. */
+static void hputs(const char *s) { vfs_say(s); }
 
 /* Placed first by the link script; the loader jumps here via e_entry. */
 __attribute__((section(".text.start"))) void _start(int argc, char **argv)

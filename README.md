@@ -342,6 +342,8 @@ $ read the fs server's private data region
     servers that reclaim what a dead client was holding
 25. a shell over TCP: the same shell, reading and writing a connection
     instead of the console
+26. output as a path, not a syscall: a namespace inherited by children, and a
+    program's output arriving wherever it was started from
 
 ## Loading a program
 
@@ -1277,27 +1279,72 @@ served from the caller's offset — and between the first read and the second,
 is rendered once, at `open`, and the reader gets the system as it was when it
 asked. A report that changes under its reader is not a file.
 
+### Where a program's output goes
+
+A program started with `run` has its output arrive on the connection:
+
+```
+rvos# run /GET.ELF example.com
+starting /GET.ELF
+  [get] resolving example.com
+  [get] example.com is 104.20.23.154
+HTTP/1.1 200 OK
+Server: cloudflare
+...
+  [get] 828 bytes
+```
+
+and `/GET.ELF` contains no line about connections, shells or redirection. Four
+mechanisms cooperate, none of them added for this, and no part of the chain
+knows about any other part:
+
+1. **Output is a path, not a syscall.** Every program used to write with
+   `SYS_PUTC` — one character per trap, straight to the UART. That is right
+   for a startup line printed before anything is listening, and wrong for
+   everything after, because a syscall cannot be bound to anything. A path
+   can. Programs write to `/dev/console` now, falling back to `SYS_PUTC` only
+   if nothing is bound there or the far end has gone.
+2. **The shell bends its own view.** `sys_nsclone()` gives it a private mount
+   table; `sys_bind("/dev/console", NET_TASK_ID)` makes that name mean the
+   network server in it, and in nobody else's.
+3. **A child inherits its parent's namespace.** It used to get the root one,
+   so no arrangement a parent made could reach it. This is Plan 9's rule, and
+   the reason `vfs_ns_clone` exists is for a child that wants to diverge.
+4. **The loader closes the race.** `spawn()` is the only code that holds a
+   child between "address space built" and "allowed to run", so that is where
+   the connection is attached to the task id. Doing it after `spawn` returns
+   is a race the child can win — and does, on a round-robin scheduler.
+
+You can see the join from inside:
+
+```
+rvos# mounts
+/ -> task 0
+/dev/ -> task 1
+/proc/ -> task 2
+/net/ -> task 11
+/dev/console -> task 11        <- only in this shell's view
+```
+
+The same program run from the serial console still prints on the serial
+console, because there `/dev/console` still means the console server. Nothing
+in the program changed; the name did.
+
 ### What it does not do
 
-A program started with `run` writes through `SYS_PUTC`, which is the console
-of last resort and goes to the serial line — so its output appears on the
-local console, not down the connection. Redirecting it is not a change to this
-shell but to how every program writes: output would have to go to a path
-rather than a syscall, and the child would have to inherit a namespace in
-which that path means the connection. The pieces for that exist — `vfs_bind`,
-`vfs_ns_clone`, a per-task mount table — but a task created by `SYS_NEWTASK`
-currently gets the root namespace rather than its creator's, so the last step
-is missing. `run` reports the task id and says where to look, which is honest
-if not satisfying.
+There is no `wait()` and no job control, so `run` returns at once and the
+prompt comes back while the program is still talking — which is why the
+announcement is printed *before* the program starts rather than after, where
+it would land in the middle of the program's first line. `ps` says what is
+running.
 
 One session at a time, for the same reason `netd` takes one caller at a time:
 there is no `poll`.
 
 ## Next steps
 
-- a spawned program's output following it: child inherits the parent's
-  namespace, programs write to a path rather than to `SYS_PUTC`, and `run`
-  over TCP shows what it started
+- `wait()`, so `run` can return when the program does, and job control so a
+  program that never exits does not have to be left running blind
 - `poll`/`select`, or a second task per connection — either would let `netd`
   serve more than one caller at a time
 - more than one waiter on the console, so two programs can read keystrokes

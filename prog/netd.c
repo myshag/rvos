@@ -24,11 +24,7 @@ static int nlen(const char *s)
     return n;
 }
 
-static void say(const char *s)
-{
-    while (*s)
-        _ecall1(SYS_PUTC, *s++);
-}
+static void say(const char *s) { vfs_say(s); }
 
 /* Write a command to /net/ctl and read the one-line answer back off the same
    descriptor. `accept` does not return until somebody calls, which costs this

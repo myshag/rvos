@@ -11,14 +11,14 @@
 #include "ulib.h"
 
 #define LINEMAX 128
-#define ELFMAX  8192
+#define ELFMAX  16384
 
 static char line[LINEMAX];
 static char elfbuf[ELFMAX];
 static char *argv[8];
 
 int spawn(const char *path, char *scratch, int scratchsz,
-          int argc, char *const argv[]);   /* loader.c */
+          int argc, char *const argv[], int console);   /* loader.c */
 
 /* One character. This used to spin — read, get 0, yield, read again — because
    the console server always answered at once. It does not any more: a read
@@ -146,7 +146,7 @@ void sh_main(void)
             continue;
         }
 
-        int tid = spawn(argv[0], elfbuf, ELFMAX, argc, argv);
+        int tid = spawn(argv[0], elfbuf, ELFMAX, argc, argv, -1);
         if (tid < 0) {
             uputs("sh: cannot run ");
             uputs(argv[0]);
