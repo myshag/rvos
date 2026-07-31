@@ -89,8 +89,9 @@ int vfs_route(const char *path)
 int vfs_dump_mounts_of(int task_id, char *out, int cap)
 {
     struct namespace *ns;
-    if (task_id >= 0 && task_id < NTASK && tasks[task_id].ns)
-        ns = tasks[task_id].ns;
+    struct task *t = task_by_id(task_id);
+    if (t && t->ns)
+        ns = t->ns;
     else
         ns = &ns_pool[0];
 

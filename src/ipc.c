@@ -58,11 +58,14 @@ static void ipc_send(void)
     uint64 sva    = A1(current);
     int    slen   = (int)A2(current);
 
-    if (dst_id < 0 || dst_id >= NTASK || tasks[dst_id].state == T_UNUSED) {
+    /* An id that names nobody — a slot never used, or one whose task has
+       died and been replaced — fails the send instead of blocking on it or,
+       worse, delivering to whoever moved in. */
+    struct task *dst = task_by_id(dst_id);
+    if (!dst || dst->state == T_UNUSED) {
         A0(current) = -1;
         return;
     }
-    struct task *dst = &tasks[dst_id];
 
     if (dst->state == T_BLOCKED && dst->waiting_recv) {
         /* Receiver is parked in recv(): copy straight across and free both. */

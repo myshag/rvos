@@ -59,6 +59,12 @@ enum {
        without it a driver that blocks waiting for a reply waits forever, and
        nothing built on top can ever decide that something was lost. */
     SYS_ALARM   = 18,     /* a0 = milliseconds, 0 cancels */
+    /* Is that task still that task? A server holding state on behalf of a
+       client — an open file, a request it has not answered — has no other way
+       to find out that the client is gone. Ids carry a generation, so this
+       answers "no" for a slot that has been reused as well as for one that is
+       empty. */
+    SYS_ALIVE   = 19,     /* a0 = task id -> 1 or 0 */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -195,10 +201,18 @@ static inline int sys_pgdump(int task_id, unsigned long va, void *out, int cap)
 }
 
 /* Blocks until the destination receives; the kernel copies `len` bytes out
-   of this task's address space into the receiver's. */
-static inline void sys_send(int dst, const void *msg, int len)
+   of this task's address space into the receiver's. Returns -1 if there is no
+   such task — which is not a formality: a caller that ignored it would go on
+   to block in recv() waiting for a reply from nobody. */
+static inline int sys_send(int dst, const void *msg, int len)
 {
-    _ecall3(SYS_SEND, dst, (long)msg, len);
+    return (int)_ecall3(SYS_SEND, dst, (long)msg, len);
+}
+
+/* Whether a task id still names the task it named when it was handed out. */
+static inline int sys_alive(int task_id)
+{
+    return (int)_ecall1(SYS_ALIVE, task_id);
 }
 
 /* Blocks until a message arrives; returns the sender's task id. */

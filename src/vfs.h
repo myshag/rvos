@@ -82,7 +82,10 @@ static inline void vfs__scpy(char *d, const char *s)
    copy, so the answer has to be shipped home explicitly. */
 static inline int vfs_call(int dst, struct vfs_req *r)
 {
-    sys_send(dst, r, (int)sizeof(*r));
+    /* If the server is gone, say so. Sending and then receiving anyway would
+       leave this task blocked for ever on a reply that cannot come. */
+    if (sys_send(dst, r, (int)sizeof(*r)) < 0)
+        return r->result = -1;
     sys_recv(r, (int)sizeof(*r));
     return r->result;
 }

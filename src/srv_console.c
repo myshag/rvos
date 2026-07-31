@@ -88,6 +88,11 @@ void console_server(void)
             while ((c = con_tryc()) >= 0)   /* drain: the FIFO may hold several */
                 ring_put((char)c);
             sys_irq_ack(UART0_IRQ);
+            /* A reader that is no longer there must not be answered: the
+               reply would either fail or, without generation-tagged ids, land
+               on whatever task moved into its slot. */
+            if (waiter >= 0 && !sys_alive(waiter))
+                waiter = -1;
             if (waiter >= 0) {
                 int k = ring_get();
                 if (k >= 0) {
@@ -117,7 +122,7 @@ void console_server(void)
             if (c >= 0) {
                 r->data[0] = (char)c;
                 r->result = 1;
-            } else if (waiter < 0) {
+            } else if (waiter < 0 || !sys_alive(waiter)) {
                 waiter  = from;                 /* keep it; answer on a key */
                 waiting = *r;
                 continue;                       /* no reply, on purpose */

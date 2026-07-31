@@ -41,7 +41,6 @@ struct task *task_create(const char *name, void (*entry)(void))
     /* sret returns to S-mode (SPP=1) with interrupts enabled (SPIE -> SIE) */
     t->ctx.status = SSTATUS_SPP | SSTATUS_SPIE;
     t->state = T_RUNNABLE;
-    t->id    = (int)(t - tasks);
     t->name  = name;
     t->ns    = vfs_root_ns();   /* inherit the shared view until it clones */
     return t;
@@ -58,9 +57,26 @@ struct task *task_create(const char *name, void (*entry)(void))
 static struct task *alloc_slot(void)
 {
     for (int i = 0; i < NTASK; i++)
-        if (tasks[i].state == T_UNUSED && !tasks[i].pt)
+        if (tasks[i].state == T_UNUSED && !tasks[i].pt) {
+            /* A slot handed out again is a *different* task, and its id has
+               to say so. The generation starts at 0, so the tasks created at
+               boot keep the ids servers.h names them by. */
+            tasks[i].id = i | (tasks[i].gen << 8);
             return &tasks[i];
+        }
     return 0;
+}
+
+struct task *task_by_id(int id)
+{
+    int i = TASK_SLOT(id);
+    if (i < 0 || i >= NTASK)
+        return 0;
+    if (tasks[i].state == T_UNUSED && !tasks[i].pt)
+        return 0;                      /* free: nobody at all */
+    if (tasks[i].id != id)
+        return 0;                      /* reused: somebody else entirely */
+    return &tasks[i];
 }
 
 /* Release a task: its private pages and page tables go back to the allocator
@@ -79,6 +95,8 @@ void task_retire(struct task *t)
     t->waiting_recv = 0;
     vm_free_task(t);                    /* also clears t->pt */
     t->state = T_UNUSED;
+    t->gen++;                           /* whatever still names this id is
+                                           naming a task that no longer is */
 }
 
 struct task *task_new_empty(const char *name)
@@ -98,7 +116,6 @@ struct task *task_new_empty(const char *name)
                   (uint64)p, PGSIZE, PTE_R | PTE_W | PTE_U, 0);
     }
     t->ctx.satp = MAKE_SATP(t->pt);
-    t->id       = (int)(t - tasks);
     int k = 0;
     for (; k < 15 && name[k]; k++)
         t->namebuf[k] = name[k];
@@ -254,6 +271,9 @@ void syscall_dispatch(uint64 num)
         current->ctx.x[10] = (uint64)(long)vfs_ns_clone();
         break;
     /* ---- building another task, one segment at a time ---------------- */
+    case SYS_ALIVE:
+        current->ctx.x[10] = task_by_id((int)current->ctx.x[10]) ? 1 : 0;
+        break;
     case SYS_ALARM: {
         int ms = (int)current->ctx.x[10];
         /* QEMU's time base is 10 MHz, so a millisecond is 10000 ticks. The
@@ -301,30 +321,27 @@ void syscall_dispatch(uint64 num)
         break;
     }
     case SYS_VMLOAD: {
-        int tid = (int)current->ctx.x[10];
+        struct task *t = task_by_id((int)current->ctx.x[10]);
         struct vmload seg;
-        if (tid <= 0 || tid >= NTASK || tasks[tid].state != T_UNUSED ||
-            !tasks[tid].pt) {
+        if (!t || t == &tasks[0] || t->state != T_UNUSED || !t->pt) {
             current->ctx.x[10] = (uint64)-1;
             break;
         }
         vm_copy_across(kernel_pagetable, (uint64)&seg,
                        current->pt, current->ctx.x[11], sizeof(seg));
         current->ctx.x[10] =
-            (uint64)(long)vm_load_segment(&tasks[tid], current->pt, &seg);
+            (uint64)(long)vm_load_segment(t, current->pt, &seg);
         break;
     }
     case SYS_START: {
-        int tid = (int)current->ctx.x[10];
-        if (tid <= 0 || tid >= NTASK || tasks[tid].state != T_UNUSED ||
-            !tasks[tid].pt) {
+        struct task *t = task_by_id((int)current->ctx.x[10]);
+        if (!t || t == &tasks[0] || t->state != T_UNUSED || !t->pt) {
             current->ctx.x[10] = (uint64)-1;
             break;
         }
         struct startinfo si;
         vm_copy_across(kernel_pagetable, (uint64)&si,
                        current->pt, current->ctx.x[11], sizeof(si));
-        struct task *t = &tasks[tid];
         t->ctx.epc    = si.entry;
         t->ctx.x[2]   = si.sp ? si.sp : USTACK_TOP;   /* sp */
         t->ctx.x[10]  = si.a0;                        /* argc */

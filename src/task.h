@@ -25,7 +25,15 @@ struct task {
     struct context ctx;                      /* MUST be first (offset 0) */
     pagetable_t pt;                          /* this task's address space */
     enum task_state state;
+    /* An id is a slot index and a generation together. The slot alone is not
+       enough: slots are reused, and anything that remembered "task 6" — a
+       server holding a request it has not answered, a mount table entry —
+       would go on believing it after task 6 died and something else moved in.
+       The generation makes a stale id name nobody rather than the wrong
+       somebody, which is the difference between a request that fails and a
+       reply delivered to an innocent task. */
     int    id;
+    int    gen;                 /* bumped each time this slot is handed out */
     const char *name;
     char   namebuf[16];         /* for names that arrive by syscall */
     struct namespace *ns;       /* what paths mean to this task (Plan 9) */
@@ -48,6 +56,13 @@ struct task {
 
 extern struct task *current;
 extern struct task tasks[NTASK];   /* the table itself, so /proc can read it */
+
+/* The only correct way to turn an id back into a task: it checks the slot is
+   in use and that the generation still matches. Indexing tasks[] directly
+   with an id is the bug this exists to prevent. */
+#define TASK_SLOT(id)  ((id) & 0xff)
+#define TASK_GEN(id)   ((id) >> 8)
+struct task *task_by_id(int id);   /* 0 if that task is gone */
 
 struct task *task_create(const char *name, void (*entry)(void));
 struct task *task_create_user(const char *name, void (*entry)(void),

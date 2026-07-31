@@ -26,6 +26,31 @@ static void hputs(const char *s)
 /* Placed first by the link script; the loader jumps here via e_entry. */
 __attribute__((section(".text.start"))) void _start(int argc, char **argv)
 {
+    /* A deliberate bad citizen, for testing what happens to a server's
+       bookkeeping when a program does not clean up after itself. It opens a
+       control file and a connection and then exits holding both — which is
+       also, from the server's side, exactly what a program that faults looks
+       like. Nothing here closes anything. */
+    if (argc > 1 && argv[1][0] == 'l' && argv[1][1] == 'e' &&
+        argv[1][2] == 'a' && argv[1][3] == 'k' && argv[1][4] == 0) {
+        hputs("\n  [hello] opening /net/ctl and a connection, then exiting\n");
+        int c = vfs_open("/net/ctl");
+        const char *cmd = "connect 10.0.2.2 9998";
+        char ans[64];
+        if (c >= 0 && vfs_write(c, cmd, hlen(cmd)) >= 0) {
+            int n = vfs_read(c, ans, (int)sizeof(ans) - 1);
+            if (n > 0) {
+                ans[n] = 0;
+                hputs("  [hello] ctl says: ");
+                hputs(ans);
+            }
+        }
+        /* Open the connection too, and walk away from all of it. */
+        vfs_open("/net/tcp");
+        hputs("  [hello] exiting without closing anything\n");
+        sys_exit();
+    }
+
     hputs("\n  [hello] loaded from a file into a fresh address space\n");
 
     /* argc/argv arrive in a0/a1, exactly where the calling convention puts

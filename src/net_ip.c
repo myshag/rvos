@@ -470,6 +470,7 @@ enum {
 #define SNDBUF 2048       /* bytes written but not yet acknowledged */
 #define MSS    1024       /* the largest segment we send or advertise */
 #define NOOO   3          /* segments held aside waiting for a gap to close */
+#define NREF   3          /* programs that may hold one connection open */
 #define OOOSEG 1200
 
 #define RTO_MIN     200
@@ -547,7 +548,12 @@ struct tcb {
     struct parked opener;
     int      accepted;            /* handed to a program by accept */
 
-    int      fds;                 /* how many programs hold this open */
+    /* Who holds this connection open. A count would be enough if every
+       program closed what it opened; one that exits or faults holding a
+       descriptor does not, and the connection would stay open for ever. The
+       owner is recorded so the reference can be reclaimed on its behalf. */
+    struct { int used; int task; } refs[NREF];
+
     int      is_client;           /* the one /net/tcp names */
 };
 
@@ -950,6 +956,8 @@ static void rcv_data(struct tcb *c, uint32 seq, const uint8 *data, int len)
 
 static void demo_opened(struct tcb *c);
 static void net_wakeups(void);       /* answer anyone whose wait is over */
+static int  ref_count(const struct tcb *c);
+static void reap_dead_clients(void);
 static void abort_waiters(struct tcb *c, const char *why);
 
 /* A segment for a connection that does not exist. RFC 793 is specific about
@@ -1229,7 +1237,7 @@ static void tcp_segment(const uint8 *sip, const uint8 *t, int seglen)
             send_ack(c);
             net_puts("  tcp: peer closed its half\n");
             /* Nobody is holding it open, so there is nothing left to say. */
-            if (c->fds == 0)
+            if (ref_count(c) == 0)
                 tcp_close(c);
             break;
         case T_FIN_WAIT_1:
@@ -1352,6 +1360,7 @@ void net_timeout(void)
 {
     uint64 now = unow_ms();
 
+    reap_dead_clients();
     dns_retry(now);
 
     for (int i = 0; i < NTCB; i++) {
@@ -1523,11 +1532,13 @@ static int net_status(char *o, int cap)
             n = app(o, n, "  unacked ");
             n += uutoa((unsigned long)(c->snd_nxt - c->snd_una), o + n);
             n = app(o, n, "  srtt ");
-            if (c->srtt < 0)
+            if (c->srtt < 0) {
                 n = app(o, n, "-");
-            else
+            } else {
                 n += uutoa((unsigned long)c->srtt, o + n);
-            n = app(o, n, "ms  rto ");
+                n = app(o, n, "ms");
+            }
+            n = app(o, n, "  rto ");
             n += uutoa((unsigned long)c->rto, o + n);
             n = app(o, n, "ms  cwnd ");
             n += uutoa((unsigned long)c->cwnd, o + n);
@@ -1550,6 +1561,7 @@ enum { FD_STATUS0 = 1, FD_CTL0 = 8, FD_CONN0 = 16 };
 
 static struct {
     int  used;
+    int  owner;                     /* the task that opened it */
     int  off;
     int  len;                       /* ctl only: bytes of answer waiting */
     char answer[64];
@@ -1643,6 +1655,79 @@ static void ctl_answer(struct parked *p, const char *text, const uint8 *ip)
     struct parked q = *p;
     p->used = 0;
     reply_done(q.task, q.fd, VFS_WRITE, q.len);
+}
+
+/* ---- references, and reclaiming them ----------------------------------
+   A program that closes what it opened needs none of this. One that exits
+   while holding a descriptor — or faults, which is the same thing seen from
+   here — needs somebody to notice, or the connection it was using stays open
+   for ever and the slot never comes back.
+
+   Nothing tells this server that a task has died; there is no such message,
+   and inventing one would put knowledge of every server into the kernel. It
+   asks instead. Ids carry a generation, so the question "is that still the
+   task I gave this to?" has an answer even after the slot has been reused. */
+
+static int ref_add(struct tcb *c, int task)
+{
+    for (int i = 0; i < NREF; i++)
+        if (!c->refs[i].used) {
+            c->refs[i].used = 1;
+            c->refs[i].task = task;
+            return 0;
+        }
+    return -1;
+}
+
+static int ref_count(const struct tcb *c)
+{
+    int n = 0;
+    for (int i = 0; i < NREF; i++)
+        n += c->refs[i].used;
+    return n;
+}
+
+static void ref_drop(struct tcb *c, int task)
+{
+    for (int i = 0; i < NREF; i++)
+        if (c->refs[i].used && c->refs[i].task == task) {
+            c->refs[i].used = 0;
+            return;
+        }
+}
+
+/* Called before serving any request and on every timer tick: cheap enough at
+   this scale that there is no reason to be clever about when. */
+static void reap_dead_clients(void)
+{
+    for (int i = 0; i < NPFD; i++)
+        if (pfd[i].used && !sys_alive(pfd[i].owner)) {
+            net_putn("  net: reclaiming a control file from dead task ",
+                     (unsigned long)pfd[i].owner, "\n");
+            pfd[i].used = 0;
+        }
+
+    for (int i = 0; i < NTCB; i++) {
+        struct tcb *c = &tcbs[i];
+        if (c->state == T_FREE)
+            continue;
+        if (c->reader.used && !sys_alive(c->reader.task))
+            c->reader.used = 0;
+        if (c->opener.used && !sys_alive(c->opener.task))
+            c->opener.used = 0;
+
+        int had = ref_count(c);
+        for (int k = 0; k < NREF; k++)
+            if (c->refs[k].used && !sys_alive(c->refs[k].task)) {
+                net_putn("  net: reclaiming a connection from dead task ",
+                         (unsigned long)c->refs[k].task, "\n");
+                c->refs[k].used = 0;
+            }
+        /* The last holder is gone, so the connection has nothing left to say.
+           Closing it is what that program would have done had it lived. */
+        if (had > 0 && ref_count(c) == 0)
+            tcp_close(c);
+    }
 }
 
 /* A connection that will never come up. Whoever was waiting on it has to be
@@ -1843,6 +1928,11 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
             if (!c)
                 n = app(o, n, "error no free connection\n");
             else {
+                /* Whoever asked for the connection holds it, from the moment
+                   it exists. Waiting for them to open /net/tcp/N would leave
+                   a window in which the connection belongs to nobody and
+                   would survive its creator. */
+                ref_add(c, from);
                 /* Park until the handshake finishes. A program has nothing to
                    do with a connection that is not up, and telling it the slot
                    number early only invites it to poll. */
@@ -1862,6 +1952,7 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
             if (!c)
                 n = app(o, n, "error no free connection\n");
             else {
+                ref_add(c, from);       /* the port belongs to whoever asked */
                 n = app(o, n, "ok ");
                 n += uutoa((unsigned long)(c - tcbs), o + n);
                 o[n++] = '\n';
@@ -1907,6 +1998,8 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
 
 int net_vfs(int from, struct vfs_req *r)
 {
+    reap_dead_clients();
+
     switch (r->op) {
     case VFS_OPEN: {
         int base = -1;
@@ -1919,9 +2012,10 @@ int net_vfs(int from, struct vfs_req *r)
             r->result = -1;
             for (int i = 0; i < NPFD; i++)
                 if (!pfd[i].used) {
-                    pfd[i].used = 1;
-                    pfd[i].off  = 0;
-                    pfd[i].len  = 0;
+                    pfd[i].used  = 1;
+                    pfd[i].owner = from;
+                    pfd[i].off   = 0;
+                    pfd[i].len   = 0;
                     r->result = base + i;
                     break;
                 }
@@ -1929,16 +2023,18 @@ int net_vfs(int from, struct vfs_req *r)
             int i = path_slot(r->path);
             if (i < 0 || tcbs[i].state == T_FREE) {
                 r->result = -1;
+            } else if (ref_add(&tcbs[i], from) < 0) {
+                r->result = -1;             /* too many holders */
             } else {
-                tcbs[i].fds++;
                 r->result = FD_CONN0 + i;
             }
         } else if (ustr_has_prefix(r->path, "/net/tcp")) {
             int i = client_slot();
             if (i < 0) {
                 r->result = -1;
+            } else if (ref_add(&tcbs[i], from) < 0) {
+                r->result = -1;
             } else {
-                tcbs[i].fds++;
                 r->result = FD_CONN0 + i;
             }
         } else {
@@ -2042,9 +2138,10 @@ int net_vfs(int from, struct vfs_req *r)
                too — a program that has stopped reading and writing has said
                everything it is going to say. */
             struct tcb *c = conn_of(r->fd);
-            if (c && --c->fds <= 0) {
-                c->fds = 0;
-                tcp_close(c);
+            if (c) {
+                ref_drop(c, from);
+                if (ref_count(c) == 0)
+                    tcp_close(c);
             }
         }
         r->result = 0;

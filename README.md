@@ -333,6 +333,8 @@ $ read the fs server's private data region
     on the disk that owns a port and serves callers itself
 23. `resolve` and a blocking `connect`; the HTTP fetch leaves the stack and
     becomes `/GET.ELF`, a program that names its own host
+24. generation-tagged task ids, a `send` that reports a dead destination, and
+    servers that reclaim what a dead client was holding
 
 ## Loading a program
 
@@ -989,12 +991,13 @@ neither side knowing anything about the other.
 ### Honest limits
 
 One waiter per connection, and one for the console: a second reader is told 0
-rather than queued. A parked task that dies is never noticed, and the reply
-that eventually goes to it will block the server, since `sys_send` is a
-rendezvous — a real system needs the kernel to tell a sender that its
-destination is gone. There is no `poll`, so a program that wants to wait on
-two things at once cannot; `netd` handles one caller at a time for exactly
-that reason.
+rather than queued. Nothing notices when a client dies holding server-side
+state, so a program that exits without closing leaks it. And there is no
+`poll`, so a program that wants to wait on two things at once cannot; `netd`
+handles one caller at a time for exactly that reason.
+
+The second of those is dealt with in [Knowing who is
+gone](#knowing-who-is-gone) below.
 
 ## Fetching a page, from the operating system
 
@@ -1070,12 +1073,114 @@ Nothing was deliberately dropped there. The initial retransmission timeout is
 real: 300, 600, 1200, and the connection came up on the fourth attempt. Up to
 this point every retransmission in this project had been staged.
 
+## Knowing who is gone
+
+Everything above assumed programs behave. A program that closes what it opened
+costs a server nothing; one that exits — or faults, which from the server's
+side is the same event — while holding a descriptor leaves state behind that
+nothing will ever reclaim. Following that through turned up three separate
+problems, only one of which was the one that had been written down.
+
+**A task id named a slot, and slots are reused.** `tasks[]` is a fixed table
+and `task_retire` hands the slot back; the next `SYS_NEWTASK` takes it, with
+the same id. Anything that had remembered that id — a server holding an
+unanswered request, a mount table entry, another task about to send — went on
+believing it. The failure is not a hang, which would at least be visible: it
+is a message delivered correctly to the wrong task.
+
+An id is now a slot and a generation together, and the generation is bumped
+when the slot is released:
+
+```c
+tasks[i].id = i | (tasks[i].gen << 8);       /* on allocation */
+t->gen++;                                    /* on retirement */
+```
+
+so `task_by_id()` can tell "gone" from "someone else". The ids the boot tasks
+get are unchanged, because generation 0 leaves them equal to the slot — which
+is why `servers.h` still names them by number. In the transcript below,
+`task 519` is slot 7, generation 2: the same slot as tasks 7 and 263 before
+it, and provably not the same task.
+
+**`sys_send` returned nothing.** The kernel already refused to send to a dead
+task, but the wrapper threw the answer away, so `vfs_call` sent, ignored the
+failure, and then blocked in `recv` waiting for a reply that could not come.
+Calling a server that had died hung the caller permanently. It returns `int`
+now and `vfs_call` gives up instead.
+
+**Nothing told a server that a client was gone — and nothing should.** The
+obvious fix is a message from the kernel when a task dies, which means the
+kernel keeping a list of who cares, which means the kernel knowing what a
+server is. The cheaper answer is to let servers ask:
+
+```c
+SYS_ALIVE   /* a0 = task id -> 1 if that id still names that task */
+```
+
+Every open now records the task that made it, and the network server sweeps
+its own tables before serving a request and on every timer tick. A connection
+whose last holder has died is closed exactly as that program would have closed
+it — which, since it is TCP, means a real FIN and a real TIME-WAIT, not a
+table entry silently dropped.
+
+Ownership starts earlier than the first `open`: a connection belongs to
+whoever asked `/net/ctl` for it, from the moment it exists. Waiting until the
+program opens `/net/tcp/N` would leave a window in which the connection
+belonged to nobody and would outlive its creator.
+
+`/HELLO.ELF leak` is a deliberate bad citizen — it opens a control file and a
+connection and exits holding both:
+
+```
+rvos$ /HELLO.ELF leak
+  [hello] opening /net/ctl and a connection, then exiting
+  tcp: SYN -> 10.0.2.2:9998
+  tcp: connection established
+  [hello] ctl says: ok 1
+  [hello] exiting without closing anything
+
+rvos$ cat /net/status
+  net: reclaiming a control file from dead task 263
+  net: reclaiming a connection from dead task 263
+  tcp: closing (active)
+  tcp: closed
+```
+
+and a listener held by a program that is still running is left alone, which is
+the property that actually matters:
+
+```
+rvos$ /NETD.ELF
+rvos$ /HELLO.ELF leak
+  net: reclaiming a control file from dead task 519
+rvos$ cat /net/status
+tcp 0 listen       :7                     <- netd's, untouched
+```
+
+### The limitation as stated was not the one that existed
+
+The previous section claimed a *parked* task could die and wedge the server on
+the reply. It cannot: a task parked in a read is blocked in `sys_recv`, and a
+task that cannot run cannot exit or fault. The reachable version of the
+problem was the duller one — a task dying with a descriptor open — and it was
+worth finding out which, because the fix is different. The parked-request case
+is now guarded anyway, since guarding it costs one comparison.
+
+### Still not fixed
+
+Reclamation is lazy: a leaked connection lingers until the next request or the
+next timer tick. Nothing wakes the server to do it sooner, and on a system
+where that mattered the kernel would have to say something after all. The
+sweep also costs a handful of `SYS_ALIVE` traps per request, which is fine at
+four connections and would not be at four thousand. And the console still
+takes one waiter.
+
 ## Next steps
 
 - `poll`/`select`, or a second task per connection — either would let `netd`
   serve more than one caller at a time
-- noticing that a parked task has died, instead of blocking a server forever
-  on a reply nobody will take
+- more than one waiter on the console, so two programs can read keystrokes
+  without one of them being told 0
 - delayed acknowledgements and Nagle's algorithm: this stack answers every
   segment at once and sends every write as its own segment
 - selective acknowledgement, so a loss costs one segment rather than
