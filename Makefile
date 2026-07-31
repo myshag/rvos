@@ -80,7 +80,15 @@ QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic \
            -netdev user,id=n0,hostfwd=tcp:$(HOSTIP):$(ECHOPORT)-:7,\
 hostfwd=tcp:$(HOSTIP):$(TELNETPORT)-:23,\
 hostfwd=tcp:$(HOSTIP):$(EXPORTPORT)-:564 \
-           -device virtio-net-device,netdev=n0 $(DRIVE)
+           -device virtio-net-device,netdev=n0 $(DRIVE) $(USB)
+
+# There is no USB on this board unless one is asked for, and asking is the
+# point: it puts a real controller on the PCI bus for the enumeration in
+# pci.c to find. It finds it (00:01.0, class 0c0330, xhci) and does not drive
+# it — an xHCI driver is rings, contexts and control transfers, and a stage of
+# its own. The keyboard and tablet behind it are there so the controller has
+# something to have found.
+USB     ?= -device qemu-xhci -device usb-kbd -device usb-tablet
 
 .PHONY: all run rundisk runpcap disk prog clean
 all: $(ELF)

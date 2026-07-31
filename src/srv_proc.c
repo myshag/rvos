@@ -54,7 +54,10 @@ static int append(char *out, int o, const char *s)
 /* The task table is kernel memory, so this asks for it an entry at a time
    rather than reading it. Formatting stays here: policy belongs in the
    server, the kernel only hands over the facts. */
-#define PROC_NTASK 10
+/* As many slots as the kernel has. It was ten, which was the number of tasks
+   there were when this was written, and a task in slot eleven was invisible
+   to `ps` — which is a worse failure than a long listing. */
+#define PROC_NTASK 18
 static int format_tasks(char *out, int cap)
 {
     int o = 0;

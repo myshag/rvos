@@ -218,6 +218,7 @@ static inline int vfs_mounts_in(const char *dir, char *out, int cap)
 
         int pe = s;                                 /* the prefix ends at " -> " */
         while (pe < e && buf[pe] != ' ') pe++;
+        int plen0 = pe - s - 1;                     /* the last character */
         while (pe > s + 1 && buf[pe - 1] == '/') pe--;
 
         const char *P = buf + s;
@@ -235,7 +236,11 @@ static inline int vfs_mounts_in(const char *dir, char *out, int cap)
         if (!same)
             continue;
 
-        out[o++] = 'd'; out[o++] = ' '; out[o++] = '0'; out[o++] = ' ';
+        /* A prefix that ends in a slash was mounted as a directory of names
+           and one that does not was mounted as a single name — /proc/ against
+           /dev/console. The table records the difference; this repeats it. */
+        out[o++] = buf[s + plen0] == '/' ? 'd' : '-';
+        out[o++] = ' '; out[o++] = '0'; out[o++] = ' ';
         for (int k = cut + 1; k < plen; k++)
             out[o++] = P[k];
         out[o++] = '\n';

@@ -10,6 +10,8 @@
 #include "vm.h"
 #include "pmm.h"
 #include "elf.h"
+#include "fdt.h"
+#include "pci.h"
 
 struct task tasks[NTASK];
 struct task *current;
@@ -477,6 +479,26 @@ void syscall_dispatch(uint64 num)
         }
         current->brk = want;
         current->ctx.x[10] = old;
+        break;
+    }
+    case SYS_DEVINFO: {
+        static char kbuf[2048];
+        int what  = (int)current->ctx.x[10];
+        int index = (int)current->ctx.x[11];
+        uint64 out = current->ctx.x[12];
+        int    cap = (int)current->ctx.x[13];
+        int n = -1;
+        if (what == DEVINFO_TREE)
+            n = fdt_render(kbuf, (int)sizeof(kbuf));
+        else if (what == DEVINFO_NAME)
+            n = pci_name(index, kbuf, (int)sizeof(kbuf));
+        else if (what == DEVINFO_PCI)
+            n = pci_render(index, kbuf, (int)sizeof(kbuf));
+        if (n > cap) n = cap;
+        if (n > 0)
+            vm_copy_across(current->pt, out, kernel_pagetable,
+                           (uint64)kbuf, (uint64)n);
+        current->ctx.x[10] = (uint64)(long)n;
         break;
     }
     case SYS_KILL: {

@@ -23,3 +23,4 @@ void fs_server(void);        /* srv_fs.c      — FAT16 behind the interface */
 void console_server(void);   /* srv_console.c — UART behind the interface */
 void proc_server(void);      /* srv_proc.c    — kernel state as files */
 void null_server(void);      /* srv_null.c    — the bit bucket */
+void dev_server(void);       /* srv_dev.c     — what the board said it is */

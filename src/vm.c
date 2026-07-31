@@ -20,6 +20,7 @@
 #include "uart.h"
 #include "elf.h"
 #include "task.h"
+#include "fdt.h"
 
 pagetable_t kernel_pagetable;
 uint64      kernel_satp;
@@ -291,6 +292,18 @@ void vm_init(void)
     /* PLIC: the kernel claims and completes here on every device interrupt. */
     vm_map_at(kernel_pagetable, PLIC_BASE_PA, PLIC_BASE_PA, PLIC_SIZE,
               PTE_R | PTE_W, 0);
+
+    /* PCI configuration space, where the device tree says it is. The window
+       is 256 MiB — one page of registers per function, for eight functions on
+       each of thirty-two devices on each of 256 buses — and two megabytes of
+       it, which is the first two buses, is as far as anything here looks. One
+       superpage rather than five hundred and twelve pages. */
+    {
+        uint64 base, size;
+        if (fdt_reg("pci@", &base, &size) == 0)
+            vm_map_at(kernel_pagetable, base, base,
+                      size < 0x200000 ? size : 0x200000, PTE_R | PTE_W, 1);
+    }
 
     kernel_satp = MAKE_SATP(kernel_pagetable);
     w_satp(kernel_satp);

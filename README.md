@@ -3292,6 +3292,114 @@ Hello from rvos!
 is a thing this system needs in order to test the thing that stops it.
 
 
+## The machine describes itself
+
+Every address in this kernel was a constant. The UART at 0x10000000, the PLIC
+at 0x0c000000, eight virtio transports a page apart from 0x10001000 — each one
+correct, and each one correct by having been looked up in QEMU's source rather
+than asked for. The board has been saying all of it since the first
+instruction: RISC-V systems are entered with `a1` holding a **flattened device
+tree**, and `boot.S` threw it away.
+
+```
+[boot] device tree at 0x87e00000
+       serial   0x10000000 irq 10
+       plic     0xc000000 + 0x600000
+       pci ecam 0x30000000 + 0x10000000
+       virtio slots: 8
+[boot] pci: 2 functions on the bus
+       00:00.0  1b36:0008  host bridge
+       00:01.0  1b36:000d  usb xhci
+```
+
+Four lines of assembly keep it: `mv s0, a1` before the `.bss` clear and a
+store after it, because storing before would zero the thing being stored.
+
+### The format, since it is the one structure that arrives from outside
+
+```
+header    magic d00dfeed, then the offsets of the two blocks below
+strings   property names, concatenated, NUL-terminated
+struct    a stream of big-endian 32-bit tokens:
+            1 BEGIN_NODE  followed by the name, NUL-padded to 4
+            2 END_NODE
+            3 PROP        length, name-offset into strings, then bytes
+            9 END
+```
+
+Big-endian, on a little-endian machine — the price of a format designed for
+Open Firmware on PowerPC and kept because it works. `src/fdt.c` is one walk
+with a callback and three questions asked through it: where is this node, how
+many are there, and render the lot. The one shortcut is that `reg` is read as
+64-bit address and size rather than consulting the parent's `#address-cells`;
+on this board both are 2, and the assumption is written down beside the code
+rather than hidden in it.
+
+### The bus, and what a bus answers
+
+The tree says where the configuration space is; `src/pci.c` reads it. On this
+board it is ECAM, which is the simplest arrangement there could be: every
+function's 4 KiB of configuration registers is *memory*, at
+
+```
+ecam + (bus << 20) + (device << 15) + (function << 12)
+```
+
+so enumeration is a loop over addresses and one test. A function that is not
+there answers 0xffff for its vendor — not a convention agreed between the bus
+and the reader, but what a read with nobody driving the lines returns, which
+became the rule because it was already the behaviour. (The older mechanism,
+still what x86 firmware uses at boot, is a pair of I/O ports and needs a lock,
+because the pair is global state. ECAM needs nothing.)
+
+Two facts the enumeration makes plain. **The interrupt line is 0 and every BAR
+is 0**, because nothing has assigned them: that is firmware's job and no
+firmware runs here. The bus is enumerable and unconfigured, and the difference
+between those two words is most of what a BIOS is for.
+
+### USB
+
+There is no USB on this board unless you ask for one, and asking is the point:
+`-device qemu-xhci -device usb-kbd -device usb-tablet` puts a real controller
+on the bus for the enumeration to find. It finds it — `00:01.0`, class
+`0c0330`, which the class table reads as *usb xhci* — and does not drive it.
+An xHCI driver is rings, contexts, control transfers and descriptor parsing,
+and it is a stage of its own. What the device file says is `driver none`,
+which is the honest thing for a discovery pass to report.
+
+### And the tree becomes files
+
+```
+rvos$ ls /dev              rvos$ ls /dev/pci        rvos$ cat /dev/pci/00:01.0
+tree  (0 bytes)            00:00.0  (0 bytes)       vendor   1b36
+pci/                       00:01.0  (0 bytes)       device   000d
+console  (0 bytes)                                  class    0c0330  usb xhci
+                                                    irq      0
+                                                    driver   none
+```
+
+`cat /dev/tree` is the whole device tree, indented, with the properties that
+say where a thing is and how to hear from it.
+
+Two arrangements were needed. **Two servers answer under /dev, and there is no
+union between them**: the console is mounted at the exact name `/dev/console`
+and the device server at the prefix `/dev/`, and resolution takes the longest
+match. So the console keeps its name and everything else under /dev is the
+board describing itself; `ls /dev` shows all of it because the client already
+adds a directory's mount points to what the serving directory said. That
+listing now distinguishes them, too — a prefix that ends in a slash was
+mounted as a directory of names and one that does not was mounted as a single
+name, which is a difference the mount table was already recording and nothing
+was reading.
+
+**And the kernel hands the facts over as text.** The device tree and the
+configuration space are physical addresses a user task does not have, so
+`SYS_DEVINFO` renders and copies, exactly as `sys_pgdump` and `sys_mounts` do
+for the page tables and the namespace. The server does no formatting of its
+own beyond building a directory listing out of the names — it is the fourth
+module with nothing behind it but kernel state, and the thinnest of them.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

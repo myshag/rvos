@@ -29,6 +29,7 @@ SECTIONS
         *srv_fs.o(.text .text.*)
         *srv_blk.o(.text .text.*)
         *srv_proc.o(.text .text.*)
+        *srv_dev.o(.text .text.*)
         *loader.o(.text .text.*)
         */sh.o(.text .text.*)
         *srv_rsh.o(.text .text.*)
@@ -45,6 +46,7 @@ SECTIONS
         *srv_fs.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_blk.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_proc.o(.rodata .rodata.* .srodata .srodata.*)
+        *srv_dev.o(.rodata .rodata.* .srodata .srodata.*)
         *loader.o(.rodata .rodata.* .srodata .srodata.*)
         */sh.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_rsh.o(.rodata .rodata.* .srodata .srodata.*)
@@ -96,6 +98,21 @@ SECTIONS
     __uproc_bss_end = .;
     . = ALIGN(4096);
     __uproc_end = .;
+
+    /* the device server (its rendered-file buffers) */
+    __udev_start = .;
+    .udev_data : {
+        *srv_dev.o(.data .data.* .sdata .sdata.*)
+    }
+    . = ALIGN(8);
+    __udev_bss_start = .;
+    .udev_bss : {
+        *srv_dev.o(.sbss .sbss.* .bss .bss.* COMMON)
+    }
+    . = ALIGN(8);
+    __udev_bss_end = .;
+    . = ALIGN(4096);
+    __udev_end = .;
 
     /* the ELF loader (its file buffer) */
     __uload_start = .;

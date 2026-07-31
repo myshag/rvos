@@ -16,6 +16,8 @@
 #include "servers.h"
 #include "pmm.h"
 #include "vm.h"
+#include "fdt.h"
+#include "pci.h"
 #include "plic.h"
 #include "virtio.h"
 #include "util.h"
@@ -167,6 +169,7 @@ void smain(void)
     {
         extern char __ufs_bss_start[],   __ufs_bss_end[];
         extern char __uproc_bss_start[], __uproc_bss_end[];
+        extern char __udev_bss_start[],  __udev_bss_end[];
         extern char __uload_bss_start[], __uload_bss_end[];
         extern char __ush_bss_start[],   __ush_bss_end[];
         extern char __ursh_bss_start[],  __ursh_bss_end[];
@@ -175,6 +178,7 @@ void smain(void)
         char *bss[][2] = {
             { __ufs_bss_start,   __ufs_bss_end   },
             { __uproc_bss_start, __uproc_bss_end },
+            { __udev_bss_start,  __udev_bss_end  },
             { __uload_bss_start, __uload_bss_end },
             { __ush_bss_start,   __ush_bss_end   },
             { __ursh_bss_start,  __ursh_bss_end  },
@@ -185,10 +189,42 @@ void smain(void)
             memset(bss[i][0], 0, (size_t)(bss[i][1] - bss[i][0]));
     }
 
+    /* Before anything is mapped: ask the machine what it is. Every address
+       this kernel used to know by heart is in here. */
+    if (fdt_init() == 0) {
+        uint64 base, size;
+        int irq = 0;
+        kprintf("[boot] device tree at 0x%lx\n", dtb_pa);
+        if (fdt_reg_n("serial@", 0, &base, &size, &irq) == 0)
+            kprintf("       serial   0x%lx irq %d\n", base, irq);
+        if (fdt_reg("plic@", &base, &size) == 0)
+            kprintf("       plic     0x%lx + 0x%lx\n", base, size);
+        if (fdt_reg("pci@", &base, &size) == 0)
+            kprintf("       pci ecam 0x%lx + 0x%lx\n", base, size);
+        kprintf("       virtio slots: %d\n", fdt_count("virtio_mmio@"));
+    } else {
+        kprintf("[boot] no device tree; the constants stand\n");
+    }
+
     pmm_init();
     vm_init();
     kprintf("[boot] Sv39 on, kernel satp=0x%lx, %d pages free\n",
             r_satp(), pmm_free_count());
+
+    /* Now that the window is mapped, ask the bus. */
+    {
+        int n = pci_init();
+        if (n > 0) {
+            kprintf("[boot] pci: %d functions on the bus\n", n);
+            for (int i = 0; i < n; i++) {
+                char line[80];
+                pci_summary(i, line, (int)sizeof(line));
+                kprintf("       %s\n", line);
+            }
+        } else {
+            kprintf("[boot] pci: nothing on the bus\n");
+        }
+    }
 
     trap_init();
     timer_init();
@@ -261,10 +297,26 @@ void smain(void)
     vm_map_at(net->pt, VIRTIO_MMIO_BASE, VIRTIO_MMIO_BASE,
               VIRTIO_MMIO_STRIDE * VIRTIO_MMIO_SLOTS, PTE_R | PTE_W | PTE_U, 0);
 
+    /* Created last so that no task id above shifts: every other server is
+       named by a constant that is its position in this list. This one is
+       named by the pointer it was just handed, which is the better way and
+       would be a pleasant afternoon's work to make general. */
+    struct task *devt;
+    {
+        extern char __udev_start[], __udev_end[];
+        devt = task_create_user("dev", dev_server, __udev_start, __udev_end);
+    }
+
     vfs_mount("/",      FS_TASK_ID, MREPL);
-    vfs_mount("/dev/",  CONSOLE_TASK_ID, MREPL);
     vfs_mount("/proc/", PROC_TASK_ID, MREPL);
     vfs_mount("/net/",  NET_TASK_ID, MREPL);
+    /* Two servers answer under /dev and there is no union between them: the
+       console is mounted at the exact name and the device server at the
+       prefix, and resolution takes the longest match. So /dev/console is
+       still the console, and everything else under /dev is the board
+       describing itself. */
+    vfs_mount("/dev/", devt ? devt->id : CONSOLE_TASK_ID, MREPL);
+    vfs_mount("/dev/console", CONSOLE_TASK_ID, MREPL);
 
     kprintf("[boot] 4 user servers, 3 kernel apps, 2 user programs, %d pages.\n",
             pmm_free_count());

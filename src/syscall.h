@@ -101,6 +101,19 @@ enum {
        notion of who owns whom. That is a real hole and it is written down
        rather than hidden — see the README. */
     SYS_KILL    = 26,     /* a0 = task id -> 0, or -1 if there is no such task */
+
+    /* What the machine said about itself. The device tree and the PCI
+       configuration space are physical addresses the kernel maps and a user
+       task does not — so, like the task table and the page tables, the facts
+       are handed over as text and the formatting is left to whoever asked.
+       a0 picks the question, a1 the index where one applies. */
+    SYS_DEVINFO = 27,     /* a0 = what, a1 = index, a2 = buf, a3 = cap */
+};
+
+enum {
+    DEVINFO_TREE = 0,     /* the flattened device tree, rendered */
+    DEVINFO_NAME,         /* "00:01.0" for pci function a1, -1 past the end */
+    DEVINFO_PCI,          /* that function's vendor, class, bars, irq */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -260,6 +273,11 @@ static inline int sys_pgdump(int task_id, unsigned long va, void *out, int cap)
 static inline int sys_send(int dst, const void *msg, int len)
 {
     return (int)_ecall3(SYS_SEND, dst, (long)msg, len);
+}
+
+static inline int sys_devinfo(int what, int index, char *out, int cap)
+{
+    return (int)_ecall4(SYS_DEVINFO, what, index, (long)out, cap);
 }
 
 static inline int sys_kill(int task_id)
