@@ -56,7 +56,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/trap.c`       | timer setup, trap/`ecall` dispatch, interrupt ownership |
 | `src/plic.c`       | the interrupt controller — how a device reaches the kernel |
 | `src/srv_net.c`    | **virtio-net driver** — user mode, owns the card |
-| `src/net_ip.c`     | ARP, IPv4, UDP and a minimal TCP client |
+| `src/net_ip.c`     | ARP, IPv4, ICMP, UDP, DNS and TCP; the network as files |
 | `src/task.c`       | task table, preemptive round-robin scheduler, syscalls |
 | `src/ipc.c`        | synchronous rendezvous `send`/`recv` |
 | `src/vfs.h`        | **the one interface** + client wrappers |
@@ -72,6 +72,8 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/loader.c`     | **ELF loader** — user mode; the kernel never parses ELF |
 | `src/sh.c`         | an interactive shell — reads a line, runs what you typed |
 | `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
+| `prog/netd.c`      | a program that owns TCP port 7 and answers callers |
+| `prog/get.c`       | an HTTP client: resolve, connect, fetch — all through files |
 | `src/kmain.c`      | boot, initial namespace, the demo shell |
 
 ## Design notes
