@@ -646,14 +646,33 @@ static inline int doupdate(void)
     for (int y = 0; y < LINES; y++) {
         const chtype *nw = cur__new + y * CURSES_MAXCOLS;
         chtype *ph = cur__phy + y * CURSES_MAXCOLS;
+
+        /* The last cell of the last line is not written, ever.
+
+           Terminals disagree about what happens when a character lands in the
+           final column: some leave the cursor there with the wrap pending
+           until the next character, which is harmless, and some wrap at once
+           — which on the bottom line means the screen scrolls. Everything
+           afterwards is then one row from where this library believes it is,
+           and since it sends only differences, it never finds out. The
+           picture that produces is a screen that looks doubled.
+
+           The original curses has the same hole and closes it the same way:
+           the corner is left blank unless the terminal advertises a way to
+           insert a character there. This one always leaves it, and claims it
+           was written so that no later update tries again. */
+        int last = (y == LINES - 1) ? COLS - 1 : COLS;
+        if (y == LINES - 1 && COLS > 0)
+            ph[COLS - 1] = nw[COLS - 1];
+
         int x = 0;
-        while (x < COLS) {
+        while (x < last) {
             if (nw[x] == ph[x]) { x++; continue; }
 
             /* Find where this run of differences ends, allowing a few
                identical cells inside it. */
             int end = x + 1, gap = 0;
-            for (int j = x + 1; j < COLS; j++) {
+            for (int j = x + 1; j < last; j++) {
                 if (nw[j] != ph[j]) { end = j + 1; gap = 0; }
                 else if (++gap > CURSES_GAP) break;
             }
@@ -665,8 +684,9 @@ static inline int doupdate(void)
                 ph[j] = nw[j];
             }
             cur__px = end;
-            /* A character written in the last column leaves the cursor in a
-               place terminals disagree about. Forget where it is. */
+            /* A character written in the last column of any other line leaves
+               the cursor where terminals disagree about. Forget where it is,
+               and the next thing sent will be an absolute move. */
             if (end >= COLS)
                 cur__py = -1;
             x = end;

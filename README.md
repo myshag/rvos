@@ -2593,6 +2593,41 @@ is no vsnprintf; and `nodelay`, because the console server answers a read when
 a key arrives and there is no way to ask it whether one is waiting. Blocking
 is a server declining to answer yet, and it does not do partial refusals.
 
+### The corner that cannot be written
+
+The first bug report was "pressing Enter makes the screen double, downwards",
+and the cause is a corner of terminal behaviour old enough that the original
+curses has a workaround for it.
+
+Terminals disagree about what happens when a character lands in the *last
+column*. Some leave the cursor sitting there with the wrap pending until the
+next character arrives, which is harmless. Some wrap immediately — and on the
+bottom line, wrapping means the screen scrolls. The key strip is padded to the
+full width, so every full redraw wrote that cell, and on a terminal of the
+second kind the whole picture moved up one row.
+
+The hand-written version did this too, five times in a five-keystroke session.
+It got away with it because it redrew everything on every key: the damage was
+painted over before anyone could read it, and all that was lost was the top
+line, briefly. The differential update does not paint over anything. It sends
+the difference between two screens and never looks at the terminal again, so
+one silent scroll leaves the library's model one row out of register for the
+rest of the session — and the next big repaint lands rows in the wrong places
+and the result looks doubled. **The library did not introduce this bug; it
+made a bug that was already there impossible to ignore.**
+
+The fix is the one ncurses uses: the bottom-right cell is never written, and
+the library records it as though it had been so that no later update tries
+again. One blank cell in the corner, and the screen holds still.
+
+Finding it needed a better tool than the last one. `screen.py`, the renderer
+these captures go through, models cursor movement and nothing else — no
+wrapping, no scrolling — so it showed a perfect screen while a real terminal
+was sliding. A second one that does model both now reads the same byte stream
+twice, once with each wrapping rule, and asserts that the two pictures come
+out identical. That is the actual property being claimed, and it was worth
+sixteen keystrokes to check: Enter, the viewer, PgUp, PgDn, Home, End, Tab.
+
 ### Two things the port found
 
 The panel used to compute its list height from the screen height, arrive at
