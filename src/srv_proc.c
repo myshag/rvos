@@ -4,22 +4,31 @@
    system by binding "/proc/" into the namespace, and not one line of the
    kernel changed to make it possible.
 
-     /proc/tasks   task table: id, state, name
-     /proc/mounts  the namespace itself, as text
+     /proc/tasks       task table: id, state, name
+     /proc/mounts      the namespace of whoever is asking
+     /proc/pagetable   the address space of whoever is asking
+     /proc/<id>/       the same two questions about a named task
+
+   The unqualified names answer about the caller, and that is not a shortcut.
+   A message carries its sender, so this server is told who is asking without
+   the path having to say — which is why Linux needs /proc/self and this does
+   not. The numbered directories are for the other question, the one the
+   sender cannot ask about itself: what does *that* task see.
 */
 #include "vfs.h"
 #include "servers.h"
 #include "syscall.h"
 #include "ulib.h"
+#include "malloc.h"
 
 #define PROC_MAXFD 2
-#define PROC_BUFSZ 1024
+#define PROC_BUFSZ 4096         /* one render; the pagetable dump is the big one */
 
 struct proc_file {
-    int  used;
-    int  size;
-    int  pos;
-    char data[PROC_BUFSZ];
+    int   used;
+    int   size;
+    int   pos;
+    char *data;
 };
 static struct proc_file p_tab[PROC_MAXFD];
 
@@ -70,14 +79,14 @@ static int format_tasks(char *out, int cap)
    there is no single namespace. Two tasks reading this file see their own
    stack land on different physical pages, and see the disk mapped or not
    depending on whether they are the filesystem. */
-static int format_pagetable(int caller, char *out, int cap)
+static int format_pagetable(int who, char *out, int cap)
 {
     int o = 0;
     int mem[2] = { 0, 0 };
     sys_meminfo(mem);
 
     o = append(out, o, "task ");
-    o += uutoa((unsigned long)caller, out + o);
+    o += uutoa((unsigned long)who, out + o);
     out[o++] = '\n';
     o = append(out, o, "free pages ");
     o += uutoa((unsigned long)mem[0], out + o);
@@ -90,13 +99,63 @@ static int format_pagetable(int caller, char *out, int cap)
        which this server has no mapping for. Asking the kernel is now the only
        way to see a translation. */
     o = append(out, o, "its stack:\n");
-    o += sys_pgdump(caller, USTACK_TOP - PGSIZE, out + o, cap - o);
+    o += sys_pgdump(who, USTACK_TOP - PGSIZE, out + o, cap - o);
+    out[o++] = '\n';
+    o = append(out, o, "its heap:\n");
+    o += sys_pgdump(who, UHEAP_BASE, out + o, cap - o);
     out[o++] = '\n';
     o = append(out, o, "the UART (shared):\n");
-    o += sys_pgdump(caller, UART_BASE_PA, out + o, cap - o);
-    out[o++] = '\n';
-    o = append(out, o, "the FAT16 image:\n");
-    o += sys_pgdump(caller, DISK_PA, out + o, cap - o);
+    o += sys_pgdump(who, UART_BASE_PA, out + o, cap - o);
+    return o;
+}
+
+/* "/proc/1030/pagetable" -> 1030, and `rest` left pointing at "pagetable".
+   Returns -1 for anything that is not a number after /proc/, which is how
+   /proc/tasks and /proc/1030 are told apart without a table of names. */
+static int path_task(const char *p, const char **rest)
+{
+    if (!ustr_has_prefix(p, "/proc/"))
+        return -1;
+    p += 6;
+    if (*p < '0' || *p > '9')
+        return -1;
+    int id = 0;
+    while (*p >= '0' && *p <= '9')
+        id = id * 10 + (*p++ - '0');
+    if (*p == '/')
+        p++;
+    *rest = p;
+    return id;
+}
+
+/* Is this path exactly `name`, with or without a trailing slash? A directory
+   answers to both spellings: one is what a person types and the other is what
+   joining a name onto a prefix produces. */
+static int is_name(const char *p, const char *name)
+{
+    int i = 0;
+    while (name[i] && p[i] == name[i])
+        i++;
+    if (name[i])
+        return 0;
+    return p[i] == 0 || (p[i] == '/' && p[i + 1] == 0);
+}
+
+/* What is in /proc: three files that answer about the caller, and one
+   directory per task that answers about that task. A task appears here the
+   moment it exists and is gone the moment it exits — the listing is rendered
+   from the table, not remembered. */
+static int format_procdir(char *out, int cap)
+{
+    int o = append(out, 0, "- 0 tasks\n- 0 mounts\n- 0 pagetable\n");
+    for (int i = 0; i < PROC_NTASK && o < cap - 24; i++) {
+        struct taskinfo ti;
+        if (sys_taskinfo(i, &ti) < 0)
+            continue;
+        o = append(out, o, "d 0 ");
+        o += uutoa((unsigned long)ti.id, out + o);
+        out[o++] = '\n';
+    }
     return o;
 }
 
@@ -117,11 +176,33 @@ static void proc_do_open(struct vfs_req *r, int caller)
     if (fd < 0) { r->result = -1; return; }
     struct proc_file *f = &p_tab[fd];
 
+    f->data = malloc(PROC_BUFSZ);
+    if (!f->data) { r->result = -1; return; }
+
     int n;
+    const char *leaf;
+    int who = path_task(r->path, &leaf);
+
     /* "/proc/" and "/proc" name the directory itself, and a directory that
        will not say what is in it is no use in a union. */
-    if (r->path[5] == 0 || r->path[6] == 0)
-        n = append(f->data, 0, "- 0 tasks\n- 0 mounts\n- 0 pagetable\n");
+    if (is_name(r->path, "/proc"))
+        n = format_procdir(f->data, PROC_BUFSZ);
+    else if (who >= 0) {
+        /* A task that is not there has no directory. Asking sys_alive first
+           means a stale number is refused rather than answered with the state
+           of whoever moved into the slot — the generation in the id is what
+           makes that distinction possible. */
+        if (!sys_alive(who))
+            n = -1;
+        else if (leaf[0] == 0)
+            n = append(f->data, 0, "- 0 mounts\n- 0 pagetable\n");
+        else if (ustr_has_prefix(leaf, "mounts"))
+            n = sys_mounts(who, f->data, PROC_BUFSZ);
+        else if (ustr_has_prefix(leaf, "pagetable"))
+            n = format_pagetable(who, f->data, PROC_BUFSZ);
+        else
+            n = -1;
+    }
     else if (ustr_has_prefix(r->path, "/proc/tasks"))
         n = format_tasks(f->data, PROC_BUFSZ);
     else if (ustr_has_prefix(r->path, "/proc/mounts"))
@@ -131,7 +212,7 @@ static void proc_do_open(struct vfs_req *r, int caller)
     else
         n = -1;
 
-    if (n < 0) { r->result = -1; return; }
+    if (n < 0) { free(f->data); f->data = 0; r->result = -1; return; }
     f->used = 1;
     f->size = n;
     f->pos  = 0;
@@ -179,8 +260,11 @@ void proc_server(void)
             r->result = -1;                     /* read-only view */
             break;
         case VFS_CLOSE:
-            if (r->fd >= 0 && r->fd < PROC_MAXFD)
+            if (r->fd >= 0 && r->fd < PROC_MAXFD) {
+                free(p_tab[r->fd].data);
+                p_tab[r->fd].data = 0;
                 p_tab[r->fd].used = 0;
+            }
             r->result = 0;
             break;
         default:

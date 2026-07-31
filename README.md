@@ -3054,6 +3054,53 @@ being told.
 comparison and it does not show.
 
 
+### One directory per task
+
+`/proc` had three files and no directories. Two of them — `mounts` and
+`pagetable` — answer about *whoever is asking*, which works because a message
+carries its sender: the server is told who wants to know without the path
+having to say. That is why there is no `/proc/self` here and why Linux needs
+one.
+
+What was missing is the other question, the one a task cannot ask about
+itself. `/proc/<id>/` is that:
+
+```
+rvos$ ls /proc              rvos$ ls /proc/5       rvos$ cat /proc/5/mounts
+tasks  (0 bytes)            mounts  (0 bytes)      / -> task 0
+mounts  (0 bytes)           pagetable  (0 bytes)   /dev/ -> task 1
+pagetable  (0 bytes)                               /proc/ -> task 2
+0/                                                 /net/ -> task 11
+1/                                                 /dev/console -> task 3
+...                                                -- namespaces 3 of 8 in use
+```
+
+Task 5 is the sandbox, and the line that is only in *its* table is the whole
+point of being able to look: `/dev/console -> task 3` is the null server, which
+is what makes it a sandbox. From inside the shell you can now read the reason.
+The same holds for the address space — `/proc/0/pagetable` and
+`/proc/4/pagetable` give the identical virtual address `0x2ffff000` and
+different physical pages, which is the isolation claim made visible from a
+command line rather than from a boot-time demonstration.
+
+Three details worth having:
+
+**A directory appears when the task does.** The listing is rendered from the
+task table at the moment it is asked for, not remembered, so a program that
+has exited has no directory and one that starts between two `ls` commands has
+one.
+
+**A stale id is refused rather than answered.** `sys_alive` is checked before
+anything is rendered, and because an id carries a generation, a number that
+named a task which has since exited does not quietly answer with the state of
+whoever moved into the slot. `cat /proc/999/mounts` says it cannot open it.
+
+**The page-table dump grew a line.** It now walks `UHEAP_BASE` as well as the
+stack and the UART, so `cat /proc/4/pagetable` shows the heap page the kernel
+maps at task creation — the one that makes an allocator with no variables of
+its own possible.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per
