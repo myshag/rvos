@@ -26,6 +26,7 @@
 
 struct proc_file {
     int   used;
+    int   owner;                /* so a slot can be taken back from the dead */
     int   size;
     int   pos;
     char *data;
@@ -159,11 +160,20 @@ static int format_procdir(char *out, int cap)
     return o;
 }
 
+/* Same as the filesystem's: a task that is killed never closes anything, and
+   two slots is two killed readers away from a /proc that answers nothing. */
 static int proc_alloc(void)
 {
     for (int i = 0; i < PROC_MAXFD; i++)
         if (!p_tab[i].used)
             return i;
+    for (int i = 0; i < PROC_MAXFD; i++)
+        if (p_tab[i].used && !sys_alive(p_tab[i].owner)) {
+            free(p_tab[i].data);
+            p_tab[i].data = 0;
+            p_tab[i].used = 0;
+            return i;
+        }
     return -1;
 }
 
@@ -213,8 +223,9 @@ static void proc_do_open(struct vfs_req *r, int caller)
         n = -1;
 
     if (n < 0) { free(f->data); f->data = 0; r->result = -1; return; }
-    f->used = 1;
-    f->size = n;
+    f->used  = 1;
+    f->owner = caller;
+    f->size  = n;
     f->pos  = 0;
     r->result = fd;
 }

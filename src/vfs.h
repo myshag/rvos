@@ -34,6 +34,16 @@ enum {
        which module has stopped answering. A system made of servers should be
        able to say that about itself. */
     IOCTL_PING,
+    /* "If the interrupt character arrives, kill this task." The argument is a
+       task id, or 0 for nobody, and it travels in `len` because an ioctl has
+       no other field to spare.
+
+       This is what a tty driver does in Unix, minus the part this system does
+       not have: there, the line discipline recognises INTR and sends SIGINT to
+       the foreground process group. There are no signals here and no groups,
+       so the terminal is told which single task is in front of it and kills
+       that one. A shell sets it before it waits and clears it after. */
+    IOCTL_INTR,
 };
 
 /* Long names need somewhere to fit. 32 was enough while every name was 8.3;
@@ -257,6 +267,17 @@ static inline int vfs_write(int fd, const void *buf, int len)
 
 /* No out-pointer any more: whatever the command yields comes home in
    `result`, because an address would not survive the trip. */
+/* An ioctl that carries a number. */
+static inline int vfs_ioctl_arg(int fd, unsigned long cmd, int arg)
+{
+    struct vfs_req r;
+    r.op = VFS_IOCTL;
+    r.fd = fd & 0xffff;
+    r.ioctl_cmd = cmd;
+    r.len = arg;
+    return vfs_call(fd >> 16, &r);
+}
+
 static inline int vfs_ioctl(int fd, unsigned long cmd)
 {
     struct vfs_req r;
@@ -334,7 +355,8 @@ static inline void vfs_say(const char *s)
 
 /* An ioctl about a *name* rather than an open file: there is nothing to open
    when the thing does not exist yet. */
-static inline int vfs_ioctl_path(const char *path, unsigned long cmd)
+static inline int vfs_ioctl_path_arg(const char *path, unsigned long cmd,
+                                     int arg)
 {
     char real[VFS_PATH_MAX];
     int srv = sys_resolve(path, real, (int)sizeof(real), 0);
@@ -344,8 +366,14 @@ static inline int vfs_ioctl_path(const char *path, unsigned long cmd)
     r.op = VFS_IOCTL;
     r.fd = -1;
     r.ioctl_cmd = cmd;
+    r.len = arg;
     vfs__scpy(r.path, real);
     return vfs_call(srv, &r);
+}
+
+static inline int vfs_ioctl_path(const char *path, unsigned long cmd)
+{
+    return vfs_ioctl_path_arg(path, cmd, 0);
 }
 
 static inline int vfs_close(int fd)

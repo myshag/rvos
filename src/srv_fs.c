@@ -23,6 +23,7 @@
    whatever is left of the machine's memory. */
 struct fs_file {
     int    used;
+    int    owner;               /* who opened it, so a dead one can be noticed */
     uint32 size;
     uint32 pos;
     uint32 cap;                 /* how much of `data` there is */
@@ -88,11 +89,34 @@ static int fs_format_dir(const char *path, char *out, int cap)
     return o;
 }
 
+/* A slot, reclaiming one from a task that is no longer there if need be.
+
+   A program that is killed — or that faults — never closes anything, and this
+   server would keep its copy of the file for ever. Three slots and three
+   killed programs is a filesystem that has stopped: `cat` cannot be loaded,
+   because loading it is an open. The net server has had this since a client
+   could hold a connection open past its own death; it is the same problem and
+   the same answer, done when the pressure appears rather than on a timer.
+
+   What is dropped is dropped: an unclosed file is not written back. That is
+   not a new rule, it is the one this server already had — nothing reaches the
+   disk until close, so a program that dies leaves the volume as it was. */
 static int fs_alloc(void)
 {
     for (int i = 0; i < FS_MAXFD; i++)
         if (!fs_tab[i].used)
             return i;
+
+    for (int i = 0; i < FS_MAXFD; i++)
+        if (fs_tab[i].used && !sys_alive(fs_tab[i].owner)) {
+            uputs("  [fs] reclaiming a file from a task that is gone\n");
+            free(fs_tab[i].data);
+            fs_tab[i].data  = 0;
+            fs_tab[i].cap   = 0;
+            fs_tab[i].used  = 0;
+            fs_tab[i].dirty = 0;
+            return i;
+        }
     return -1;
 }
 
@@ -124,7 +148,7 @@ static int fs_room(struct fs_file *f, uint32 want)
     return 0;
 }
 
-static void fs_do_open(struct vfs_req *r, int create)
+static void fs_do_open(struct vfs_req *r, int create, int from)
 {
     int fd = fs_alloc();
     if (fd < 0) { r->result = -1; return; }
@@ -163,6 +187,7 @@ static void fs_do_open(struct vfs_req *r, int create)
         return;
     }
     f->used  = 1;
+    f->owner = from;
     f->size  = (uint32)n;
     f->pos   = 0;
     f->dirty = create;              /* an empty file still has to be created */
@@ -243,8 +268,8 @@ void fs_server(void)
         int from = sys_recv(&req, (int)sizeof(req));
         struct vfs_req *r = &req;          /* our own copy, not the client's */
         switch (r->op) {
-        case VFS_OPEN:   fs_do_open(r, 0); break;
-        case VFS_CREATE: fs_do_open(r, 1); break;
+        case VFS_OPEN:   fs_do_open(r, 0, from); break;
+        case VFS_CREATE: fs_do_open(r, 1, from); break;
         case VFS_READ:  fs_do_read(r);  break;
         case VFS_IOCTL:
             /* A ping is about this server, not about a file, so it is

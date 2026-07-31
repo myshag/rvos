@@ -112,6 +112,29 @@ void task_retire(struct task *t)
     }
     t->wait_sender  = 0;
     t->waiting_recv = 0;
+
+    /* And take it off any queue it is standing in. A task blocked in send()
+       is threaded onto its destination's list of waiting senders, and nothing
+       records which destination that is — so this looks for it. Leaving it
+       there is a pointer into a task that has just been freed, which the next
+       receive on that server would follow and copy a message out of.
+
+       The hole was always here and could not be reached: a task blocked in
+       send is not running, so it could not fault. Kill made it reachable on
+       the first try — the console server took a store fault inside the trap
+       handler about a second after the first Ctrl-C. */
+    for (int i = 0; i < NTASK; i++) {
+        struct task *prev = 0;
+        for (struct task *s = tasks[i].wait_sender; s; prev = s, s = s->send_next)
+            if (s == t) {
+                if (prev)
+                    prev->send_next = s->send_next;
+                else
+                    tasks[i].wait_sender = s->send_next;
+                s->send_next = 0;
+                break;
+            }
+    }
     /* Anyone waiting for this task has been waiting for exactly this. Done
        before the id is retired, since that is what they named. */
     for (int i = 0; i < NTASK; i++) {
@@ -454,6 +477,19 @@ void syscall_dispatch(uint64 num)
         }
         current->brk = want;
         current->ctx.x[10] = old;
+        break;
+    }
+    case SYS_KILL: {
+        struct task *t = task_by_id((int)current->ctx.x[10]);
+        /* Not itself through this door — SYS_EXIT is that door, and it does
+           not have to survive the return. Not task 0 either: the idle task is
+           the one thing the scheduler assumes is always there. */
+        if (!t || t == current || t == &tasks[0]) {
+            current->ctx.x[10] = (uint64)-1;
+            break;
+        }
+        task_retire(t);
+        current->ctx.x[10] = 0;
         break;
     }
     case SYS_NEWTASK: {

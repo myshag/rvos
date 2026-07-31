@@ -90,6 +90,17 @@ enum {
        kernel's entire contribution to having an allocator: pages, mapped and
        unmapped, at a fixed window in the address space. */
     SYS_SBRK    = 25,
+
+    /* Stop that task. It is exactly what a fault does to one — the same
+       task_retire, which wakes whoever was waiting on it, tells a closed
+       receiver its correspondent is gone, and gives the pages back. Nothing
+       is delivered to the task itself: there are no signals here, and a task
+       that could refuse to die is a larger idea than this needs.
+
+       Unguarded, like SYS_NEWTASK and for the same reason: this system has no
+       notion of who owns whom. That is a real hole and it is written down
+       rather than hidden — see the README. */
+    SYS_KILL    = 26,     /* a0 = task id -> 0, or -1 if there is no such task */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -249,6 +260,11 @@ static inline int sys_pgdump(int task_id, unsigned long va, void *out, int cap)
 static inline int sys_send(int dst, const void *msg, int len)
 {
     return (int)_ecall3(SYS_SEND, dst, (long)msg, len);
+}
+
+static inline int sys_kill(int task_id)
+{
+    return (int)_ecall1(SYS_KILL, task_id);
 }
 
 static inline int sys_wait(int task_id)

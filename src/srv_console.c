@@ -72,6 +72,15 @@ static int ring_get(void)
 static int             waiter = -1;
 static struct vfs_req  waiting;
 
+/* Whom to kill if the interrupt character arrives, or -1 for nobody. A shell
+   nominates the task it is waiting for and takes the nomination back
+   afterwards; this server does not know what a shell is and does not need to.
+   Unix would call this the foreground process group, and would send it a
+   signal that it could catch. There are no signals here. */
+#define CON_INTR 3                      /* ETX: what Ctrl-C sends */
+static int intr_task = -1;
+static int intr_fired;
+
 /* Two things are open-able here and they could not be less alike: the console
    itself, and the directory it lives in. Reading the first waits for a key;
    reading the second must not, or `ls /dev` hangs the shell until somebody
@@ -103,8 +112,19 @@ void console_server(void)
            the kernel distinguishes them by the sender it reports. */
         if (from == IRQ_SENDER) {
             int c;
-            while ((c = con_tryc()) >= 0)   /* drain: the FIFO may hold several */
+            while ((c = con_tryc()) >= 0) { /* drain: the FIFO may hold several */
+                /* The interrupt character is acted on rather than delivered:
+                   a program being killed is not going to read it. */
+                if (c == CON_INTR && intr_task >= 0) {
+                    if (sys_alive(intr_task))
+                        sys_kill(intr_task);
+                    intr_task  = -1;
+                    intr_fired = 1;
+                    uputs("^C\n");
+                    continue;
+                }
                 ring_put((char)c);
+            }
             sys_irq_ack(UART0_IRQ);
             /* A reader that is no longer there must not be answered: the
                reply would either fail or, without generation-tagged ids, land
@@ -167,7 +187,16 @@ void console_server(void)
         case VFS_IOCTL:
             /* A ping is about this server, not about a file, so it is
                answered before the descriptor is even looked at. */
-            r->result = (r->ioctl_cmd == IOCTL_PING) ? 0 : -1;
+            if (r->ioctl_cmd == IOCTL_PING) {
+                r->result = 0;
+            } else if (r->ioctl_cmd == IOCTL_INTR) {
+                /* Clearing the nomination answers whether it went off. */
+                r->result  = r->len > 0 ? 0 : intr_fired;
+                intr_task  = r->len > 0 ? r->len : -1;
+                intr_fired = 0;
+            } else {
+                r->result = -1;
+            }
             break;
         case VFS_CLOSE: r->result = 0;  break;
         default:        r->result = -1; break;

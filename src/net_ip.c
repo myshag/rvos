@@ -575,6 +575,12 @@ struct tcb {
     struct { int used; int task; } refs[NREF];
 
     int      is_client;           /* the one /net/tcp names */
+    /* Whom to kill if the interrupt character arrives on this connection, and
+       whether it has. A shell on the far end of a telnet session nominates
+       the program it is waiting for; this is the tty's job in Unix, done by
+       the only thing here that sees the bytes first. */
+    int      intr_task;
+    int      intr_fired;
 };
 
 static struct tcb tcbs[NTCB];
@@ -908,8 +914,26 @@ static void tcp_close(struct tcb *c)
 /* Hand `len` bytes at rcv_nxt to whoever is reading. Returns how many were
    taken: fewer than offered means the read queue is full, and the peer will
    be told so by the window in the next acknowledgement. */
+#define TCP_INTR 3                    /* ETX: what Ctrl-C sends */
+
+/* The interrupt character, acted on rather than delivered — a program about
+   to be killed is not going to read it. Like a tty, this cannot tell an
+   interrupt from the same byte inside a file being sent down the same
+   connection; Unix answers that with ISIG, which a program turns off before
+   a binary transfer. Here the nomination exists only while a shell is
+   waiting for a child, which is a narrower window and the same trade. */
 static int rcv_accept(struct tcb *c, const uint8 *data, int len)
 {
+    if (c->intr_task > 0)
+        for (int i = 0; i < len; i++)
+            if (data[i] == TCP_INTR) {
+                if (sys_alive(c->intr_task))
+                    sys_kill(c->intr_task);
+                c->intr_task  = 0;
+                c->intr_fired = 1;
+                net_puts("  tcp: interrupt character; the program was killed\n");
+                break;
+            }
     int room = RXQ - c->rxq_len;
     int n = len < room ? len : room;
     if (n > 0) {
@@ -2203,7 +2227,22 @@ int net_vfs(int from, struct vfs_req *r)
     case VFS_IOCTL:
         /* Answered before anything else is looked at: a ping asks whether
            this task is still turning its loop, not about a connection. */
-        r->result = (r->ioctl_cmd == IOCTL_PING) ? 0 : -1;
+        if (r->ioctl_cmd == IOCTL_PING) {
+            r->result = 0;
+        } else if (r->ioctl_cmd == IOCTL_INTR) {
+            struct tcb *c = conn_of(r->fd);
+            if (!c) {
+                r->result = -1;
+            } else {
+                /* Clearing the nomination answers whether it went off, which
+                   is how the shell knows to say so. */
+                r->result = r->len > 0 ? 0 : c->intr_fired;
+                c->intr_task  = r->len > 0 ? r->len : 0;
+                c->intr_fired = 0;
+            }
+        } else {
+            r->result = -1;
+        }
         break;
 
     case VFS_READ:

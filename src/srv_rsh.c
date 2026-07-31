@@ -200,7 +200,16 @@ static int readline(char *out, int cap)
             inlen -= skip;
         }
 
+        /* Nobody is nominated while this shell is the one reading, so the
+           interrupt character arrives here as a byte and means the only thing
+           it can mean: forget the line. */
         for (int i = 0; i < inlen; i++) {
+            if (inbuf[i] == 3) {
+                inlen = 0;
+                out[0] = 0;
+                puts_conn("^C\n");
+                return 0;
+            }
             if (inbuf[i] != '\n' && inbuf[i] != '\r')
                 continue;
             int n = i;
@@ -334,7 +343,12 @@ static void run_command(int argc, char **argv)
         put_num((unsigned long)tid);
         puts_conn("]\n");
     } else {
+        /* The connection is told who is in front of it, so that Ctrl-C has
+           something to mean while this shell is not reading anything. */
+        vfs_ioctl_arg(conn, IOCTL_INTR, tid);
         sys_wait(tid);
+        if (vfs_ioctl_arg(conn, IOCTL_INTR, 0) > 0)
+            puts_conn("^C\n");
     }
 }
 

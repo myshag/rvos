@@ -3204,6 +3204,87 @@ paint over the panels' idea of theirs, and getting that right is what a job
 control and a saved screen are for.
 
 
+## Ctrl-C, and the two things it found
+
+There was no way to stop a program. A runaway task ran until the machine was
+restarted, and the byte Ctrl-C sends went into whatever happened to read next.
+Three pieces were missing, and the first is the smallest:
+
+```c
+SYS_KILL = 26,     /* a0 = task id -> 0 */
+```
+
+It is `task_retire`, which is exactly what a fault already does to a task:
+wake whoever was waiting on it, tell a closed receiver its correspondent is
+gone, give the pages back. **Nothing is delivered to the task itself** —
+there are no signals here, and a task that could decline to die is a larger
+idea than this needs. It is unguarded, like `SYS_NEWTASK`, and for the same
+reason: this system has no notion of who owns whom.
+
+The second piece is where the character is noticed. In Unix the line
+discipline recognises INTR and sends SIGINT to the foreground process group.
+There are no signals and no groups here, so the terminal is told which single
+task is in front of it:
+
+```c
+IOCTL_INTR      /* "if the interrupt character arrives, kill this task" */
+```
+
+A shell sets it before it waits and clears it afterwards; clearing answers
+whether it went off, which is how the shell knows to print `^C`. Both
+terminals implement it — the console server for the serial line, the network
+server per connection, because when a program runs under `rsh` its
+`/dev/console` *is* the connection and the bytes reach the net server first.
+And when no program is running, nobody is nominated, so the byte arrives at
+the shell's own line reader as a byte and means the only thing left for it to
+mean: forget the line.
+
+### The first Ctrl-C crashed the console server
+
+A store fault at address 8, inside the trap handler, about a second after the
+kill. The cause was a dangling pointer that had been in the kernel since
+message passing existed and could not be reached until now.
+
+A task blocked in `send()` is threaded onto its destination's list of waiting
+senders, and nothing records which destination that is. `task_retire` cleared
+the list of senders waiting on *it* and never took it off the list it was
+standing in — so the console server's queue kept a pointer to a task whose
+page table had just been freed, and the next receive followed it.
+
+It could not happen before because **a task blocked in send is not running,
+so it could not fault.** Kill is the first thing in this system that can
+retire a task which is not the one running. The fix is a scan of every task's
+sender queue, which is sixteen entries and costs nothing at the only moment it
+happens.
+
+### The second one stopped the filesystem
+
+Kill it five times and `cat` reports "no such command" — because loading `cat`
+is an open, and the filesystem server had run out of the three slots it has. A
+killed program never closes anything, and its copy of the file stayed.
+
+The network server has had the answer since a client could hold a connection
+open past its own death: reclaim on pressure. `fs_alloc` now looks for a slot
+whose owner is no longer alive when it cannot find a free one, says so, and
+takes it. What is dropped is dropped — an unclosed file is not written back,
+which is not a new rule but the one this server already had: nothing reaches
+the disk until close, so a program that dies leaves the volume as it was.
+`/proc` got the same treatment for the same reason.
+
+```
+rvos$ forever
+holding a file open; looping, interrupt me
+.......^C
+
+rvos$ cat /HELLO.TXT
+  [fs] reclaiming a file from a task that is gone
+Hello from rvos!
+```
+
+`/BIN/FOREVER.ELF` is on the disk now, because "a program that does not stop"
+is a thing this system needs in order to test the thing that stops it.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

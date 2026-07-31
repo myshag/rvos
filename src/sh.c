@@ -127,7 +127,11 @@ static void run_command(int argc, char **argv)
         uputs(n);
         uputs("]\n");
     } else {
+        /* The terminal is told who is in front of it, so that Ctrl-C has
+           something to mean while this shell is not reading anything. */
+        vfs_ioctl_path_arg("/dev/console", IOCTL_INTR, tid);
         sys_wait(tid);
+        vfs_ioctl_path_arg("/dev/console", IOCTL_INTR, 0);
     }
 }
 
@@ -152,6 +156,14 @@ void sh_main(void)
             int c = getc_blocking(con);
             if (c == '\r' || c == '\n') {
                 uputs("\n");
+                break;
+            }
+            /* Nobody is nominated while the shell is the one reading, so the
+               interrupt character arrives here as a byte and means the only
+               thing it can mean: forget the line. */
+            if (c == 3) {
+                uputs("^C\n");
+                len = 0;
                 break;
             }
             if ((c == 8 || c == 127) && len > 0) {   /* backspace */
