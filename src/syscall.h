@@ -120,6 +120,10 @@ enum {
     DEVINFO_TREE = 0,     /* the flattened device tree, rendered */
     DEVINFO_NAME,         /* "00:01.0" for pci function a1, -1 past the end */
     DEVINFO_PCI,          /* that function's vendor, class, bars, irq */
+    /* And the kernel's own description of itself, which cannot be asked for
+       by message: it is not a task and receives nothing. a1 is an offset,
+       because the answer does not fit in one. */
+    DEVINFO_KERNEL,
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an

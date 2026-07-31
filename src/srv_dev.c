@@ -12,6 +12,7 @@
      /dev/console     the console server, mounted over this one
      /doc/            one file per server, which that server writes itself
      /doc/net         what /net/ctl accepts, in /net's own words
+     /doc/kernel      the syscalls, which no server can answer for
 
    That last line is the arrangement worth explaining. Two servers answer for
    names under /dev, and there is no union: the console is mounted at the
@@ -213,7 +214,10 @@ static int server_task(int idx, char *name, int cap)
 
 static int format_doc_dir(char *out, int cap)
 {
-    int o = 0;
+    /* The kernel first, because it is what everything else is written in
+       terms of — and because it is the one entry here that is not a task and
+       cannot be asked by message. */
+    int o = append(out, 0, "- 0 kernel\n");
     for (int i = 0; i < 16 && o < cap - 32; i++) {
         char name[24];
         if (server_task(i, name, (int)sizeof(name)) < 0)
@@ -229,6 +233,19 @@ static int format_doc_dir(char *out, int cap)
    it says it has finished. */
 static int fetch_doc(const char *leaf, char *out, int cap)
 {
+    /* The kernel answers by syscall, which is the only way it answers
+       anything: it is not a task and there is nobody to send a message to. */
+    if (leaf[0] == 'k' && leaf[1] == 'e' && leaf[2] == 'r' && leaf[3] == 'n') {
+        int o = 0;
+        for (;;) {
+            int n = sys_devinfo(DEVINFO_KERNEL, o, out + o, cap - o - 1);
+            if (n <= 0)
+                break;
+            o += n;
+        }
+        return o;
+    }
+
     int id = -1;
     for (int i = 0; i < 16; i++) {
         char name[24];
@@ -271,7 +288,9 @@ static int fetch_doc(const char *leaf, char *out, int cap)
     return o;
 }
 
-#define DEV_BUFSZ 4096
+/* The kernel's description is four kilobytes on its own, and a buffer that
+   is exactly as big as the thing it holds truncates it by the terminator. */
+#define DEV_BUFSZ 8192
 
 static void dev_do_open(struct vfs_req *r, int from)
 {

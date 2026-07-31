@@ -3485,6 +3485,34 @@ console  (0 bytes)                   connect <ip> <port>   -> ok <n>, when the
                                    write sends, close closes.
 ```
 
+The kernel is in that list too, and it is the one entry that cannot be asked
+by message: it is not a task and receives nothing. It answers the way it
+answers every other question about itself — a syscall that renders text into
+the caller's buffer — so `cat /doc/kernel` is four kilobytes listing all
+twenty-nine calls, what each takes, and what it will not do:
+
+```
+messages — the whole of IPC, and there is no other kind
+  1  send(dst, buf, len)         blocks until dst receives
+ 22  trysend(dst, buf, len)      -1 rather than blocking. What a server
+                                 answering a parked request must use: it
+                                 may never wait on a client
+ 24  recvfrom(src, buf, cap)     that task and nobody else. A reply is not
+                                 an event: taking the next message from
+                                 anybody is answering the wrong question
+
+what it does not have
+  no signals — kill is delivered to nobody, it simply retires the task
+  no permissions on any of the above, anywhere
+  no threads: a task is an address space and one thread of control
+```
+
+That text is a constant, which means it *can* be wrong, and that is worth
+admitting next to the servers whose text cannot be: a server describes itself
+by answering, and if the code that answers is gone the file is gone with it.
+The kernel has no such guarantee available, because **the asking is the thing
+being described**.
+
 **Nothing in `/doc` knows what any of it says.** The server that publishes it
 asks and pages, and the list of servers comes from the mount table, because a
 server nobody has mounted is a server nobody can ask. A description longer

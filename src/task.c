@@ -525,6 +525,24 @@ void syscall_dispatch(uint64 num)
             n = pci_name(index, kbuf, (int)sizeof(kbuf));
         else if (what == DEVINFO_PCI)
             n = pci_render(index, kbuf, (int)sizeof(kbuf));
+        else if (what == DEVINFO_KERNEL) {
+            /* Straight out of the constant, with no buffer in between: the
+               text is already in the kernel's address space and the copy
+               goes to the caller's. */
+            extern const char kernel_doc[];
+            extern int kernel_doc_len(void);
+            int total = kernel_doc_len();
+            if (index < 0 || index >= total) {
+                current->ctx.x[10] = 0;
+                break;
+            }
+            n = total - index;
+            if (n > cap) n = cap;
+            vm_copy_across(current->pt, out, kernel_pagetable,
+                           (uint64)(kernel_doc + index), (uint64)n);
+            current->ctx.x[10] = (uint64)(long)n;
+            break;
+        }
         if (n > cap) n = cap;
         if (n > 0)
             vm_copy_across(current->pt, out, kernel_pagetable,
