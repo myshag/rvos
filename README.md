@@ -348,6 +348,7 @@ $ read the fs server's private data region
     program's output arriving wherever it was started from
 27. `bind` as Plan 9 means it — a name onto a name — which deletes the
     machinery stage 26 needed to work around not having it
+28. `unmount`, and namespaces that come back when the task holding one dies
 
 ## Loading a program
 
@@ -1409,21 +1410,76 @@ Joining `/` to `/README.TXT` gives `//README.TXT`, which is a name the
 filesystem has never heard of. And a prefix has to end where a component ends,
 or `/mnt` claims `/mnt2/x` and rewrites it to `2/x`.
 
+### Taking it back
+
+`unmount(name)` is the other half, and the demonstration is the one worth
+having: undo the binding and the *same program*, run the *same way*, sends its
+output somewhere else.
+
+```
+rvos# unmount /dev/console
+rvos# run /HELLO.ELF after-unmount
+starting /HELLO.ELF
+rvos#                          <- nothing here
+```
+
+and on the serial console:
+
+```
+  [hello] argv: /HELLO.ELF after-unmount
+```
+
+Plan 9's `unmount(nil, old)` removes what is mounted on a name; with no unions
+there is nothing to remove it *from*, so the entry either exists or does not.
+The hole is filled with the last entry rather than shifted over, because
+resolution is longest-prefix-wins and the order of the table has never meant
+anything — which is easy to say and worth testing, so `unmount /proc/` takes
+out a middle entry and `ps` stops working until `mount /proc/ 2` puts it back.
+
+### Namespaces come back now
+
+There are eight private namespaces in the system and `vfs_ns_clone` used to
+take the next one for ever. Three are spoken for at boot — root, the sandbox
+demo, the shell over TCP — so the fourth program to want one would have failed,
+and nothing would have said why.
+
+They are reclaimed when the last task pointing at one is retired. A *sweep*,
+not a reference count, and the choice is the point: a count has to be right in
+every place a namespace pointer is copied — `task_create`, the inheritance in
+`task_new_empty`, `ns_clone` itself — and one missed increment is either a slot
+that never returns or one freed while in use. The sweep has to be right once,
+over a table four entries wide.
+
+It has one trap, and it is the same one `alloc_slot` has: a task under
+construction has state `T_UNUSED` *and* a page table, and its namespace is very
+much still spoken for. "Live" has to mean what the allocator means by it.
+
+`/proc/mounts` ends with a line about the pool, because running out is a thing
+that happens:
+
+```
+rvos# mounts
+/ -> task 0
+/dev/ -> task 1
+/dev/console -> /net/tcp/0
+-- namespaces 3 of 8 in use
+```
+
+Ten runs of a program that clones a namespace and exits leave it at 3.
+
 ### What it still is not
 
 Plan 9 evaluates `old` at bind time and holds the resulting channel, so
 rebinding what `old` refers to afterwards does not disturb the bind. This
 stores the string and re-resolves it on every open, which is simpler and
 observably different: rebind `/net/tcp/0` and everything bound onto it moves.
-There is no union mount (`MAFTER`/`MBEFORE`), no `unmount`, eight mounts per
-namespace, and four namespaces in the whole system — never reclaimed, since
-`vfs_ns_clone` only ever takes the next slot. The fourth clone will fail and
-nobody will notice.
+There is no union mount (`MAFTER`/`MBEFORE`), and eight mounts per namespace
+is a hard ceiling with no error a program is likely to check.
 
 ## Next steps
 
-- `unmount`, and reclaiming a namespace when the task holding it dies: there
-  are four, and they are handed out and never returned
+- union mounts, so two directories can appear as one — the piece of Plan 9's
+  namespace that is still missing
 - `wait()`, so `run` can return when the program does, and job control so a
   program that never exits does not have to be left running blind
 - `poll`/`select`, or a second task per connection — either would let `netd`

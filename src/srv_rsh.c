@@ -168,6 +168,7 @@ static void do_help(void)
               "  bind <old> <new>   make <new> mean <old>, here and in\n"
               "                     anything started from here\n"
               "  mount <pfx> <task> put a server behind a name\n"
+              "  unmount <name>     take a name back\n"
               "  net            interface, ARP, connections (/net/status)\n"
               "  mem            free and total pages\n"
               "  run <path> ..  start a program; its output comes back here\n"
@@ -234,6 +235,11 @@ static void session(int slot)
                 if (sys_mount(argv[1], t) < 0)
                     puts_conn("mount: no room in the mount table\n");
             }
+        } else if (streq(argv[0], "unmount")) {
+            if (argc < 2)
+                puts_conn("usage: unmount <name>\n");
+            else if (sys_unmount(argv[1]) < 0)
+                puts_conn("unmount: nothing bound there\n");
         } else if (streq(argv[0], "net")) {
             do_cat("/net/status");
         } else if (streq(argv[0], "echo")) {

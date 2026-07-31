@@ -97,6 +97,10 @@ void task_retire(struct task *t)
     t->state = T_UNUSED;
     t->gen++;                           /* whatever still names this id is
                                            naming a task that no longer is */
+    /* Its view of the tree may have been private, and may now be nobody's.
+       This is the only moment a namespace can become unreferenced, so it is
+       the only place worth looking. */
+    vfs_ns_gc();
 }
 
 struct task *task_new_empty(const char *name)
@@ -280,6 +284,12 @@ void syscall_dispatch(uint64 num)
         vm_copy_across(current->pt, current->ctx.x[10], kernel_pagetable,
                        (uint64)info, sizeof(info));
         current->ctx.x[10] = 0;
+        break;
+    }
+    case SYS_UNMOUNT: {
+        char kp[VFS_PREFIX_MAX];
+        copy_string_in(current->ctx.x[10], kp, VFS_PREFIX_MAX);
+        current->ctx.x[10] = (uint64)(long)vfs_unmount(kp);
         break;
     }
     case SYS_MOUNT: {

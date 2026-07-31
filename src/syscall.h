@@ -70,6 +70,7 @@ enum {
        empty. */
     SYS_ALIVE   = 19,     /* a0 = task id -> 1 or 0 */
     SYS_MOUNT   = 20,     /* a0 = prefix, a1 = server task id */
+    SYS_UNMOUNT = 21,     /* a0 = name — take it back */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -150,6 +151,10 @@ static inline int sys_meminfo(int out[2])
 static inline int sys_mount(const char *prefix, int server_task)
 {
     return (int)_ecall2(SYS_MOUNT, (long)prefix, server_task);
+}
+static inline int sys_unmount(const char *name)
+{
+    return (int)_ecall1(SYS_UNMOUNT, (long)name);
 }
 /* bind(old, new): `new` means `old` from now on. The second argument is the
    one that changes — Plan 9's order, and the one everybody gets backwards. */

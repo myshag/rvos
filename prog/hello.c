@@ -51,6 +51,19 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
         sys_exit();
     }
 
+    /* Take a private namespace, bend it, and exit — leaving the slot behind.
+       There are only a few, so whether they come back is the difference
+       between a system that can do this repeatedly and one that cannot. */
+    if (argc > 1 && argv[1][0] == 'n' && argv[1][1] == 's' && argv[1][2] == 0) {
+        if (sys_nsclone() < 0) {
+            hputs("  [hello] no private namespace left\n");
+        } else {
+            sys_bind("/", "/mine");
+            hputs("  [hello] cloned a namespace, bound /mine, exiting\n");
+        }
+        sys_exit();
+    }
+
     hputs("\n  [hello] loaded from a file into a fresh address space\n");
 
     /* argc/argv arrive in a0/a1, exactly where the calling convention puts

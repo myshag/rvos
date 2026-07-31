@@ -51,13 +51,16 @@ struct vfs_req {
    told whose — there is no ambient "the" namespace to inspect. */
 #define VFS_PREFIX_MAX 16
 #define VFS_NMOUNT     8
-#define VFS_NNS        4        /* root + private namespaces */
+#define VFS_NNS        8        /* root + private namespaces */
 
 struct namespace;
 
 int vfs_mount(const char *prefix, int server_task); /* a server behind a name */
 int vfs_bind(const char *old, const char *new);    /* `new` means `old` now */
+int vfs_unmount(const char *name);                 /* undo either of them */
 int vfs_ns_clone(void);                             /* private copy of it */
+void vfs_ns_gc(void);        /* release namespaces no live task refers to */
+int  vfs_ns_inuse(void);     /* how many of VFS_NNS are taken */
 /* -> the server that answers, and in `out` the name to ask it about, which
    differs from `path` if a bind was crossed. -1 if nothing is bound over it. */
 int vfs_resolve(const char *path, char *out, int cap);

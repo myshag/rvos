@@ -42,10 +42,10 @@ struct mount {
 struct namespace {
     struct mount mnt[VFS_NMOUNT];
     int n;
+    int used;
 };
 
-static struct namespace ns_pool[VFS_NNS];
-static int nns = 1;                     /* ns_pool[0] is the root namespace */
+static struct namespace ns_pool[VFS_NNS];   /* ns_pool[0] is the root */
 
 struct namespace *vfs_root_ns(void)
 {
@@ -63,12 +63,52 @@ static struct namespace *cur_ns(void)
 
 int vfs_ns_clone(void)
 {
-    if (!current || nns >= VFS_NNS)
+    if (!current)
         return -1;
-    struct namespace *n = &ns_pool[nns++];
-    *n = *cur_ns();                     /* snapshot, then diverge freely */
-    current->ns = n;
-    return 0;
+    for (int i = 1; i < VFS_NNS; i++) {
+        if (ns_pool[i].used)
+            continue;
+        ns_pool[i] = *cur_ns();         /* snapshot, then diverge freely */
+        ns_pool[i].used = 1;
+        current->ns = &ns_pool[i];
+        return 0;
+    }
+    return -1;                          /* every private namespace is taken */
+}
+
+int vfs_ns_inuse(void)
+{
+    int n = 1;                          /* the root is always one of them */
+    for (int i = 1; i < VFS_NNS; i++)
+        n += ns_pool[i].used;
+    return n;
+}
+
+/* Release any private namespace no live task is pointing at. Called when a
+   task is retired, which is the only moment one can become unreferenced.
+
+   A sweep rather than a reference count, deliberately. A count has to be
+   right in every place a namespace pointer is copied — task_create,
+   task_new_empty's inheritance, ns_clone itself — and one missed increment
+   is a slot that never comes back or, worse, one freed while in use. The
+   sweep has to be right once, and the table is four tasks wide.
+
+   "Live" here has to mean what alloc_slot means by it: a task under
+   construction has state T_UNUSED and a page table, and its namespace is very
+   much still spoken for. */
+void vfs_ns_gc(void)
+{
+    for (int i = 1; i < VFS_NNS; i++) {
+        if (!ns_pool[i].used)
+            continue;
+        int live = 0;
+        for (int t = 0; t < NTASK && !live; t++)
+            if ((tasks[t].state != T_UNUSED || tasks[t].pt) &&
+                tasks[t].ns == &ns_pool[i])
+                live = 1;
+        if (!live)
+            ns_pool[i].used = 0;
+    }
 }
 
 static int streq(const char *a, const char *b)
@@ -132,6 +172,22 @@ static int prefix_matches(const char *path, const char *prefix)
         return 1;
     char c = path[l];
     return c == 0 || c == '/';
+}
+
+/* Plan 9's unmount(nil, old): take the name back. There are no unions here,
+   so there is nothing to remove it *from* — the entry either exists or does
+   not. The hole is filled with the last entry rather than shifted over,
+   because resolution is longest-prefix-wins and the order of the table has
+   never meant anything. */
+int vfs_unmount(const char *name)
+{
+    struct namespace *ns = cur_ns();
+    for (int i = 0; i < ns->n; i++)
+        if (streq(ns->mnt[i].prefix, name)) {
+            ns->mnt[i] = ns->mnt[--ns->n];
+            return 0;
+        }
+    return -1;
 }
 
 static struct mount *longest_match(struct namespace *ns, const char *path)
@@ -225,6 +281,18 @@ int vfs_dump_mounts_of(int task_id, char *out, int cap)
             o += utoa((unsigned long)ns->mnt[i].server, out + o);
         }
         out[o++] = '\n';
+    }
+    /* One line about the system rather than the caller, because the pool is
+       small enough that running out is a thing that happens. */
+    if (o < cap - 40) {
+        memcpy(out + o, "-- namespaces ", 14);
+        o += 14;
+        o += utoa((unsigned long)vfs_ns_inuse(), out + o);
+        memcpy(out + o, " of ", 4);
+        o += 4;
+        o += utoa((unsigned long)VFS_NNS, out + o);
+        memcpy(out + o, " in use\n", 8);
+        o += 8;
     }
     return o;
 }
