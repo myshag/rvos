@@ -15,7 +15,9 @@ enum task_state { T_UNUSED = 0, T_RUNNABLE, T_RUNNING, T_BLOCKED };
 
 struct namespace;   /* opaque here; defined in vfs.c */
 
-#define NTASK   18
+/* Восемнадцать было ровно столько, сколько задач в системе и было, пока не
+   появились нити: нить занимает слот, как и всё остальное. */
+#define NTASK   24
 
 /* USTACK_TOP / USTACK_PAGES live in riscv.h: every task's stack sits at the
    same virtual address but on different physical pages — which is the point:

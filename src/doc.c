@@ -2,7 +2,7 @@
 
    Every server can be asked what it accepts, and /doc collects the answers.
    The kernel could not be asked, and it is the thing whose interface is
-   least visible from inside the running system: twenty-nine calls that
+   least visible from inside the running system: thirty calls that
    exist, from a program's point of view, only as numbers in a register.
 
    It cannot answer a message — it is not a task and receives nothing — so it
@@ -15,7 +15,7 @@
 #include "riscv.h"
 
 const char kernel_doc[] =
-"the kernel — twenty-nine calls, and nothing else it will do for you.\n"
+"the kernel — thirty calls, and nothing else it will do for you.\n"
 "\n"
 "Everything below is `ecall` with the number in a7 and arguments in a0..a3.\n"
 "There is no library between a program and this: prog/lib.h is inline\n"
@@ -28,6 +28,12 @@ const char kernel_doc[] =
 " 23  wait(task)                  block until that task is gone\n"
 " 26  kill(task)                  stop it, exactly as a fault would\n"
 " 28  self()                      which task am I\n"
+" 29  thread(entry, sp, arg)      a second thread of control in this address\n"
+"                                 space: a task that is handed the caller's\n"
+"                                 page table instead of one of its own. The\n"
+"                                 stack is the caller's to provide, because\n"
+"                                 every task's stack is at the same address\n"
+"                                 and two threads cannot both have it\n"
 " 14  exit()                      never returns\n"
 "\n"
 "messages — the whole of IPC, and there is no other kind\n"
@@ -92,7 +98,7 @@ const char kernel_doc[] =
 "                                 when the thing that says it is gone\n"
 "\n"
 "the numbers it was built with\n"
-"  tasks         18 slots, ids carrying a generation in the high byte\n"
+"  tasks         24 slots, ids carrying a generation in the high byte\n"
 "  page          4 KiB, Sv39, three levels\n"
 "  user stack    16 KiB at 0x30000000, growing down\n"
 "  user heap     0x28000000, one page mapped at birth so that an allocator\n"
@@ -105,7 +111,8 @@ const char kernel_doc[] =
 "what it does not have\n"
 "  no signals — kill is delivered to nobody, it simply retires the task\n"
 "  no permissions on any of the above, anywhere\n"
-"  no threads: a task is an address space and one thread of control\n"
+"  no thread that is not a task: a thread has an id, a slot and a line\n"
+"               in ps, because everything here is addressed by task id\n"
 "  no priority: round robin over the runnable, preempted on the timer\n";
 
 int kernel_doc_len(void)

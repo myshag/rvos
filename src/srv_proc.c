@@ -90,7 +90,7 @@ static int ipc_words(const struct taskinfo *t, char *out, int cap)
 /* As many slots as the kernel has. It was ten, which was the number of tasks
    there were when this was written, and a task in slot eleven was invisible
    to `ps` — which is a worse failure than a long listing. */
-#define PROC_NTASK 18
+#define PROC_NTASK 24
 static int format_tasks(char *out, int cap)
 {
     int o = 0;
@@ -284,7 +284,7 @@ static int format_task_ipc(int who, char *out, int cap)
 static const char proc_conf[] =
     "open files   2    each a rendering, made at open\n"
     "buffer       4096 bytes, allocated per open\n"
-    "tasks shown  18   as many slots as the kernel has\n";
+    "tasks shown  24   as many slots as the kernel has\n";
 
 static const char proc_doc[] =
 "proc — kernel state as files, and nothing behind it.\n"

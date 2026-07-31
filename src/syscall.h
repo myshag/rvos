@@ -114,6 +114,20 @@ enum {
        a server that has to recognise itself among a list of servers needs the
        number. */
     SYS_SELF    = 28,     /* -> this task's id */
+
+    /* A second thread of control in this address space.
+
+       Everything else in this system makes a task by making an address space
+       first; this one deliberately does not. The new task shares the caller's
+       page table, its namespace and its heap, and differs from it in exactly
+       one thing: its own saved context. That is what a thread is.
+
+       The stack is the caller's problem, and that is not laziness — every
+       task's stack is at the same virtual address, which works only because
+       address spaces differ. Two threads in one space cannot both have it, so
+       the caller allocates a stack (malloc will do) and says where its top
+       is. The kernel then has no opinion about how big a stack should be. */
+    SYS_THREAD  = 29,     /* a0 = entry, a1 = stack top, a2 = arg -> id */
 };
 
 enum {
@@ -308,6 +322,12 @@ static inline int sys_send(int dst, const void *msg, int len)
 static inline int sys_devinfo(int what, int index, char *out, int cap)
 {
     return (int)_ecall4(SYS_DEVINFO, what, index, (long)out, cap);
+}
+
+/* Start `entry(arg)` on `sp`, in this address space. Returns its task id. */
+static inline int sys_thread(void (*entry)(long), void *stack_top, long arg)
+{
+    return (int)_ecall3(SYS_THREAD, (long)entry, (long)stack_top, arg);
 }
 
 static inline int sys_self(void)

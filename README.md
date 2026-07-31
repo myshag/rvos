@@ -3647,6 +3647,73 @@ for one field is a thing this protocol can afford exactly once per field, and
 the fix is a second helper whose name says which it is.
 
 
+## Two threads of control in one address space
+
+A task was an address space and one thread of control. `sys_thread` takes
+those apart: the new task is handed the caller's page table instead of one of
+its own, and differs from it in exactly one thing — its own saved context.
+That is what a thread is, and it is thirty lines in the kernel.
+
+**Nothing else changed.** The scheduler, the trap path, messages, `/proc` and
+`ps` all work on a thread because a thread *is* a task by every measure except
+the one that matters. It has an id, a slot and a line in `ps` — it has to,
+since everything here is addressed by task id and a thread that cannot be
+addressed cannot take part in the only kind of communication there is.
+
+**The stack is the caller's to provide**, and that is not laziness. Every
+task's stack sits at `USTACK_TOP`, which works only because address spaces
+differ; two threads in one space cannot both have it. So the caller allocates
+a stack with `malloc` from the shared heap and says where its top is, and the
+kernel is left with no opinion about how big a stack should be.
+
+### What becomes shared becomes a race
+
+The heap is one per address space, so the first thing a second thread breaks
+is the allocator. `src/malloc.h` now takes a lock — one `amoswap` (the A
+extension is in rv64imac), held across the whole of an allocation rather than
+per list operation, because the free list is walked, split and relinked as one
+act. Waiting yields rather than spinning: the holder is a task the scheduler
+has to get back to.
+
+`/BIN/THREADS.ELF` shows both halves. Four threads, three hundred increments
+each, on a counter in the parent's `.bss`:
+
+```
+без замка:  300 из 1200  — потеряно на гонке
+с замком:   1200 из 1200  сходится
+1600 malloc/free из четырёх нитей: прошло
+```
+
+The counter lives in the parent and the threads increment it: that is the
+proof the memory is shared. The first line is the race, and it needs a word of
+honesty — the window between reading the counter and writing it back is real,
+but on this machine a thread runs the whole loop inside one 50 ms slice and
+never collides. The program widens the window with an explicit yield. Widened,
+not created, and the difference is the whole point.
+
+### Two bugs, and the second was always there
+
+`vm_free_task` frees the page table, and with threads the first one to die
+would take the memory out from under the others — including the stack the
+thread doing the freeing is standing on. So the address space goes only when
+nobody else is standing in it, checked by a sweep of the task table, for the
+same reason `vfs_ns_gc` sweeps rather than counting references.
+
+The second one wedged the whole machine, and it had nothing to do with
+threads except that threads found it. **A reused task slot carried the
+previous occupant's fields.** `task_retire` clears what is dangerous at that
+moment — the sender queue, the receive flags — and a dozen others simply
+stayed: `wait_for`, `alarm_at`, `recv_closed`, `irq_pending`, `dma_next`.
+Every creation path happened to set the ones it cared about, which is not the
+same as them being right. Threads reuse slots four at a time, and the machine
+stopped answering the serial console. `alloc_slot` now zeroes the whole
+structure and keeps only the generation — which is the one thing that must
+survive, because it counts how many tasks this slot has been.
+
+`NTASK` went from 18 to 24: eighteen was exactly the number of tasks there
+were before threads existed, and a thread takes a slot like anything else.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

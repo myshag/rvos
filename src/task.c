@@ -4,6 +4,7 @@
    the free-page arena is not mapped at all, so one task holds no translation
    for another's memory. Isolation is why IPC copies rather than sharing. */
 #include "task.h"
+#include "util.h"
 #include "uart.h"
 #include "syscall.h"
 #include "vfs.h"
@@ -79,10 +80,22 @@ static struct task *alloc_slot(void)
 {
     for (int i = 0; i < NTASK; i++)
         if (tasks[i].state == T_UNUSED && !tasks[i].pt) {
-            /* A slot handed out again is a *different* task, and its id has
-               to say so. The generation starts at 0, so the tasks created at
+            /* A slot handed out again is a *different* task, and nothing of
+               the last one may survive in it. task_retire clears the fields
+               that would otherwise be dangerous *at that moment* — the sender
+               queue, the receive flags — but a dozen others simply stayed:
+               wait_for, alarm_at, recv_closed, irq_pending, dma_next. Every
+               creation path so far happened to set the ones it cared about,
+               which is not the same as them being right, and threads made the
+               difference visible by reusing slots four at a time.
+
+               The generation is the one thing kept: it counts how many tasks
+               this slot has been, and it starts at 0, so the tasks created at
                boot keep the ids servers.h names them by. */
-            tasks[i].id = i | (tasks[i].gen << 8);
+            int gen = tasks[i].gen;
+            memset(&tasks[i], 0, sizeof(tasks[i]));
+            tasks[i].gen = gen;
+            tasks[i].id  = i | (gen << 8);
             return &tasks[i];
         }
     return 0;
@@ -157,7 +170,26 @@ void task_retire(struct task *t)
         }
     }
 
-    vm_free_task(t);                    /* also clears t->pt */
+    /* The address space goes only if nobody else is standing in it. Threads
+       share a page table, and the first of them to die would otherwise take
+       the memory out from under the others — including the stack the thread
+       running the free is standing on.
+
+       A sweep rather than a reference count, for the reason written over
+       vfs_ns_gc: a count has to be right in every place a pointer is copied,
+       and this has to be right once. "Live" means what alloc_slot means by
+       it — a task under construction has T_UNUSED and a page table, and its
+       address space is very much spoken for. */
+    int shared = 0;
+    for (int i = 0; i < NTASK && !shared; i++)
+        if (&tasks[i] != t && tasks[i].pt == t->pt &&
+            (tasks[i].state != T_UNUSED || tasks[i].pt))
+            shared = 1;
+
+    if (shared)
+        t->pt = 0;                      /* let go without freeing */
+    else
+        vm_free_task(t);                /* also clears t->pt */
     t->state = T_UNUSED;
     t->gen++;                           /* whatever still names this id is
                                            naming a task that no longer is */
@@ -508,6 +540,13 @@ void syscall_dispatch(uint64 num)
                task is about to run again with the same satp. */
             sfence_vma();
         }
+        /* One address space, one break. Threads share the page table, so a
+           break kept per task would have each of them growing the same heap
+           from a different idea of where it ends. A sweep of eighteen entries,
+           and only when the heap actually moves. */
+        for (int i = 0; i < NTASK; i++)
+            if (tasks[i].pt == current->pt && tasks[i].state != T_UNUSED)
+                tasks[i].brk = want;
         current->brk = want;
         current->ctx.x[10] = old;
         break;
@@ -548,6 +587,35 @@ void syscall_dispatch(uint64 num)
             vm_copy_across(current->pt, out, kernel_pagetable,
                            (uint64)kbuf, (uint64)n);
         current->ctx.x[10] = (uint64)(long)n;
+        break;
+    }
+    /* A thread: a task that is handed the caller's address space instead of
+       being given one of its own. Everything that makes tasks work — the
+       scheduler, the trap path, messages, /proc — needs no change at all,
+       because a thread is a task by every measure except the one that
+       matters here. */
+    case SYS_THREAD: {
+        uint64 entry = current->ctx.x[10];
+        uint64 sp    = current->ctx.x[11];
+        uint64 arg   = current->ctx.x[12];
+        struct task *t = alloc_slot();
+        if (!t || !entry || !sp) {
+            current->ctx.x[10] = (uint64)-1;
+            break;
+        }
+        for (int i = 0; i < 32; i++)
+            t->ctx.x[i] = 0;
+        t->pt         = current->pt;        /* the whole of it: shared */
+        t->ctx.satp   = current->ctx.satp;
+        t->ctx.x[2]   = sp;                 /* the caller said where */
+        t->ctx.x[10]  = arg;                /* entry(arg) */
+        t->ctx.epc    = entry;
+        t->ctx.status = SSTATUS_SPIE;       /* U-mode, like whoever asked */
+        t->ns         = current->ns;
+        t->brk        = current->brk;       /* one heap, so one break */
+        t->name       = current->name;
+        t->state      = T_RUNNABLE;
+        current->ctx.x[10] = (uint64)t->id;
         break;
     }
     case SYS_SELF:

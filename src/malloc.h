@@ -68,6 +68,10 @@ static const unsigned short m__class[NCLASS] = {
 };
 
 struct mheap {
+    /* First, and at a known offset, because it has to be usable before the
+       rest of this structure is known to be initialised — and a page arrives
+       zeroed, which is the unlocked state. */
+    int            lock;
     unsigned long magic;
     struct mblk  *free;         /* address-ordered, so coalescing is local */
     unsigned long top;          /* the break, as the allocator last left it */
@@ -93,8 +97,31 @@ struct mstat {
 /* The two that the run machinery below needs before they are written: a run
    page is an ordinary block, so making one and giving one up go through the
    ordinary calls. */
+static inline void  m__free(void *p);
+static inline void *m__realloc(void *p, unsigned long n);
 static inline void  free(void *p);
+static inline void *malloc(unsigned long n);
 static inline void *realloc(void *p, unsigned long n);
+
+/* The moment there are two threads, everything shared needs one, and the
+   first thing that is shared is this. rv64imac has the A extension, so the
+   lock is one atomic swap; spinning yields rather than burning the slice,
+   because the holder is a task the scheduler has to get back to.
+
+   A thread that dies holding this wedges every other thread's allocator.
+   That is true of every lock in every system and is not fixed here. */
+static inline void m__lock(void)
+{
+    struct mheap *h = (struct mheap *)UHEAP_BASE;
+    while (__sync_lock_test_and_set(&h->lock, 1))
+        sys_yield();
+}
+
+static inline void m__unlock(void)
+{
+    struct mheap *h = (struct mheap *)UHEAP_BASE;
+    __sync_lock_release(&h->lock);
+}
 
 static inline void m__copy(void *d, const void *s, unsigned long n)
 {
@@ -301,7 +328,7 @@ static inline int m__dir_cover(struct mheap *h, unsigned long page)
     for (unsigned long i = 0; i < want; i++)
         d[i] = i < h->dirlen ? h->dir[i] : 0;
     if (h->dir)
-        free(h->dir);
+        m__free(h->dir);            /* the lock is already held */
     h->dir    = d;
     h->dirlen = want;
     return (int)idx;
@@ -335,7 +362,7 @@ static inline struct mrun *m__newrun(struct mheap *h, int c)
     return r;
 }
 
-static inline void *malloc(unsigned long n)
+static inline void *m__malloc(unsigned long n)
 {
     if (!n)
         return 0;
@@ -358,7 +385,7 @@ static inline void *malloc(unsigned long n)
     return p;
 }
 
-static inline void free(void *p)
+static inline void m__free(void *p)
 {
     if (!p)
         return;
@@ -402,18 +429,18 @@ static inline void *calloc(unsigned long n, unsigned long size)
     unsigned long total = n * size;
     if (n && total / n != size)
         return 0;
-    void *p = malloc(total);
+    void *p = malloc(total);            /* takes the lock itself */
     if (p)
         m__zero(p, total);
     return p;
 }
 
-static inline void *realloc(void *p, unsigned long n)
+static inline void *m__realloc(void *p, unsigned long n)
 {
     if (!p)
-        return malloc(n);
+        return m__malloc(n);
     if (!n) {
-        free(p);
+        m__free(p);
         return 0;
     }
     struct mheap *h = m__heap();
@@ -426,11 +453,38 @@ static inline void *realloc(void *p, unsigned long n)
         have = ((struct mblk *)((char *)p - MHDR))->size - MHDR;
     if (have >= n)
         return p;                       /* it already fits; say nothing */
-    void *q = malloc(n);
+    void *q = m__malloc(n);
     if (!q)
         return 0;
     m__copy(q, p, have);
-    free(p);
+    m__free(p);
+    return q;
+}
+
+/* And the four that anybody calls: the same, with the lock around them. Held
+   for the whole of an allocation rather than per list operation, because the
+   free list is walked, split and relinked as one act and a lock taken twice
+   in the middle of that protects nothing. */
+static inline void *malloc(unsigned long n)
+{
+    m__lock();
+    void *p = m__malloc(n);
+    m__unlock();
+    return p;
+}
+
+static inline void free(void *p)
+{
+    m__lock();
+    m__free(p);
+    m__unlock();
+}
+
+static inline void *realloc(void *p, unsigned long n)
+{
+    m__lock();
+    void *q = m__realloc(p, n);
+    m__unlock();
     return q;
 }
 
@@ -442,6 +496,7 @@ static inline void *realloc(void *p, unsigned long n)
    for one size and useless to any other. Not part of anybody's standard. */
 static inline void malloc_stat(struct mstat *st)
 {
+    m__lock();
     struct mheap *h = m__heap();
     st->taken = h->top - UHEAP_BASE;
     st->idle = st->largest = 0;
@@ -463,4 +518,5 @@ static inline void malloc_stat(struct mstat *st)
             unsigned long slots = (PGSIZE - MRUNHDR) / m__class[c];
             st->run_free += (slots - r->used) * m__class[c];
         }
+    m__unlock();
 }
