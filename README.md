@@ -3400,6 +3400,65 @@ own beyond building a directory listing out of the names — it is the fourth
 module with nothing behind it but kernel state, and the thinnest of them.
 
 
+## The rendezvous, as a file
+
+Every blocked task in this system is blocked on another task. That is what a
+synchronous rendezvous *is* — there are no message queues, only queues of
+senders — and until now the pairing was invisible. `ps` said `blocked`, which
+covers a client waiting for its reply, a server waiting for its next client,
+and two tasks wedged against each other, and those are not the same situation.
+
+The kernel has known all along. These are the fields `ipc.c` parks a task
+with, and it costs four integers in `struct taskinfo` to say them out loud:
+what kind of wait, whom it names, how big the message being held out is, and
+how many senders are queued on this task. `/proc/ipc` prints the graph:
+
+```
+task                  state    holding out to
+0 fs                blocked  recv
+1 console           blocked  send to 1286
+2 proc              running
+4 shell             blocked  recv
+10 sh               blocked  recv from 1
+13 rsh              blocked  wait for 519
+519 /BIN/cat.ELF    blocked  recv from 2
+1286 /BIN/forever.EL runnable
+```
+
+Read it as a chain. `sh` is waiting for a keystroke from the console server —
+a *closed* receive, so nobody else can answer it. `rsh` is waiting for the
+`cat` it started. That `cat` is waiting for the proc server's reply, which is
+the very text being printed. And the console server was caught mid-rendezvous,
+holding a reply out to the runaway program that had asked to print a dot.
+
+**A cycle in that list is a deadlock.** Before this there was no way to find
+one but to reason about it — which is how `SYS_TRYSEND` came to exist, and the
+reasoning took an afternoon. Now it is a `cat`.
+
+`/proc/<id>/ipc` is one task's half of it, and adds the direction the kernel
+does not record: who is standing in *its* queue. Nothing on the sender says
+where it is queued, so both the kernel and this server find it the same way —
+by looking at every queue. That is a scan of sixteen entries, at the only
+moment anybody asks.
+
+### And a task becomes a name you can kill
+
+```
+rvos$ write /proc/1286/ctl kill
+```
+
+Plan 9 spells it exactly this way, and spelling it the same is the point: it
+turns a syscall into a name. Ctrl-C nominates a task to the terminal and the
+terminal kills it; this is the same act done deliberately, by whoever can
+write the file. There is no permission on it — the same hole `SYS_KILL` has,
+written down in both places rather than in neither.
+
+So `ls /proc/<id>` is now `mounts`, `pagetable`, `ipc`, `ctl`: what that task
+can see, where it lives, whom it is waiting for, and one thing you can do to
+it. That is a namespace, an address space, a rendezvous and a signal — four
+mechanisms of this kernel, in four files, for a task that is not you.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

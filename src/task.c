@@ -321,13 +321,43 @@ void syscall_dispatch(uint64 num)
             current->ctx.x[10] = (uint64)-1;
             break;
         }
+        struct task *t = &tasks[idx];
         struct taskinfo ti;
-        ti.id         = tasks[idx].id;
-        ti.state      = (int)tasks[idx].state;
-        ti.is_current = (&tasks[idx] == current);
+        ti.id         = t->id;
+        ti.state      = (int)t->state;
+        ti.is_current = (t == current);
+
+        /* The same fields ipc.c parks a task with, read back out. */
+        ti.ipc = IPC_NONE;
+        ti.peer = -1;
+        ti.msglen = 0;
+        if (t->state == T_BLOCKED) {
+            if (t->waiting_recv) {
+                ti.ipc  = t->recv_closed ? IPC_RECVFROM : IPC_RECV;
+                ti.peer = t->recv_closed ? t->recv_from : -1;
+            } else if (t->wait_for) {
+                ti.ipc  = IPC_WAIT;
+                ti.peer = t->wait_for;
+            } else if (t->alarm_at) {
+                ti.ipc  = IPC_ALARM;
+            } else {
+                /* Not receiving and not waiting: it is standing in somebody's
+                   queue of senders, and which somebody is not recorded — so
+                   this looks, exactly as task_retire has to. */
+                ti.ipc    = IPC_SEND;
+                ti.msglen = t->send_len;
+                for (int i = 0; i < NTASK; i++)
+                    for (struct task *q = tasks[i].wait_sender; q; q = q->send_next)
+                        if (q == t)
+                            ti.peer = tasks[i].id;
+            }
+        }
+        ti.senders = 0;
+        for (struct task *q = t->wait_sender; q; q = q->send_next)
+            ti.senders++;
         int k = 0;
-        for (; k < 15 && tasks[idx].name[k]; k++)
-            ti.name[k] = tasks[idx].name[k];
+        for (; k < 15 && t->name[k]; k++)
+            ti.name[k] = t->name[k];
         ti.name[k] = 0;
         vm_copy_across(current->pt, out, kernel_pagetable,
                        (uint64)&ti, sizeof(ti));

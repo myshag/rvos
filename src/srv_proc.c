@@ -4,7 +4,8 @@
    system by binding "/proc/" into the namespace, and not one line of the
    kernel changed to make it possible.
 
-     /proc/tasks       task table: id, state, name
+     /proc/tasks       task table: id, state, name, and what it waits for
+     /proc/ipc         the rendezvous graph: who is holding out to whom
      /proc/mounts      the namespace of whoever is asking
      /proc/pagetable   the address space of whoever is asking
      /proc/<id>/       the same two questions about a named task
@@ -27,6 +28,7 @@
 struct proc_file {
     int   used;
     int   owner;                /* so a slot can be taken back from the dead */
+    int   ctl_task;             /* if this is a /proc/<id>/ctl, which id */
     int   size;
     int   pos;
     char *data;
@@ -51,6 +53,34 @@ static int append(char *out, int o, const char *s)
     return o + l;
 }
 
+/* Why a task is not running. "blocked" was all `ps` could say, and blocked
+   on what is the only interesting half: a client waiting for its reply and a
+   server waiting for its next client are the same word and opposite
+   situations. */
+static int ipc_words(const struct taskinfo *t, char *out, int cap)
+{
+    (void)cap;
+    int o = 0;
+    switch (t->ipc) {
+    case IPC_RECV:     o = append(out, o, "recv"); break;
+    case IPC_RECVFROM: o = append(out, o, "recv from "); break;
+    case IPC_SEND:     o = append(out, o, "send to "); break;
+    case IPC_WAIT:     o = append(out, o, "wait for "); break;
+    case IPC_ALARM:    o = append(out, o, "alarm"); break;
+    default: break;
+    }
+    if (t->peer >= 0)
+        o += uutoa((unsigned long)t->peer, out + o);
+    if (t->ipc == IPC_SEND && t->peer < 0)
+        o = append(out, o, "?");
+    if (t->senders) {
+        o = append(out, o, "   senders ");
+        o += uutoa((unsigned long)t->senders, out + o);
+    }
+    out[o] = 0;
+    return o;
+}
+
 /* The task table is kernel memory, so this asks for it an entry at a time
    rather than reading it. Formatting stays here: policy belongs in the
    server, the kernel only hands over the facts. */
@@ -71,8 +101,12 @@ static int format_tasks(char *out, int cap)
         for (int p = ustrlen(state_name(ti.state)); p < 9; p++)
             out[o++] = ' ';
         o = append(out, o, ti.name);
+        for (int p = (int)ustrlen(ti.name); p < 18; p++)
+            out[o++] = ' ';
         if (ti.is_current)
-            o = append(out, o, "  (me)");
+            o = append(out, o, "(me)");
+        else
+            o += ipc_words(&ti, out + o, cap - o);
         out[o++] = '\n';
     }
     return o;
@@ -151,7 +185,7 @@ static int is_name(const char *p, const char *name)
    from the table, not remembered. */
 static int format_procdir(char *out, int cap)
 {
-    int o = append(out, 0, "- 0 tasks\n- 0 mounts\n- 0 pagetable\n");
+    int o = append(out, 0, "- 0 tasks\n- 0 mounts\n- 0 pagetable\n- 0 ipc\n");
     for (int i = 0; i < PROC_NTASK && o < cap - 24; i++) {
         struct taskinfo ti;
         if (sys_taskinfo(i, &ti) < 0)
@@ -165,6 +199,85 @@ static int format_procdir(char *out, int cap)
 
 /* Same as the filesystem's: a task that is killed never closes anything, and
    two slots is two killed readers away from a /proc that answers nothing. */
+/* The rendezvous graph. Every blocked task in this system is blocked on
+   another task, and the pair is what you want to see when nothing is moving:
+   a cycle in this list is a deadlock, and until it could be printed the only
+   way to find one was to reason about it. */
+static int format_ipc(char *out, int cap)
+{
+    int o = append(out, 0, "task                  state    holding out to\n");
+    for (int i = 0; i < PROC_NTASK && o < cap - 80; i++) {
+        struct taskinfo ti;
+        if (sys_taskinfo(i, &ti) < 0)
+            continue;
+        o += uutoa((unsigned long)ti.id, out + o);
+        out[o++] = ' ';
+        o = append(out, o, ti.name);
+        /* A program's name is its path, which is long: /BIN/FOREVER.ELF is
+           seventeen characters and the column has to hold it or the line
+           stops lining up exactly when there is something to read. */
+        for (int p = (int)ustrlen(ti.name) + 4; p < 22; p++)
+            out[o++] = ' ';
+        o = append(out, o, state_name(ti.state));
+        for (int p = (int)ustrlen(state_name(ti.state)); p < 9; p++)
+            out[o++] = ' ';
+        o += ipc_words(&ti, out + o, cap - o);
+        if (ti.ipc == IPC_SEND && ti.msglen) {
+            o = append(out, o, "  (");
+            o += uutoa((unsigned long)ti.msglen, out + o);
+            o = append(out, o, " bytes)");
+        }
+        out[o++] = '\n';
+    }
+    return o;
+}
+
+/* One task's half of it, and who is queued waiting for it. The queue is the
+   part `ps` could never show: a server with four clients standing behind it
+   looks exactly like a server with none. */
+static int format_task_ipc(int who, char *out, int cap)
+{
+    for (int i = 0; i < PROC_NTASK; i++) {
+        struct taskinfo ti;
+        if (sys_taskinfo(i, &ti) < 0 || ti.id != who)
+            continue;
+        int o = append(out, 0, "task     ");
+        o += uutoa((unsigned long)ti.id, out + o);
+        out[o++] = ' ';
+        o = append(out, o, ti.name);
+        o = append(out, o, "\nstate    ");
+        o = append(out, o, state_name(ti.state));
+        o = append(out, o, "\nwaiting  ");
+        int k = ipc_words(&ti, out + o, cap - o);
+        o += k;
+        if (!k)
+            o = append(out, o, "nothing");
+        o = append(out, o, "\nsenders  ");
+        o += uutoa((unsigned long)ti.senders, out + o);
+        o = append(out, o, "\n");
+
+        /* And the other direction: who is standing in its queue. The kernel
+           does not record it on the sender, so this is read off every task
+           that says it is sending to this one. */
+        for (int j = 0; j < PROC_NTASK && o < cap - 48; j++) {
+            struct taskinfo s2;
+            if (sys_taskinfo(j, &s2) < 0)
+                continue;
+            if (s2.ipc == IPC_SEND && s2.peer == who) {
+                o = append(out, o, "  <- ");
+                o += uutoa((unsigned long)s2.id, out + o);
+                out[o++] = ' ';
+                o = append(out, o, s2.name);
+                o = append(out, o, " is holding out ");
+                o += uutoa((unsigned long)s2.msglen, out + o);
+                o = append(out, o, " bytes\n");
+            }
+        }
+        return o;
+    }
+    return -1;
+}
+
 static int proc_alloc(void)
 {
     for (int i = 0; i < PROC_MAXFD; i++)
@@ -191,6 +304,7 @@ static void proc_do_open(struct vfs_req *r, int caller)
 
     f->data = malloc(PROC_BUFSZ);
     if (!f->data) { r->result = -1; return; }
+    f->ctl_task = 0;
 
     int n;
     const char *leaf;
@@ -200,6 +314,8 @@ static void proc_do_open(struct vfs_req *r, int caller)
        will not say what is in it is no use in a union. */
     if (is_name(r->path, "/proc"))
         n = format_procdir(f->data, PROC_BUFSZ);
+    else if (ustr_has_prefix(r->path, "/proc/ipc"))
+        n = format_ipc(f->data, PROC_BUFSZ);
     else if (who >= 0) {
         /* A task that is not there has no directory. Asking sys_alive first
            means a stale number is refused rather than answered with the state
@@ -208,7 +324,14 @@ static void proc_do_open(struct vfs_req *r, int caller)
         if (!sys_alive(who))
             n = -1;
         else if (leaf[0] == 0)
-            n = append(f->data, 0, "- 0 mounts\n- 0 pagetable\n");
+            n = append(f->data, 0, "- 0 mounts\n- 0 pagetable\n- 0 ipc\n"
+                                   "- 0 ctl\n");
+        else if (ustr_has_prefix(leaf, "ipc"))
+            n = format_task_ipc(who, f->data, PROC_BUFSZ);
+        else if (ustr_has_prefix(leaf, "ctl")) {
+            f->ctl_task = who;
+            n = append(f->data, 0, "kill\n");   /* what it will accept */
+        }
         else if (ustr_has_prefix(leaf, "mounts"))
             n = sys_mounts(who, f->data, PROC_BUFSZ);
         else if (ustr_has_prefix(leaf, "pagetable"))
@@ -245,6 +368,28 @@ void proc_server(void)
         case VFS_OPEN:
             proc_do_open(r, from);
             break;
+        /* A control file: write `kill` to it and the task is gone. Plan 9
+           spells it exactly this way, and it is worth spelling the same,
+           because it turns a syscall into a name — Ctrl-C nominates a task to
+           the terminal, and this is the same act done deliberately, by
+           whoever can write the file. There is no permission on it, which is
+           the same hole SYS_KILL has and is written down in both places. */
+        case VFS_WRITE: {
+            if (r->fd < 0 || r->fd >= PROC_MAXFD || !p_tab[r->fd].used) {
+                r->result = -1;
+                break;
+            }
+            struct proc_file *f = &p_tab[r->fd];
+            if (f->ctl_task <= 0) {
+                r->result = -1;         /* not a control file */
+                break;
+            }
+            if (ustr_has_prefix(r->data, "kill"))
+                r->result = sys_kill(f->ctl_task) == 0 ? r->len : -1;
+            else
+                r->result = -1;
+            break;
+        }
         case VFS_READ: {
             if (r->fd < 0 || r->fd >= PROC_MAXFD || !p_tab[r->fd].used) {
                 r->result = -1;
@@ -269,9 +414,6 @@ void proc_server(void)
                 r->result = p_tab[r->fd].size;
             else
                 r->result = -1;
-            break;
-        case VFS_WRITE:
-            r->result = -1;                     /* read-only view */
             break;
         case VFS_CLOSE:
             if (r->fd >= 0 && r->fd < PROC_MAXFD) {

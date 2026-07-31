@@ -133,11 +133,31 @@ struct dmapage {
     uint64 pa;
 };
 
+/* Why a task is not running, which "blocked" does not say.
+
+   Every rendezvous in this system is a pair of tasks, and until now the pair
+   was invisible: `ps` said blocked and left you to guess whether a task was
+   waiting for a reply, waiting for a client, or wedged against another task
+   that was waiting for it. The kernel has known all along — these are the
+   fields ipc.c parks a task with — and it costs four integers to say. */
+enum {
+    IPC_NONE = 0,        /* running, or blocked on something that is not IPC */
+    IPC_RECV,            /* in recv(): anybody may answer */
+    IPC_RECVFROM,        /* in recv_from(peer): only that one may */
+    IPC_SEND,            /* in send(peer): parked on its queue */
+    IPC_WAIT,            /* in wait(peer): until that task is gone */
+    IPC_ALARM,           /* in an alarm: until the clock says so */
+};
+
 struct taskinfo {
     int  id;
     int  state;          /* matches enum task_state */
     int  is_current;
     char name[16];
+    int  ipc;            /* one of the above */
+    int  peer;           /* whom, where that means anything */
+    int  msglen;         /* the message it is holding out, for IPC_SEND */
+    int  senders;        /* how many tasks are queued sending to it */
 };
 
 static inline long _ecall1(long n, long a0)
