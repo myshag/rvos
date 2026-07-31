@@ -9,6 +9,7 @@
 #include "syscall.h"
 #include "vfs.h"
 #include "ulib.h"
+#include "servers.h"
 
 #define LINEMAX 128
 #define ELFMAX  16384
@@ -178,6 +179,16 @@ void sh_main(void)
                                         /* Text to a file, which is how a control file is spoken to. Not a
            redirection — there are no pipes here — just the write a program
            would do, available from the prompt. */
+        /* Measured on demand rather than at boot: a benchmark that runs
+           while the system is busy measures the system, not the thing. It is
+           a builtin because it needs two tasks already in the image talking
+           to each other, and a program on the disk cannot arrange that. */
+        if (streq(argv[0], "bench")) {
+            unsigned long go = 0;
+            sys_send(BENCH_TASK_ID, &go, (int)sizeof(go));
+            continue;
+        }
+
         if (streq(argv[0], "write")) {
             if (argc < 3) {
                 uputs("usage: write <path> <text...>\n");

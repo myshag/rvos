@@ -73,6 +73,7 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/loader.c`     | **ELF loader** — user mode; the kernel never parses ELF |
 | `src/sh.c`         | an interactive shell — reads a line, runs what you typed |
 | `src/srv_rsh.c`    | the same shell, over TCP on port 23, and over telnet |
+| `src/bench.c`      | two tasks and one message: the floor under everything else |
 | `prog/lib.h`       | what a disk program has instead of a library: included, not linked |
 | `prog/*.c`         | `ls cat echo mkdir rm cp mv wc ps free` — /BIN, and the services |
 | `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
@@ -376,6 +377,8 @@ $ read the fs server's private data region
 37. VFAT long names: UTF-16 on disk, UTF-8 in the system, and quotes in the
     shells because a file can have a space in it now
 38. a closed receive, because a reply is not an event
+39. `ping` and `bench`: what a message costs, and which module stopped
+    answering
 
 ## Loading a program
 
@@ -2246,6 +2249,92 @@ receive can name a task that then dies, so `task_retire` wakes anyone waiting
 to hear from it with -1. Without that, a client of a server that crashed would
 wait for ever with somebody else's message queued behind it.
 
+## What a message costs
+
+After two stages of surgery on the IPC there was not a single number anywhere
+saying what any of it cost, and when the shell wedged there was no way to ask
+which module had stopped answering. Both gaps close with one thing: an
+operation every server answers immediately, with 0 and nothing else, so that
+the only information in the reply is its own timing.
+
+```
+rvos$ ping /
+  ioctl: 92.88 us per round trip  (2000 of them in 185 ms)
+  open+close: 173.10 us per round trip
+rvos$ ping /r3/                     <- a namespace on another machine
+  ioctl: 25339.40 us per round trip
+```
+
+Same command, same call, the same five-operation interface — and the number is
+the only thing that says one of them crosses a TCP connection.
+
+### It found something before it measured anything
+
+The first run said 127 µs to the filesystem and 182 µs to `/proc`, which made
+no sense: the same request, the same size, two servers doing the same nothing.
+The difference was **where they sat in the round-robin**. Three tasks left over
+from the boot demonstration were finishing with
+
+```c
+for (;;)
+    yield();
+```
+
+which is not idling — it is *busy*. Every message in the system paid for them
+in context switches on the way past. They block now, and `/proc` went from
+182 µs to 116 µs without touching a line of the proc server. The cost had been
+there since stage 9 and nothing had ever looked.
+
+### The floor underneath
+
+`ping` measures the whole interface. `bench` measures two tasks and one
+message with nothing on top, so the difference is what the interface costs
+over the primitive it is built on:
+
+```
+rvos$ bench
+  8 bytes, open recv  : 85.68 us
+  8 bytes, closed recv: 85.79 us
+  (672 bytes is one vfs_req)
+  vfs_req, closed recv: 89.92 us
+```
+
+Three things fall out of those four lines:
+
+- **the closed receive is free.** 85.68 against 85.79 µs — searching the
+  sender queue instead of taking its head does not show up at all;
+- **the copy is nearly free.** 672 bytes across two address spaces, twice,
+  costs about 4 µs — which is worth knowing, because "IPC copies" has been
+  the stated price of isolation since stage 9 and it is not where the money
+  goes;
+- **the interface is nearly free.** 92.9 µs for a full resolve-send-dispatch-
+  reply against 89.9 for the bare message: about 3 µs, three per cent. Every
+  open, read and write in this system is a message and a rounding error.
+
+So a message costs 86 µs, and everything built on it costs 3. If this ever
+needed to be fast, the place to look is the context switch — save and restore
+thirty-two registers, change `satp`, flush the TLB — and not the interface at
+all.
+
+### What these numbers are not
+
+They are QEMU's, under software translation, and they say nothing about
+hardware. And they move with load: `/dev/console` measured 128 µs on a quiet
+system and 187 µs while somebody was typing at it over telnet. A benchmark
+reports the system it ran on.
+
+The first version of `bench` ran at boot, and reported the bare primitive as
+*slower* than the whole interface built on top of it — because it was
+competing with a name being resolved, a program being loaded and a
+retransmission timer. The number was not wrong about anything except what it
+was measuring, which is the ordinary way for a benchmark to lie. It runs on
+demand now.
+
+And one number invites a question rather than answering it: 25 ms across a
+mounted remote namespace is suspiciously close to the 20 ms retry deadline the
+network server arms when a reply is refused. That suggests every remote round
+trip is waiting for one, which would be worth chasing.
+
 ## Next steps
 - each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
@@ -2253,6 +2342,8 @@ wait for ever with somebody else's message queued behind it.
 - more than one request in flight per connection: the tag is already there
 - `old` held as a channel rather than re-resolved as a string, so rebinding
   what a bind points at does not move everything bound onto it
+- why a round trip through a remote mount takes 25 ms when the link is
+  loopback: the 20 ms retry deadline is the obvious suspect
 - a pseudo-terminal: the shell serving its children's `/dev/console`, so that
   output is ordered and line endings are added in one place. It was attempted
   before the closed receive existed and failed four different ways

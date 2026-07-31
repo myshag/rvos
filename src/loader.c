@@ -162,6 +162,8 @@ void loader_main(void)
     else
         say_num("  started as task ", (unsigned long)tid, "\n");
 
-    for (;;)
-        _ecall1(SYS_YIELD, 0);
+    /* Finished. Blocking rather than spinning: a task that yields for ever is
+       not idle, it is busy, and every message in the system pays for it. */
+    unsigned long done;
+    sys_recv(&done, (int)sizeof(done));
 }

@@ -71,8 +71,12 @@ static void sandbox(void)
     cat("/proc/pagetable", "\n$ cat /proc/pagetable  -- sandbox's own space");
 
     sys_send(SHELL_TASK_ID, &m, (int)sizeof(m));
-    for (;;)
-        yield();
+    /* Finished. A task with nothing left to do blocks rather than spinning:
+       `for (;;) yield()` is not idling, it is *busy*, and every message in
+       the system then pays for it in context switches on the way past. That
+       cost was invisible until something measured it. */
+    uint64 done;
+    sys_recv(&done, (int)sizeof(done));
 }
 
 /* ---- isolation demo: reach for another module's memory --------------- */
@@ -92,8 +96,12 @@ static void snooper(void)
     char c = *disk;                  /* load page fault: task is retired */
 
     kprintf("  UNREACHABLE: read 0x%x — isolation failed\n", (int)c);
-    for (;;)
-        yield();
+    /* Finished. A task with nothing left to do blocks rather than spinning:
+       `for (;;) yield()` is not idling, it is *busy*, and every message in
+       the system then pays for it in context switches on the way past. That
+       cost was invisible until something measured it. */
+    uint64 done;
+    sys_recv(&done, (int)sizeof(done));
 }
 
 /* ---- shell ------------------------------------------------------------ */
@@ -119,8 +127,12 @@ static void shell(void)
     sys_send(NET_TASK_ID,     &m, (int)sizeof(m));
     sys_send(RSH_TASK_ID,     &m, (int)sizeof(m));
 
-    for (;;)
-        yield();
+    /* Finished. A task with nothing left to do blocks rather than spinning:
+       `for (;;) yield()` is not idling, it is *busy*, and every message in
+       the system then pays for it in context switches on the way past. That
+       cost was invisible until something measured it. */
+    uint64 done;
+    sys_recv(&done, (int)sizeof(done));
 }
 
 void user_main(void);        /* user.c — runs with the U bit set */
@@ -129,6 +141,8 @@ void loader_main(void);      /* loader.c — reads an ELF and spawns it */
 void sh_main(void);          /* sh.c — reads a command line and runs it */
 void net_server(void);       /* srv_net.c — virtio-net, in user mode */
 void rsh_main(void);         /* srv_rsh.c — the same shell, over TCP */
+void bench_main(void);       /* bench.c — what a message costs */
+void pong_main(void);        /* bench.c — the other end of it */
 
 /* Always runnable, so the scheduler never runs out of candidates — without
    it, retiring a faulting task while everyone else is blocked left nothing to
@@ -222,6 +236,10 @@ void smain(void)
        in the shared user text linked into this image, so it is a task here
        rather than a program on the disk. */
     task_create_user("rsh", rsh_main, __ursh_start, __ursh_end); /* 13 */
+    /* Two tasks whose only purpose is to time one message between them. Both
+       exit when they are done, so they cost two slots and nothing else. */
+    task_create_user("bench", bench_main, __umisc_start, __umisc_end); /* 14 */
+    task_create_user("pong",  pong_main,  __umisc_start, __umisc_end); /* 15 */
 
     /* Devices are handed to their driver and to nobody else — with the U bit,
        so the driver reaches them from user mode without the kernel on the

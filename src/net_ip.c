@@ -2109,6 +2109,12 @@ int net_vfs(int from, struct vfs_req *r)
         break;
     }
 
+    case VFS_IOCTL:
+        /* Answered before anything else is looked at: a ping asks whether
+           this task is still turning its loop, not about a connection. */
+        r->result = (r->ioctl_cmd == IOCTL_PING) ? 0 : -1;
+        break;
+
     case VFS_READ:
         if ((r->fd >= FD_STATUS0 && r->fd < FD_STATUS0 + NPFD) ||
             (r->fd >= FD_CTL0    && r->fd < FD_CTL0 + NPFD)) {

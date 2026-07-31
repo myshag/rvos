@@ -21,6 +21,8 @@ void null_server(void)
         case VFS_WRITE: r->result = r->len;   break;   /* accepted, dropped */
         case VFS_READ:  r->result = 0;        break;   /* EOF */
         case VFS_CLOSE: r->result = 0;        break;
+        case VFS_IOCTL: r->result = (r->ioctl_cmd == IOCTL_PING) ? 0 : -1;
+                        break;
         default:        r->result = -1;       break;
         }
         sys_send(from, r, (int)sizeof(*r));

@@ -131,7 +131,11 @@ void console_server(void)
             }
             break;
         }
-        case VFS_IOCTL: r->result = -1; break;  /* no tty commands yet */
+        case VFS_IOCTL:
+            /* A ping is about this server, not about a file, so it is
+               answered before the descriptor is even looked at. */
+            r->result = (r->ioctl_cmd == IOCTL_PING) ? 0 : -1;
+            break;
         case VFS_CLOSE: r->result = 0;  break;
         default:        r->result = -1; break;
         }

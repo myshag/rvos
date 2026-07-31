@@ -32,6 +32,7 @@ SECTIONS
         *loader.o(.text .text.*)
         */sh.o(.text .text.*)
         *srv_rsh.o(.text .text.*)
+        *bench.o(.text .text.*)
         *srv_net.o(.text .text.*)
         *net_ip.o(.text .text.*)
         *fat16.o(.text .text.*)
@@ -47,6 +48,7 @@ SECTIONS
         *loader.o(.rodata .rodata.* .srodata .srodata.*)
         */sh.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_rsh.o(.rodata .rodata.* .srodata .srodata.*)
+        *bench.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_net.o(.rodata .rodata.* .srodata .srodata.*)
         *net_ip.o(.rodata .rodata.* .srodata .srodata.*)
         *fat16.o(.rodata .rodata.* .srodata .srodata.*)
@@ -171,6 +173,7 @@ SECTIONS
     /* everyone else (ulib, user.o, console, null) */
     __umisc_start = .;
     .umisc_data : {
+        *bench.o(.data .data.* .sdata .sdata.*)
         *ulib.o(.data .data.* .sdata .sdata.*)
         *user.o(.data .data.* .sdata .sdata.*)
         *srv_null.o(.data .data.* .sdata .sdata.*)
@@ -179,6 +182,7 @@ SECTIONS
     . = ALIGN(8);
     __umisc_bss_start = .;
     .umisc_bss : {
+        *bench.o(.sbss .sbss.* .bss .bss.* COMMON)
         *ulib.o(.sbss .sbss.* .bss .bss.* COMMON)
         *user.o(.sbss .sbss.* .bss .bss.* COMMON)
         *srv_null.o(.sbss .sbss.* .bss .bss.* COMMON)

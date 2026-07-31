@@ -165,7 +165,11 @@ void proc_server(void)
             break;
         }
         case VFS_IOCTL:
-            if (r->ioctl_cmd == IOCTL_GETSIZE &&
+            /* A ping is about this server, not about a file, so it is
+               answered before the descriptor is even looked at. */
+            if (r->ioctl_cmd == IOCTL_PING)
+                r->result = 0;
+            else if (r->ioctl_cmd == IOCTL_GETSIZE &&
                 r->fd >= 0 && r->fd < PROC_MAXFD && p_tab[r->fd].used)
                 r->result = p_tab[r->fd].size;
             else

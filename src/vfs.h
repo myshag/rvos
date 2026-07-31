@@ -24,7 +24,17 @@ enum { VFS_OPEN = 1, VFS_READ, VFS_WRITE, VFS_IOCTL, VFS_CLOSE, VFS_CREATE };
 
 /* Generic ioctls. IOCTL_GETSIZE reports a file's size without slurping its
    bytes. New commands plug in here without changing the transport. */
-enum { IOCTL_GETSIZE = 1, IOCTL_REMOVE, IOCTL_MKDIR };  /* answer in `result` */
+enum {
+    IOCTL_GETSIZE = 1,
+    IOCTL_REMOVE,
+    IOCTL_MKDIR,
+    /* Answered by every server, immediately, with 0 and nothing else. It is
+       the one request whose *timing* is the answer: how long a message takes
+       to cross to a module and come back, and — when it does not come back —
+       which module has stopped answering. A system made of servers should be
+       able to say that about itself. */
+    IOCTL_PING,
+};
 
 /* Long names need somewhere to fit. 32 was enough while every name was 8.3;
    a path like /DOCS/длинное имя.txt is 40 bytes of UTF-8 before it starts. */

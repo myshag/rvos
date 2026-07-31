@@ -37,6 +37,17 @@ static inline void pcpy(void *d, const void *s, int n)
 
 static inline void say(const char *s) { vfs_say(s); }
 
+/* The clock, in one instruction and no syscall: smain sets scounteren.TM, so
+   rdtime is legal in user mode. QEMU's time base is 10 MHz, which is 100 ns a
+   tick — coarse for one round trip, which is why anything measured here is
+   measured a thousand times. */
+static inline unsigned long pticks(void)
+{
+    unsigned long t;
+    __asm__ volatile("rdtime %0" : "=r"(t));
+    return t;
+}
+
 static inline void sayn(unsigned long v)
 {
     char tmp[24], out[25];

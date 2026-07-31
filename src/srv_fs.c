@@ -175,7 +175,11 @@ void fs_server(void)
         case VFS_CREATE: fs_do_open(r, 1); break;
         case VFS_READ:  fs_do_read(r);  break;
         case VFS_IOCTL:
-            if (r->ioctl_cmd == IOCTL_MKDIR) {
+            /* A ping is about this server, not about a file, so it is
+               answered before the descriptor is even looked at. */
+            if (r->ioctl_cmd == IOCTL_PING) {
+                r->result = 0;
+            } else if (r->ioctl_cmd == IOCTL_MKDIR) {
                 /* On the path, not on the descriptor: there is nothing to
                    open yet. The fd is ignored and the path carries it. */
                 r->result = fat16_mkdir(r->path);
