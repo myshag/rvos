@@ -73,6 +73,8 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/loader.c`     | **ELF loader** — user mode; the kernel never parses ELF |
 | `src/sh.c`         | an interactive shell — reads a line, runs what you typed |
 | `src/srv_rsh.c`    | the same shell, reached over TCP on port 23 |
+| `prog/lib.h`       | what a disk program has instead of a library: included, not linked |
+| `prog/*.c`         | `ls cat echo mkdir rm cp mv wc ps free` — /BIN, and the services |
 | `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
 | `prog/netd.c`      | a program that owns TCP port 7 and answers callers |
 | `prog/get.c`       | an HTTP client: resolve, connect, fetch — all through files |
@@ -368,6 +370,8 @@ $ read the fs server's private data region
     kept in step, checked with `fsck.fat`
 34. directories: walking a path, listing any of them, `mkdir`, and the root
     that is not one
+35. the commands leave the shell and become programs in `/BIN`, which needs
+    `wait` first
 
 ## Loading a program
 
@@ -1938,6 +1942,92 @@ build/fat16.img: 13 files, 83/16223 clusters      <- no complaints
 
 and after deleting them again, `fsck` counts the clusters back down.
 
+## The shell stops knowing the commands
+
+`cat` was a builtin, and so were `ls`, `mkdir`, `rm` and the rest. They are
+programs on the disk now, in `/BIN` — a directory that can exist because the
+previous stage made directories possible — and the shell finds them by name:
+
+```
+rvos$ ls
+HELLO.TXT  (54 bytes)
+README.TXT  (105 bytes)
+DOCS/
+BIN/
+rvos$ wc /README.TXT
+4 13 105  /README.TXT
+rvos$ free
+free 12017 of 12203 pages (48068 KiB free)
+```
+
+`ls`, `cat`, `echo`, `mkdir`, `rm`, `cp`, `mv`, `wc`, `ps`, `free` — ten ELF
+files, none of which the shell has heard of. A bare word becomes
+`/BIN/<word>.ELF`; a word with a slash in it is taken as written.
+
+**Nothing uppercases anything.** FAT16 stores an 8.3 name upper-cased and
+looks one up the same way, so `ls` finds `/BIN/LS.ELF` without a line of shell
+code knowing that this filesystem shouts.
+
+### `wait` had to come first
+
+Without it this change makes the system worse, not better: the child and the
+shell write the same place, so the prompt comes back in the middle of the
+program's first line. That was a tolerable wart when `cat` was a builtin and
+is not one when it is not.
+
+```c
+SYS_WAIT    /* block until that task is gone */
+```
+
+Polling `sys_alive` would do, and did for a moment, but it costs a scheduling
+slice per check and a shell running a command spends all its time there. The
+kernel version is a field and four lines in `task_retire`: anyone blocked on
+an id is woken when that id is retired. `&` at the end of a line skips the
+wait, which is how a program that never exits gets started:
+
+```
+rvos$ /BIN/NETD.ELF &
+[4358]
+```
+
+### What a program on the disk has instead of a library
+
+It cannot link against `ulib`: that lives in the shared user text of
+`kernel.elf`, which is not mapped into anything loaded at run time. So each
+program carries its own copy of the half-dozen functions it needs, and
+`prog/lib.h` is how they stopped being written out ten times — included, not
+linked.
+
+Everything in it writes through `vfs_say`, which is a path, which means the
+output follows whatever `/dev/console` is bound to where the program was
+started. The same `/BIN/GET.ELF` prints on the serial console from the local
+shell and down the connection from the one over TCP:
+
+```
+rvos# get example.com
+  [get] example.com is 104.20.23.154
+HTTP/1.1 200 OK
+...
+  [get] 828 bytes
+```
+
+### What is still a builtin, and why
+
+Four things, and they have something in common: `bind`, `mount`, `unmount`
+and `import` change *this shell's own namespace*. A separate program could do
+it — a child shares its parent's namespace rather than copying it, so the
+change would stick — but it would be a surprising way to write it. And `echo`,
+which has nothing to start.
+
+### What it does not have
+
+No pipes and no redirection, so a command's output goes where its namespace
+says and nowhere else; `>` would be a bind, which is the interesting way to
+build it and is not built. No exit status, because nothing returns one — the
+shell learns only that a task is gone. `mv` is a copy and a delete, since the
+filesystem has no rename; within one directory that is eleven bytes of work
+being done as a whole-file copy.
+
 ## Next steps
 - each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
@@ -1945,8 +2035,7 @@ and after deleting them again, `fsck` counts the clusters back down.
 - more than one request in flight per connection: the tag is already there
 - `old` held as a channel rather than re-resolved as a string, so rebinding
   what a bind points at does not move everything bound onto it
-- `wait()`, so `run` can return when the program does, and job control so a
-  program that never exits does not have to be left running blind
+- redirection, which in this system wants to be a bind rather than a `>`
 - `poll`/`select`, or a second task per connection — either would let `netd`
   serve more than one caller at a time
 - more than one waiter on the console, so two programs can read keystrokes

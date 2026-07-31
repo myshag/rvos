@@ -93,6 +93,15 @@ void task_retire(struct task *t)
     }
     t->wait_sender  = 0;
     t->waiting_recv = 0;
+    /* Anyone waiting for this task has been waiting for exactly this. Done
+       before the id is retired, since that is what they named. */
+    for (int i = 0; i < NTASK; i++)
+        if (tasks[i].state == T_BLOCKED && tasks[i].wait_for == t->id) {
+            tasks[i].wait_for  = 0;
+            tasks[i].ctx.x[10] = 0;
+            tasks[i].state     = T_RUNNABLE;
+        }
+
     vm_free_task(t);                    /* also clears t->pt */
     t->state = T_UNUSED;
     t->gen++;                           /* whatever still names this id is
@@ -312,6 +321,17 @@ void syscall_dispatch(uint64 num)
         current->ctx.x[10] = (uint64)(long)vfs_ns_clone();
         break;
     /* ---- building another task, one segment at a time ---------------- */
+    case SYS_WAIT: {
+        int tid = (int)current->ctx.x[10];
+        if (!task_by_id(tid)) {
+            current->ctx.x[10] = 0;     /* already gone */
+            break;
+        }
+        current->wait_for = tid;
+        current->state    = T_BLOCKED;
+        schedule();
+        break;
+    }
     case SYS_ALIVE:
         current->ctx.x[10] = task_by_id((int)current->ctx.x[10]) ? 1 : 0;
         break;

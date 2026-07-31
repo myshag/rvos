@@ -50,6 +50,7 @@ struct task {
     uint64 dma_next;            /* next free VA in its DMA window */
     uint64 alarm_at;            /* absolute time to wake it, 0 = no alarm */
     int    timer_pending;       /* the alarm went off while it was busy */
+    int    wait_for;            /* blocked until this task id is gone, or 0 */
     struct task *wait_sender;   /* head of senders blocked on us as receiver */
     struct task *send_next;     /* intrusive link within that sender queue */
 };

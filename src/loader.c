@@ -151,12 +151,12 @@ void loader_main(void)
     }
 
     char *argv[3];
-    argv[0] = (char *)"/HELLO.ELF";
+    argv[0] = (char *)"/BIN/HELLO.ELF";
     argv[1] = (char *)"alpha";
     argv[2] = (char *)"beta";
 
-    uputs("$ exec /HELLO.ELF alpha beta\n");
-    int tid = spawn("/HELLO.ELF", elfbuf, ELFMAX, 3, argv);
+    uputs("$ exec /BIN/HELLO.ELF alpha beta\n");
+    int tid = spawn("/BIN/HELLO.ELF", elfbuf, ELFMAX, 3, argv);
     if (tid < 0)
         uputs("  exec failed\n");
     else

@@ -132,64 +132,10 @@ static int split(char *s, char **out, int max)
 }
 
 /* ---- builtins ---------------------------------------------------------
-   `cat` is the interesting one, and it is interesting because it is dull:
-   the path may be a file on the FAT16 volume, a report rendered by the proc
-   server, or the state of a TCP connection, and this code cannot tell which.
-   That is the whole point of the interface these stages have been building —
-   read over a network what a server renders on request, with no part of the
-   chain knowing about any other. */
-static void do_cat(const char *path)
-{
-    int fd = vfs_open(path);
-    if (fd < 0) {
-        puts_conn("rsh: cannot open ");
-        puts_conn(path);
-        puts_conn("\n");
-        return;
-    }
-    for (;;) {
-        char buf[VFS_DATA_MAX];
-        int n = vfs_read(fd, buf, VFS_DATA_MAX);
-        if (n <= 0)
-            break;
-        if (wr(buf, n) < 0)
-            break;
-    }
-    vfs_close(fd);
-}
-
-/* A directory that is a union is *every* member of it, one after another —
-   which is the whole point of joining two names, and the one place a program
-   has to know the union exists. Opening a file takes the first answer;
-   listing a directory takes all of them. */
-static void do_ls(const char *path)
-{
-    char real[VFS_PATH_MAX];
-    int shown = 0;
-    for (int nth = 0; ; nth++) {
-        int srv = sys_resolve(path, real, (int)sizeof(real), nth);
-        if (srv < 0)
-            break;
-        int fd = vfs_open_at(srv, real);
-        if (fd < 0)
-            continue;                   /* this member does not have it */
-        for (;;) {
-            char buf[VFS_DATA_MAX];
-            int n = vfs_read(fd, buf, VFS_DATA_MAX);
-            if (n <= 0)
-                break;
-            if (wr(buf, n) < 0)
-                break;
-        }
-        vfs_close(fd);
-        shown++;
-    }
-    if (!shown) {
-        puts_conn("rsh: cannot open ");
-        puts_conn(path);
-        puts_conn("\n");
-    }
-}
+   Almost none. What is left changes *this shell's own namespace*, which is
+   the one thing a separate program cannot usefully do on its behalf, and
+   `echo`, whose output has to come back here rather than wherever
+   /dev/console happens to point. Everything else is a file in /BIN. */
 
 static void do_help(void)
 {
@@ -212,6 +158,61 @@ static void do_help(void)
               "  run <path> ..  start a program; its output comes back here\n"
               "  echo <words>   write them back\n"
               "  exit           hang up\n");
+}
+
+/* Where a bare word is looked for: /BIN, unless it already has a slash in it.
+   Nothing here uppercases anything — the filesystem does, since an 8.3 name
+   is stored and looked up upper-cased, so `ls` finds /BIN/LS.ELF without this
+   code knowing that FAT16 shouts. */
+static void find_program(const char *word, char *out, int cap)
+{
+    int has_slash = 0;
+    for (const char *p = word; *p; p++)
+        if (*p == '/')
+            has_slash = 1;
+
+    int n = 0;
+    if (!has_slash)
+        for (const char *pre = "/BIN/"; *pre && n < cap - 6; pre++)
+            out[n++] = *pre;
+    for (const char *p = word; *p && n < cap - 5; p++)
+        out[n++] = *p;
+    if (!has_slash)
+        for (const char *ext = ".ELF"; *ext && n < cap - 1; ext++)
+            out[n++] = *ext;
+    out[n] = 0;
+}
+
+/* Start it and wait, unless the line ended in `&`.
+
+   Waiting is what makes a shell of external commands usable: the child writes
+   this same connection, so without it the prompt and the program's first line
+   arrive interleaved. That used to be an accepted wart because `cat` was a
+   builtin. It is not one now. */
+static void run_command(int argc, char **argv)
+{
+    int background = 0;
+    if (argc > 1 && streq(argv[argc - 1], "&")) {
+        background = 1;
+        argc--;
+    }
+    char path[VFS_PATH_MAX];
+    find_program(argv[0], path, (int)sizeof(path));
+
+    int tid = spawn(path, elfbuf, ELFMAX, argc, argv);
+    if (tid < 0) {
+        puts_conn("rsh: no such command: ");
+        puts_conn(argv[0]);
+        puts_conn("  (try `help`)\n");
+        return;
+    }
+    if (background) {
+        puts_conn("[");
+        put_num((unsigned long)tid);
+        puts_conn("]\n");
+    } else {
+        sys_wait(tid);
+    }
 }
 
 /* ---- one session ------------------------------------------------------ */
@@ -240,22 +241,17 @@ static void session(int slot)
         }
         if (streq(argv[0], "help")) {
             do_help();
-        } else if (streq(argv[0], "cat")) {
-            if (argc < 2)
-                puts_conn("usage: cat <path>\n");
-            else
-                for (int i = 1; i < argc; i++)
-                    do_cat(argv[i]);
-        } else if (streq(argv[0], "ls")) {
-            do_ls(argc > 1 ? argv[1] : "/");
-        } else if (streq(argv[0], "ps")) {
-            do_cat("/proc/tasks");
-        } else if (streq(argv[0], "mounts")) {
-            /* Whose namespace? This shell's — and the answer would differ for
-               a task that had cloned and rebound its own. That is why the
-               proc server has to be told which task to report on rather than
-               having "the" mount table to look at. */
-            do_cat("/proc/mounts");
+        } else if (streq(argv[0], "echo")) {
+            /* The one command kept, because its output has to arrive *here*
+               rather than wherever /dev/console points — which for a program
+               started from this shell is here anyway, but for `echo` there is
+               nothing to start. */
+            for (int i = 1; i < argc; i++) {
+                if (i > 1)
+                    puts_conn(" ");
+                puts_conn(argv[i]);
+            }
+            puts_conn("\n");
         } else if (streq(argv[0], "bind") || streq(argv[0], "mount")) {
             /* -a and -b are Plan 9's spelling of "join what is already there,
                after it" and "…before it". Without one, replace. */
@@ -278,47 +274,11 @@ static void session(int slot)
             } else if (sys_bind(argv[a], argv[a + 1], f) < 0) {
                 puts_conn("bind: no room in the mount table\n");
             }
-        } else if (streq(argv[0], "create")) {
-            if (argc < 2) {
-                puts_conn("usage: create <path> [text...]\n");
-            } else {
-                char msg[LINEMAX];
-                int k = 0;
-                for (int i = 2; i < argc; i++) {
-                    if (i > 2)
-                        msg[k++] = ' ';
-                    for (const char *q = argv[i]; *q && k < LINEMAX - 2; q++)
-                        msg[k++] = *q;
-                }
-                if (k)
-                    msg[k++] = '\n';
-                int fd = vfs_create(argv[1]);
-                if (fd < 0) {
-                    puts_conn("create: refused\n");
-                } else {
-                    if (k && vfs_write(fd, msg, k) < 0)
-                        puts_conn("create: write refused\n");
-                    vfs_close(fd);
-                }
-            }
-        } else if (streq(argv[0], "mkdir")) {
+        } else if (streq(argv[0], "unmount")) {
             if (argc < 2)
-                puts_conn("usage: mkdir <path>\n");
-            else if (vfs_ioctl_path(argv[1], IOCTL_MKDIR) < 0)
-                puts_conn("mkdir: refused\n");
-        } else if (streq(argv[0], "rm")) {
-            if (argc < 2) {
-                puts_conn("usage: rm <path>\n");
-            } else {
-                int fd = vfs_open(argv[1]);
-                if (fd < 0) {
-                    puts_conn("rm: no such file\n");
-                } else {
-                    if (vfs_ioctl(fd, IOCTL_REMOVE) < 0)
-                        puts_conn("rm: refused\n");
-                    vfs_close(fd);
-                }
-            }
+                puts_conn("usage: unmount <name>\n");
+            else if (sys_unmount(argv[1]) < 0)
+                puts_conn("unmount: nothing bound there\n");
         } else if (streq(argv[0], "import")) {
             /* Two steps and nothing else: start the proxy, and mount it. It
                is a task, and a mount takes a task — the namespace has no
@@ -327,13 +287,13 @@ static void session(int slot)
                 puts_conn("usage: import <a.b.c.d> <port> <prefix>\n");
             } else {
                 char *av[4];
-                av[0] = (char *)"/IMPORT.ELF";
+                av[0] = (char *)"/BIN/IMPORT.ELF";
                 av[1] = argv[1];
                 av[2] = argv[2];
                 av[3] = argv[3];        /* its own mount point, to strip */
                 int tid = spawn(av[0], elfbuf, ELFMAX, 4, av);
                 if (tid < 0) {
-                    puts_conn("import: cannot run /IMPORT.ELF\n");
+                    puts_conn("import: cannot run /BIN/IMPORT.ELF\n");
                 } else if (sys_mount(argv[3], tid, MREPL) < 0) {
                     puts_conn("import: no room in the mount table\n");
                 } else {
@@ -342,53 +302,8 @@ static void session(int slot)
                     puts_conn("\n");
                 }
             }
-        } else if (streq(argv[0], "unmount")) {
-            if (argc < 2)
-                puts_conn("usage: unmount <name>\n");
-            else if (sys_unmount(argv[1]) < 0)
-                puts_conn("unmount: nothing bound there\n");
-        } else if (streq(argv[0], "net")) {
-            do_cat("/net/status");
-        } else if (streq(argv[0], "echo")) {
-            for (int i = 1; i < argc; i++) {
-                if (i > 1)
-                    puts_conn(" ");
-                puts_conn(argv[i]);
-            }
-            puts_conn("\n");
-        } else if (streq(argv[0], "mem")) {
-            int info[2] = { 0, 0 };
-            sys_meminfo(info);
-            puts_conn("free pages: ");
-            put_num((unsigned long)info[0]);
-            puts_conn(" of ");
-            put_num((unsigned long)info[1]);
-            puts_conn("\n");
-        } else if (streq(argv[0], "run")) {
-            if (argc < 2) {
-                puts_conn("usage: run <path> [args]\n");
-            } else {
-                /* Announced *before* it is started, not after. The child
-                   and this shell write the same connection, and the child is
-                   running the instant spawn returns — a line printed
-                   afterwards arrives in the middle of the program's first
-                   one. There is no wait() here and no job control, so the
-                   prompt below still comes back while the program is talking;
-                   `ps` says what is running. */
-                puts_conn("starting ");
-                puts_conn(argv[1]);
-                puts_conn("\n");
-                if (spawn(argv[1], elfbuf, ELFMAX,
-                          argc - 1, argv + 1) < 0) {
-                    puts_conn("rsh: cannot run ");
-                    puts_conn(argv[1]);
-                    puts_conn("\n");
-                }
-            }
         } else {
-            puts_conn("rsh: no such command: ");
-            puts_conn(argv[0]);
-            puts_conn("  (try `help`)\n");
+            run_command(argc, argv);
         }
     }
 }

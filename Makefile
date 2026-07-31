@@ -21,16 +21,9 @@ ELF     := $(BUILD)/kernel.elf
 
 # Standalone programs: their own ELFs, linked at a fixed user address, put on
 # the FAT16 volume and loaded at run time. Not part of kernel.elf.
-PROG    := $(BUILD)/hello.elf
-NETD    := $(BUILD)/netd.elf
-GET     := $(BUILD)/get.elf
-EXPORT  := $(BUILD)/exportfs.elf
-IMPORT  := $(BUILD)/import.elf
-PROGS   := $(PROG) $(NETD) $(GET) $(EXPORT) $(IMPORT)
-# -MMD -MP for the same reason the kernel has it: these programs are built
-# from headers in src/, and without dependency tracking a change to vfs.h
-# leaves a stale .elf on the disk image that disagrees with the kernel it is
-# loaded by. That is a bug that hides until one field happens to be non-zero.
+# Every .c in prog/ is a program. They land in /BIN on the volume, which is
+# where the shell looks for a bare command name.
+PROGS   := $(patsubst prog/%.c,$(BUILD)/%.elf,$(wildcard prog/*.c))
 PCFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany \
            -ffreestanding -nostdlib -fno-common -fno-builtin \
            -Wall -Wextra -Os -I$(SRCDIR) -MMD -MP

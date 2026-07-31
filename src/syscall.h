@@ -76,6 +76,10 @@ enum {
        recv. What a server uses to answer a request it parked, since it
        must never be left waiting on a client. */
     SYS_TRYSEND = 22,     /* a0 = dest, a1 = message, a2 = length */
+    /* Block until that task is gone. Polling sys_alive would do, and did for
+       a while, but it burns a slice per check and a shell running a command
+       spends all its time there. */
+    SYS_WAIT    = 23,     /* a0 = task id -> 0 when it has exited */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -228,6 +232,11 @@ static inline int sys_pgdump(int task_id, unsigned long va, void *out, int cap)
 static inline int sys_send(int dst, const void *msg, int len)
 {
     return (int)_ecall3(SYS_SEND, dst, (long)msg, len);
+}
+
+static inline int sys_wait(int task_id)
+{
+    return (int)_ecall1(SYS_WAIT, task_id);
 }
 
 static inline int sys_trysend(int dst, const void *msg, int len)

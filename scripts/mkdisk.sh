@@ -23,12 +23,14 @@ printf 'a nested note in /DOCS\n' > "$tmp"
 mcopy -i "$IMG" "$tmp" ::/DOCS/NOTE.TXT
 rm -f "$tmp"
 
-# Real executables on the volume, for the loader to find at run time. The
-# 8.3 name FAT16 stores is the basename upper-cased: build/netd.elf -> NETD.ELF.
+# The programs go in /BIN, which is where the shell looks for a bare command
+# name. The 8.3 name FAT16 stores is the basename upper-cased:
+# build/netd.elf -> /BIN/NETD.ELF.
+mmd -i "$IMG" ::/BIN
 for p in "${PROGS[@]:-}"; do
     [ -n "$p" ] && [ -f "$p" ] || continue
     name="$(basename "$p" | tr '[:lower:]' '[:upper:]')"
-    mcopy -i "$IMG" "$p" "::/$name"
+    mcopy -i "$IMG" "$p" "::/BIN/$name"
 done
 
 echo "built $IMG"

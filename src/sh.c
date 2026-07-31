@@ -42,30 +42,6 @@ static int streq(const char *a, const char *b)
     return *a == *b;
 }
 
-/* Print a file. The point of "everything is a file" is lost if the shell
-   cannot look at one, and the things worth looking at are not files at all:
-   /proc/tasks is rendered by a server, /net/status by the protocol stack.
-   This does not know or care which. */
-static void cat(const char *path)
-{
-    int fd = vfs_open(path);
-    if (fd < 0) {
-        uputs("sh: cannot open ");
-        uputs(path);
-        uputs("\n");
-        return;
-    }
-    for (;;) {
-        char buf[VFS_DATA_MAX + 1];
-        int n = vfs_read(fd, buf, VFS_DATA_MAX);
-        if (n <= 0)
-            break;
-        buf[n] = 0;
-        uputs(buf);
-    }
-    vfs_close(fd);
-}
-
 static int split(char *s, char **out, int max)
 {
     int n = 0;
@@ -81,6 +57,70 @@ static int split(char *s, char **out, int max)
     return n;
 }
 
+/* Where a bare word is looked for. There is no PATH variable and no reason
+   for one yet: /BIN is where programs are, and a name with a slash in it is
+   taken as written.
+
+   Nothing here uppercases anything. The filesystem does: an 8.3 name is
+   stored upper-cased and looked up the same way, so `ls` finds /BIN/LS.ELF
+   without this code knowing that FAT16 shouts. */
+static int find_program(const char *word, char *out, int cap)
+{
+    int has_slash = 0;
+    for (const char *p = word; *p; p++)
+        if (*p == '/')
+            has_slash = 1;
+
+    int n = 0;
+    if (!has_slash) {
+        const char *pre = "/BIN/";
+        while (*pre && n < cap - 6)
+            out[n++] = *pre++;
+    }
+    for (const char *p = word; *p && n < cap - 5; p++)
+        out[n++] = *p;
+    if (!has_slash) {
+        const char *ext = ".ELF";
+        while (*ext && n < cap - 1)
+            out[n++] = *ext++;
+    }
+    out[n] = 0;
+    return 0;
+}
+
+/* Start it, and wait unless the line ended in `&`. Waiting is what makes a
+   shell of external commands usable at all: without it the prompt comes back
+   in the middle of the program's output, which was tolerable when `cat` was a
+   builtin and is not now that it is not. */
+static void run_command(int argc, char **argv)
+{
+    int background = 0;
+    if (argc > 1 && streq(argv[argc - 1], "&")) {
+        background = 1;
+        argc--;
+    }
+    char path[VFS_PATH_MAX];
+    find_program(argv[0], path, (int)sizeof(path));
+
+    int tid = spawn(path, elfbuf, ELFMAX, argc, argv);
+    if (tid < 0) {
+        uputs("sh: no such command: ");
+        uputs(argv[0]);
+        uputs("\n");
+        return;
+    }
+    if (background) {
+        uputs("[");
+        char n[24];
+        int k = uutoa((unsigned long)tid, n);
+        n[k] = 0;
+        uputs(n);
+        uputs("]\n");
+    } else {
+        sys_wait(tid);
+    }
+}
+
 void sh_main(void)
 {
     unsigned long go;
@@ -93,7 +133,7 @@ void sh_main(void)
     }
 
     uputs("\n--- sh (U-mode) ----------------------------------------\n");
-    uputs("type a path to run it, e.g. /HELLO.ELF one two\n");
+    uputs("commands live in /BIN; try `ls`, `cat /README.TXT`, `free`\n");
 
     for (;;) {
         uputs("\nrvos$ ");
@@ -123,66 +163,7 @@ void sh_main(void)
         if (argc == 0)
             continue;
 
-        if (streq(argv[0], "cat")) {
-            if (argc < 2)
-                uputs("usage: cat <path>\n");
-            else
-                for (int i = 1; i < argc; i++)
-                    cat(argv[i]);
-            continue;
-        }
-
-        if (streq(argv[0], "create")) {
-            if (argc < 2) {
-                uputs("usage: create <path> [text...]\n");
-                continue;
-            }
-            char msg[LINEMAX];
-            int k = 0;
-            for (int i = 2; i < argc; i++) {
-                if (i > 2)
-                    msg[k++] = ' ';
-                for (const char *q = argv[i]; *q && k < LINEMAX - 2; q++)
-                    msg[k++] = *q;
-            }
-            if (k)
-                msg[k++] = '\n';
-            int fd = vfs_create(argv[1]);
-            if (fd < 0) {
-                uputs("create: refused\n");
-                continue;
-            }
-            if (k && vfs_write(fd, msg, k) < 0)
-                uputs("create: write refused\n");
-            vfs_close(fd);
-            continue;
-        }
-
-        if (streq(argv[0], "mkdir")) {
-            if (argc < 2)
-                uputs("usage: mkdir <path>\n");
-            else if (vfs_ioctl_path(argv[1], IOCTL_MKDIR) < 0)
-                uputs("mkdir: refused\n");
-            continue;
-        }
-
-        if (streq(argv[0], "rm")) {
-            if (argc < 2) {
-                uputs("usage: rm <path>\n");
-                continue;
-            }
-            int fd = vfs_open(argv[1]);
-            if (fd < 0) {
-                uputs("rm: no such file\n");
-                continue;
-            }
-            if (vfs_ioctl(fd, IOCTL_REMOVE) < 0)
-                uputs("rm: refused\n");
-            vfs_close(fd);
-            continue;
-        }
-
-        /* Text to a file, which is how a control file is spoken to. Not a
+                                        /* Text to a file, which is how a control file is spoken to. Not a
            redirection — there are no pipes here — just the write a program
            would do, available from the prompt. */
         if (streq(argv[0], "write")) {
@@ -226,13 +207,13 @@ void sh_main(void)
                 continue;
             }
             char *av[4];
-            av[0] = (char *)"/IMPORT.ELF";
+            av[0] = (char *)"/BIN/IMPORT.ELF";
             av[1] = argv[1];
             av[2] = argv[2];
             av[3] = argv[3];
             int tid = spawn(av[0], elfbuf, ELFMAX, 4, av);
             if (tid < 0)
-                uputs("import: cannot run /IMPORT.ELF\n");
+                uputs("import: cannot run /BIN/IMPORT.ELF\n");
             else if (sys_mount(argv[3], tid, MREPL) < 0)
                 uputs("import: no room in the mount table\n");
             else
@@ -242,23 +223,6 @@ void sh_main(void)
 
         /* The other builtin, because it answers the question a loader raises:
            does running programs cost memory permanently? */
-        if (streq(argv[0], "mem")) {
-            int mem[2] = { 0, 0 };
-            char n[24];
-            sys_meminfo(mem);
-            int k = uutoa((unsigned long)mem[0], n);
-            n[k] = 0;
-            uputs("free pages: ");
-            uputs(n);
-            uputs("\n");
-            continue;
-        }
-
-        int tid = spawn(argv[0], elfbuf, ELFMAX, argc, argv);
-        if (tid < 0) {
-            uputs("sh: cannot run ");
-            uputs(argv[0]);
-            uputs("\n");
-        }
+                run_command(argc, argv);
     }
 }
