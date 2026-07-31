@@ -99,9 +99,9 @@ static void fs_do_ioctl(struct vfs_req *r)
 void fs_server(void)
 {
     if (fat16_init() == 0)
-        uputs("  [fs] up (user mode), FAT16 mounted from its own mapping\n");
+        uputs("  [fs] up (user mode), FAT16 on a virtio-blk disk it drives itself\n");
     else
-        uputs("  [fs] no valid FAT16 (run with 'make rundisk')\n");
+        uputs("  [fs] no valid FAT16 on the disk\n");
 
     for (;;) {
         struct vfs_req req;

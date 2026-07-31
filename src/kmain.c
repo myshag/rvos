@@ -83,9 +83,12 @@ static void snooper(void)
 
     kprintf("\n--- snooper (task %d) ----------------------------------\n",
             SNOOPER_TASK_ID);
-    kprintf("$ read *(char*)0x%lx  -- FAT16 image, mapped only into fs\n",
-            DISK_PA);
-    volatile char *disk = (volatile char *)DISK_PA;
+    /* The disk used to be a window of RAM mapped into fs alone; it is a
+       device now, and its registers are mapped into fs alone. The point of
+       the demonstration is unchanged and the address is different. */
+    kprintf("$ read *(char*)0x%lx  -- virtio registers, mapped only to drivers\n",
+            VIRTIO_MMIO_BASE);
+    volatile char *disk = (volatile char *)VIRTIO_MMIO_BASE;
     char c = *disk;                  /* load page fault: task is retired */
 
     kprintf("  UNREACHABLE: read 0x%x — isolation failed\n", (int)c);
@@ -223,7 +226,17 @@ void smain(void)
     /* Devices are handed to their driver and to nobody else — with the U bit,
        so the driver reaches them from user mode without the kernel on the
        data path at all. */
-    vm_map_at(fs->pt,  DISK_PA, DISK_PA, DISK_SIZE, PTE_R | PTE_U, 1);
+    /* The filesystem server drives the disk itself now, so what it needs is
+       the device window rather than a window of RAM somebody filled for it.
+
+       Both driver tasks get the whole virtio-mmio range, which is a real loss
+       and worth saying so: they can reach each other's registers. Handing each
+       one only its own slot means the kernel deciding which slot that is,
+       which means the kernel knowing what a virtio-net is — and the price of
+       that is the thing this design has been avoiding all along. The device
+       tree is the way out, and it is not here. */
+    vm_map_at(fs->pt, VIRTIO_MMIO_BASE, VIRTIO_MMIO_BASE,
+              VIRTIO_MMIO_STRIDE * VIRTIO_MMIO_SLOTS, PTE_R | PTE_W | PTE_U, 0);
     vm_map_at(con->pt, UART_BASE_PA, UART_BASE_PA, PGSIZE,
               PTE_R | PTE_W | PTE_U, 0);
     /* The virtio transports go to the network driver alone. */

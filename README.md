@@ -61,7 +61,8 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `src/ipc.c`        | synchronous rendezvous `send`/`recv` |
 | `src/vfs.h`        | **the one interface** + client wrappers |
 | `src/vfs.c`        | the namespace: `mount` and Plan 9 `bind`, longest-prefix routing |
-| `src/srv_fs.c`     | filesystem server — **user mode**, owns the disk mapping |
+| `src/srv_fs.c`     | filesystem server — **user mode**, owns the disk |
+| `src/srv_blk.c`    | **virtio-blk driver** — user mode, in the fs server's task |
 | `src/srv_console.c`| console server — **user mode**, drives the UART itself |
 | `src/srv_proc.c`   | kernel state as files — **user mode**, asks via syscalls |
 | `src/srv_null.c`   | the bit bucket — **user mode** |
@@ -119,8 +120,11 @@ which is how the sandbox in the demo is silenced without knowing it.
   bind rewriting the head of the path and resolving again. Because the
   namespace is the caller's, a server asked to report one has to be told
   whose — hence `vfs_dump_mounts_of(task_id, …)` behind `/proc/mounts`.
-- **Filesystem** image is loaded into guest RAM at `0x84000000` via
-  `-device loader`; the driver treats that region as a flat block device.
+- **The disk is a disk.** A virtio-blk device, driven by `srv_blk.c` inside
+  the filesystem server's own task — the same arrangement as the network,
+  where `srv_net.c` drives the card and `net_ip.c` speaks the protocols.
+  It used to be a FAT16 image copied into guest RAM with `-device loader`
+  and read with a memcpy.
 
 ## How Sv39 works
 
@@ -213,8 +217,8 @@ Needs `gcc-riscv64-unknown-elf`, `qemu-system-misc`, `mtools`, `dosfstools`.
 
 ```bash
 make            # build kernel.elf
-make disk       # build the FAT16 image, including /HELLO.ELF
-make rundisk    # run headless with the disk mapped into RAM
+make disk       # build the FAT16 image, including the programs
+make run        # run headless, with the image attached as a virtio-blk disk
 ```
 
 The boot demo runs first; when it settles you get a prompt and can type:
@@ -358,6 +362,8 @@ $ read the fs server's private data region
     and the non-blocking send the whole thing turned out to need
 31. two machines on one wire: a runtime address, and one writing to the
     other's control files through a mounted namespace
+32. a virtio-blk driver: the RAM image becomes a disk the filesystem server
+    drives itself
 
 ## Loading a program
 
@@ -1718,8 +1724,70 @@ nothing. That is a sentence in this README rather than a `TODO` in the source
 because it is not a detail — it is the difference between a demonstration and
 a system.
 
+## A disk that is a disk
+
+Everything above ran off a FAT16 image that QEMU copied into guest RAM with
+`-device loader`, which the filesystem server read with a memcpy from a window
+mapped into it alone. It is a virtio-blk device now, driven by `srv_blk.c`
+inside that same task — the arrangement the network has had since stage 15,
+where `srv_net.c` drives the card and `net_ip.c` speaks the protocols. Neither
+pair can reach into the other, and neither driver has the kernel on its data
+path.
+
+The shape of `fat16.c` barely changed, which is the whole argument for its
+having had a `blk_read()` in the first place.
+
+A request is three descriptors chained: a header the device reads, a sector it
+writes (for a read) or reads (for a write), and one status byte. The chain is
+the point — they are one request because of the NEXT flag, not because they
+are adjacent. And the `WRITE` flag means *the device writes here*, so it is
+set for a **read**; backwards, it is a request the device accepts and a buffer
+it never touches.
+
+**Polled, not interrupt-driven, and on purpose.** The obvious thing is to wait
+for the interrupt in `sys_recv`, as the network driver does. But the
+filesystem server is already inside a client's request when it reads a sector,
+and a `sys_recv` there is as likely to hand it a second client's request as
+the interrupt it wanted — the multiplexing problem `import` had to solve, and
+which the filesystem has no reason to take on. It yields between checks, so
+nothing is starved, and the request completes in the time QEMU takes to copy
+512 bytes.
+
+**What it cost.** Both driver tasks now have the whole virtio-mmio range
+mapped, so they can reach each other's registers — a real loss of the
+isolation the earlier stages were careful about. Handing each one only its own
+slot means the kernel deciding which slot that is, which means the kernel
+knowing what a virtio-net is. The device tree is the way out of that and it is
+not here.
+
+**Checked by changing the image and looking.** The decisive test is not that
+the guest can read a file; it is that the guest reads *the file the host just
+changed*:
+
+```
+$ mcopy -o -i build/fat16.img new.txt ::/README.TXT
+$ make run
+rvos$ cat /README.TXT
+CHANGED ON THE HOST at 03:42:10
+```
+
+and the other direction, since a driver that only reads is half a driver: the
+guest wrote a sector, and the bytes were in the host's image file afterwards.
+
+```
+  [fs] wrote sector 16383
+$ dd if=build/fat16.img bs=512 skip=16383 count=1 | head -c 45
+rvos wrote this sector through virtio-blk
+```
+
+That was a temporary probe rather than something the system does — `blk_write`
+is there and correct, and nothing calls it yet, because FAT16 writes are their
+own piece of work.
+
 ## Next steps
 
+- FAT16 writes, now that there is something to write to
+- each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
   pointed at a network anybody else is on
 - more than one request in flight per connection: the tag is already there
@@ -1737,8 +1805,7 @@ a system.
   everything after it
 - capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
-- a `virtio-blk` driver, replacing the RAM image with a real disk
-- FAT16 writes; subdirectory traversal
+- subdirectory traversal in the filesystem
 - run under OpenSBI in supervisor mode
 
 ## License

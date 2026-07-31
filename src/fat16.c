@@ -1,16 +1,16 @@
 /* fat16.c — minimal read-only FAT16. Parses the BPB, walks the root directory
    and follows cluster chains through the FAT. Block device is a flat region of
-   guest RAM at DISK_BASE (the image QEMU loaded with -device loader). */
+   a real disk, one sector at a time, through the virtio-blk driver next to it
+   in the same task. It used to be a memcpy from a window of guest RAM that
+   QEMU had filled with the image; the shape of the code barely changed, which
+   is the whole argument for having had a blk_read() at all. */
 #include "fat16.h"
+#include "blk.h"
 #include "ulib.h"
 
-#define DISK_BASE 0x84000000UL
-#define SECSZ     512
+#define SECSZ     BLK_SECSZ
 
-static void blk_read(uint32 lba, void *buf)
-{
-    umemcpy(buf, (const void *)(DISK_BASE + (uint64)lba * SECSZ), SECSZ);
-}
+
 
 static struct {
     uint16 bytes_per_sec;

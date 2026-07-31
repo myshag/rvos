@@ -35,9 +35,12 @@ PCFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany \
            -ffreestanding -nostdlib -fno-common -fno-builtin \
            -Wall -Wextra -Os -I$(SRCDIR) -MMD -MP
 
-# FAT16 RAM-disk image, loaded into guest memory (see fs stage).
+# The FAT16 image, attached as a drive. It used to be copied into guest RAM
+# with -device loader and read with a memcpy; it is a disk now, and the
+# filesystem server drives it.
 DISK    := $(BUILD)/fat16.img
-DISK_ADDR := 0x84000000
+DRIVE   := -drive file=$(DISK),if=none,format=raw,id=hd0 \
+           -device virtio-blk-device,drive=hd0
 # sstc is requested explicitly because the S-mode timer depends on it: CLINT's
 # mtimecmp is machine-mode only and the machine timer interrupt is not
 # delegable, so without Sstc an S-mode kernel has no clock of its own.
@@ -52,7 +55,7 @@ DISK_ADDR := 0x84000000
 QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic \
            -global virtio-mmio.force-legacy=false -kernel $(ELF) \
            -netdev user,id=n0,hostfwd=tcp::5555-:7,hostfwd=tcp::5556-:23,hostfwd=tcp::5564-:564 \
-           -device virtio-net-device,netdev=n0
+           -device virtio-net-device,netdev=n0 $(DRIVE)
 
 .PHONY: all run rundisk runpcap disk prog clean
 all: $(ELF)
@@ -89,17 +92,13 @@ disk: $(DISK)
 $(DISK): scripts/mkdisk.sh $(PROGS) | $(BUILD)
 	scripts/mkdisk.sh $(DISK) $(PROGS)
 
-run: $(ELF)
+run rundisk: $(ELF) $(DISK)
 	$(QEMU) $(QFLAGS)
-
-# Run with the FAT16 image mapped into RAM at $(DISK_ADDR).
-rundisk: $(ELF) $(DISK)
-	$(QEMU) $(QFLAGS) -device loader,file=$(DISK),addr=$(DISK_ADDR),force-raw=on
 
 # Same, but every frame is written to build/net.pcap for inspection on the
 # host — the way to check a network driver without trusting its own output.
 runpcap: $(ELF) $(DISK)
-	$(QEMU) $(QFLAGS) -device loader,file=$(DISK),addr=$(DISK_ADDR),force-raw=on \
+	$(QEMU) $(QFLAGS) \
 	  -object filter-dump,id=f0,netdev=n0,file=$(BUILD)/net.pcap
 
 clean:

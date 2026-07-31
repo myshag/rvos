@@ -27,6 +27,7 @@ SECTIONS
         *srv_null.o(.text .text.*)
         *srv_console.o(.text .text.*)
         *srv_fs.o(.text .text.*)
+        *srv_blk.o(.text .text.*)
         *srv_proc.o(.text .text.*)
         *loader.o(.text .text.*)
         */sh.o(.text .text.*)
@@ -41,6 +42,7 @@ SECTIONS
         *srv_null.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_console.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_fs.o(.rodata .rodata.* .srodata .srodata.*)
+        *srv_blk.o(.rodata .rodata.* .srodata .srodata.*)
         *srv_proc.o(.rodata .rodata.* .srodata .srodata.*)
         *loader.o(.rodata .rodata.* .srodata .srodata.*)
         */sh.o(.rodata .rodata.* .srodata .srodata.*)
@@ -63,12 +65,14 @@ SECTIONS
     __ufs_start = .;
     .ufs_data : {
         *srv_fs.o(.data .data.* .sdata .sdata.*)
+        *srv_blk.o(.data .data.* .sdata .sdata.*)
         *fat16.o(.data .data.* .sdata .sdata.*)
     }
     . = ALIGN(8);
     __ufs_bss_start = .;
     .ufs_bss : {
         *srv_fs.o(.sbss .sbss.* .bss .bss.* COMMON)
+        *srv_blk.o(.sbss .sbss.* .bss .bss.* COMMON)
         *fat16.o(.sbss .sbss.* .bss .bss.* COMMON)
     }
     . = ALIGN(8);
