@@ -979,6 +979,26 @@ static inline WINDOW *initscr(void)
     return stdscr;
 }
 
+/* Step off the screen without giving up the terminal: for running somebody
+   else's program, which will write to the same console and knows nothing
+   about any of this. The connection stays open and the negotiation stays in
+   force — only the picture is surrendered. curses_resume takes it back by
+   admitting it knows nothing about what is on the glass. */
+static inline void curses_suspend(void)
+{
+    cur__str("\x1b[0m\x1b[?25h\x1b[2J\x1b[H");
+    cur__flush();
+    cur__attr = 0xffffffffu;
+    cur__py = cur__px = -1;
+}
+
+static inline void curses_resume(void)
+{
+    curses_touchall();
+    cur__str(cur__visible ? "\x1b[?25h" : "\x1b[?25l");
+    cur__flush();
+}
+
 /* Give the terminal back the way it was found: cursor showing, no colour, no
    negotiation outstanding, and a blank screen — the shell that started this
    program is about to print its prompt into it. */

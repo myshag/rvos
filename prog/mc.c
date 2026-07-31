@@ -19,6 +19,7 @@
 
    usage: /BIN/MC.ELF [left] [right]                                       */
 #include "curses.h"
+#include "spawn.h"
 
 #define MAXENT 48
 #define NAMEW  64
@@ -110,6 +111,17 @@ static void load(struct panel *p)
     p->sel = 0;
     p->top = 0;
 
+    /* The way out belongs to the path, not to the directory.
+
+       FAT16 keeps ".." as a real entry on the disk, so it appeared in those
+       panels and nowhere else: /proc and /net are rendered by servers that
+       have no reason to invent one, and a panel showing one of them had no
+       way up but the left arrow. Every path except the root has a parent —
+       that is arithmetic on the name — so the entry is put there first and
+       the duplicate a real directory offers is dropped by `take`. */
+    if (!(p->path[0] == '/' && p->path[1] == 0))
+        take(p, "d 0 ..");
+
     int fd = vfs_open(p->path);
     if (fd < 0)
         return;
@@ -176,6 +188,8 @@ static void go_up(struct panel *p)
         k--;
     while (k > 0 && p->path[k - 1] != '/')
         k--;
+    if (k > 1)
+        k--;                    /* the slash goes too, unless it is the root */
     if (k < 1)
         k = 1;
     p->path[k] = 0;
@@ -910,6 +924,42 @@ static int edit_file(const char *path, int writable)
     return saved;
 }
 
+/* ---- running one ---------------------------------------------------------
+
+   The panels can start a program now, which the README said for several
+   stages they could not. The sentence was that spawn lives in the shared user
+   text of the kernel image — true, and the conclusion drawn from it was
+   wrong: what is out of reach is the function, not the three syscalls under
+   it, and a disk program can carry its own loader the way it carries its own
+   libc. prog/spawn.h is that.
+
+   The screen is the whole difficulty. The child inherits this task's
+   namespace, so /dev/console means the same connection for both, and a
+   program that prints a line knows nothing about panels. So the panels get
+   out of the way, the program runs, and the screen comes back when a key
+   says it may — which is what MC does, and for the same reason. */
+static void run_program(struct panel *p)
+{
+    char full[VFS_PATH_MAX];
+    join(full, p->path, p->e[p->sel].name);
+    char *av[1];
+    av[0] = full;
+
+    curses_suspend();
+    int tid = prun(full, 1, av);
+    if (tid < 0) {
+        say("mc: cannot run ");
+        say(full);
+        say("\n");
+    } else {
+        sys_wait(tid);
+    }
+    say("\n-- any key --");
+    getch();
+    curses_resume();
+    load(p);
+}
+
 /* ---- what the panel does with a file ------------------------------------ */
 
 static void do_mkdir(struct panel *p)
@@ -1031,6 +1081,8 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
                     for (int i = 0; i < VFS_PATH_MAX; i++)
                         p->path[i] = next[i];
                     load(p);
+                } else if (is_prog(e->name)) {
+                    run_program(p);         /* Enter runs it, F3 reads it */
                 } else {
                     char full[VFS_PATH_MAX];
                     join(full, p->path, e->name);

@@ -2493,12 +2493,14 @@ which is worth remembering the *next* time something only looks broken.
 
 ### What it does not do
 
-It cannot run anything: a program loaded from the disk cannot start another,
-because `spawn` lives in the shared user text of the kernel image — so the
-panels copy, delete, make directories, view and edit, and the shell is still
-where you run things. The menu bar along the top is painted, not wired; the
-keys under it are the ones on the strip. And one session at a time, which by
-now is a familiar sentence.
+The menu bar along the top is painted, not wired; the keys under it are the
+ones on the strip. And one session at a time, which by now is a familiar
+sentence.
+
+It could not run anything either, and that sentence stood here for several
+stages: "a program loaded from the disk cannot start another, because `spawn`
+lives in the shared user text of the kernel image". True, and the conclusion
+was wrong — see below.
 
 ## The screen becomes a data structure
 
@@ -3135,6 +3137,71 @@ None of this changes what is on the other end. **The shell still has no
 authentication of any kind**, and a standard port number is a better-known
 door rather than a stronger one. It is reachable on a private overlay because
 `HOSTIP` says so, and that is the only thing keeping it private.
+
+
+## The conclusion that was wrong
+
+Two things a person notices in the first minute of using the panels, and both
+had the same shape: something was missing because nobody had thought about
+where it should come from.
+
+### `..` belongs to the path, not to the directory
+
+FAT16 keeps `..` as a real entry on the disk, so it showed up in those panels
+and in no others. `/proc`, `/net` and `/proc/<id>` are rendered by servers
+with no reason to invent one, so a panel showing them had no way up except the
+left arrow — and nothing on the screen said so. (`.` is filtered on purpose:
+a directory's entry for itself is noise in a panel.)
+
+The fix is one line, and it is the same idea as the mount points: **every path
+except the root has a parent, and that is arithmetic on the name rather than a
+fact about the directory.** The entry is put into the panel before the
+directory is read, and the duplicate that a real FAT16 directory offers is
+dropped by the same check that stops a mount point being named twice.
+
+### A program on the disk can start another after all
+
+Pressing Enter on `/BIN/FREE.ELF` opened it in the viewer, because of a
+sentence that had been in this file since the panels existed: a program loaded
+from the disk cannot start another, since `spawn` lives in the shared user
+text of the kernel image and a disk program is not linked against it.
+
+Every word of that is true and the conclusion does not follow. What is out of
+reach is the *function*. The three calls underneath it were never restricted
+at all:
+
+```c
+SYS_NEWTASK   an empty address space          -> task id
+SYS_VMLOAD    one PT_LOAD segment into pages
+SYS_START     an entry point, and let it run
+```
+
+and the comment beside them in `syscall.h` has said so all along — "they are
+deliberately unguarded — any task may build another. Real systems put a
+capability in front of exactly these." A disk program can therefore carry its
+own loader, which is the same answer `lib.h` gives to not having a libc:
+`prog/spawn.h` is forty lines, reads the file through the ordinary filesystem
+interface, allocates with the ordinary allocator, and makes three syscalls.
+
+The interesting part is the screen, not the loading. The child inherits its
+parent's namespace, so `/dev/console` is the same connection for both, and a
+program that prints a line knows nothing about panels. So the panels get out
+of the way — `curses_suspend()`, which surrenders the picture without giving
+up the terminal or the telnet negotiation — the program runs, `sys_wait` waits
+for it, and a keystroke brings the screen back with everything marked as
+unknown so it is drawn again from nothing.
+
+```
+free 11934 of 12235 pages (47736 KiB free)
+
+-- any key --
+```
+
+Enter on an `.ELF` runs it; F3 still reads it as bytes, which is how you look
+at a program rather than run it. The one thing this does not do is give the
+child a different console — a program that wants to draw its own screen would
+paint over the panels' idea of theirs, and getting that right is what a job
+control and a saved screen are for.
 
 
 ## Next steps
