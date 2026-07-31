@@ -24,4 +24,6 @@ struct vfs_req;
    net_reply(). That is all "blocking" is here: a server declining to reply
    yet, while the caller sits in the sys_recv it already had to make. */
 int  net_vfs(int from, struct vfs_req *r);       /* net_ip.c */
-void net_reply(int to, struct vfs_req *r);       /* srv_net.c */
+/* -1 if the destination is not waiting to receive: the caller keeps the
+   request parked and tries again on the next event. */
+int  net_reply(int to, struct vfs_req *r);       /* srv_net.c */

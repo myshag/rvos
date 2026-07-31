@@ -202,6 +202,8 @@ static void do_help(void)
               "                     join what is there instead of replacing it\n"
               "  mount [-a|-b] <pfx> <task> put a server behind a name\n"
               "  unmount <name>     take a name back\n"
+              "  import <ip> <port> <prefix>  mount a namespace from another\n"
+              "                     machine at <prefix>\n"
               "  net            interface, ARP, connections (/net/status)\n"
               "  mem            free and total pages\n"
               "  run <path> ..  start a program; its output comes back here\n"
@@ -272,6 +274,29 @@ static void session(int slot)
                     puts_conn("mount: no room in the mount table\n");
             } else if (sys_bind(argv[a], argv[a + 1], f) < 0) {
                 puts_conn("bind: no room in the mount table\n");
+            }
+        } else if (streq(argv[0], "import")) {
+            /* Two steps and nothing else: start the proxy, and mount it. It
+               is a task, and a mount takes a task — the namespace has no
+               notion of "remote" and does not need one. */
+            if (argc < 4) {
+                puts_conn("usage: import <a.b.c.d> <port> <prefix>\n");
+            } else {
+                char *av[4];
+                av[0] = (char *)"/IMPORT.ELF";
+                av[1] = argv[1];
+                av[2] = argv[2];
+                av[3] = argv[3];        /* its own mount point, to strip */
+                int tid = spawn(av[0], elfbuf, ELFMAX, 4, av);
+                if (tid < 0) {
+                    puts_conn("import: cannot run /IMPORT.ELF\n");
+                } else if (sys_mount(argv[3], tid, MREPL) < 0) {
+                    puts_conn("import: no room in the mount table\n");
+                } else {
+                    puts_conn("mounted, task ");
+                    put_num((unsigned long)tid);
+                    puts_conn("\n");
+                }
             }
         } else if (streq(argv[0], "unmount")) {
             if (argc < 2)

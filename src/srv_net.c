@@ -39,9 +39,15 @@ static void say_num(const char *l, unsigned long v, const char *t)
 void net_puts(const char *s) { say(s); }
 void net_putn(const char *l, unsigned long v, const char *t) { say_num(l, v, t); }
 
-/* Answer a request that was parked earlier. The destination is blocked in the
-   sys_recv that followed its sys_send, so this rendezvous completes at once. */
-void net_reply(int to, struct vfs_req *r) { sys_send(to, r, (int)sizeof(*r)); }
+/* Answer a request that was parked earlier. Usually the destination is
+   blocked in the sys_recv that followed its sys_send and this completes at
+   once — but not always: a task can have two things outstanding with this
+   server and be busy sending the second when the first is answered. Blocking
+   there would be a deadlock, so this gives up and the caller tries again. */
+int net_reply(int to, struct vfs_req *r)
+{
+    return sys_trysend(to, r, (int)sizeof(*r));
+}
 
 static void say_hex2(unsigned v)
 {

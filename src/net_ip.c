@@ -337,6 +337,11 @@ static unsigned dns_id;
 static struct parked dns_waiter;
 static char     dns_name[64];
 static uint64   dns_at;                 /* absolute ms; 0 = nothing pending */
+/* A reply the client was too busy to take has to be offered again, and the
+   next packet or timer might be a long way off. Refusing one arms a deadline
+   of its own — otherwise an answer can sit in a queue with nobody to nudge
+   it. */
+static uint64   retry_at;
 static int      dns_tries;
 
 /* "example.com" -> 7 'example' 3 'com' 0 */
@@ -1322,6 +1327,8 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
 static void timers_rearm(void)
 {
     uint64 now = unow_ms(), best = dns_at;
+    if (retry_at && (!best || retry_at < best))
+        best = retry_at;
     for (int i = 0; i < NTCB; i++) {
         struct tcb *c = &tcbs[i];
         if (c->state == T_FREE)
@@ -1361,6 +1368,7 @@ void net_timeout(void)
     uint64 now = unow_ms();
 
     reap_dead_clients();
+    net_wakeups();
     dns_retry(now);
 
     for (int i = 0; i < NTCB; i++) {
@@ -1612,7 +1620,11 @@ static int path_slot(const char *p)
    kernel — which is the point. A microkernel that had to grow a "wait for
    data" primitive for every kind of data would not be minimal for long. */
 
-static void reply_read(struct parked *p, const char *data, int n)
+/* Returns 0 if the answer was taken. A -1 leaves the request parked, and
+   nothing has been consumed on its behalf — which is why the bytes of a read
+   are copied here but removed from the queue only by the caller, and only
+   once this has succeeded. */
+static int reply_read(struct parked *p, const char *data, int n)
 {
     struct vfs_req r;
     umemset(&r, 0, sizeof(r));
@@ -1622,22 +1634,24 @@ static void reply_read(struct parked *p, const char *data, int n)
     r.result = n;
     if (n > 0)
         umemcpy(r.data, data, (unsigned long)n);
+    if (net_reply(p->task, &r) < 0)
+        return -1;
     p->used = 0;
-    net_reply(p->task, &r);
+    return 0;
 }
 
 /* An answer that carries no payload, only a result — the reply to the write
    that asked the question. What the answer says is left in the ctl slot's
    buffer, where the caller's next read will find it, exactly as if the
    command had been carried out on the spot. */
-static void reply_done(int task, int fd, int op, int result)
+static int reply_done(int task, int fd, int op, int result)
 {
     struct vfs_req r;
     umemset(&r, 0, sizeof(r));
     r.op     = op;
     r.fd     = fd;
     r.result = result;
-    net_reply(task, &r);
+    return net_reply(task, &r);
 }
 
 /* Put an answer into the ctl slot the caller will read next, and release the
@@ -1650,6 +1664,8 @@ static void ctl_answer(struct parked *p, const char *text, const uint8 *ip)
         p->used = 0;
         return;
     }
+    /* Writing the answer into the slot is idempotent, so a refused reply can
+       simply be tried again with the text already in place. */
     char *o = pfd[pi].buf;
     int   n = app(o, 0, text);
     if (ip) {
@@ -1659,9 +1675,8 @@ static void ctl_answer(struct parked *p, const char *text, const uint8 *ip)
     pfd[pi].len = n;
     pfd[pi].off = 0;
 
-    struct parked q = *p;
-    p->used = 0;
-    reply_done(q.task, q.fd, VFS_WRITE, q.len);
+    if (reply_done(p->task, p->fd, VFS_WRITE, p->len) == 0)
+        p->used = 0;
 }
 
 /* ---- references, and reclaiming them ----------------------------------
@@ -1757,13 +1772,13 @@ static int conn_eof(const struct tcb *c)
             c->state == T_CLOSING    || c->state == T_TIME_WAIT);
 }
 
-static int conn_take(struct tcb *c, char *dst, int want)
+/* Remove n bytes from the head of the read queue. Separate from copying them
+   out, because a reply that is refused must leave the queue as it was. */
+static void conn_drop(struct tcb *c, int n)
 {
     int was_shut = rcv_window(c) == 0;
-    int n = c->rxq_len < want ? c->rxq_len : want;
     if (n <= 0)
-        return 0;
-    umemcpy(dst, c->rxq, (unsigned long)n);
+        return;
     c->rxq_len -= n;
     for (int i = 0; i < c->rxq_len; i++)        /* shift the remainder down */
         c->rxq[i] = c->rxq[i + n];
@@ -1772,13 +1787,26 @@ static int conn_take(struct tcb *c, char *dst, int want)
        this update deadlocks a connection it throttled. */
     if (was_shut && c->state == T_ESTABLISHED)
         send_ack(c);
+}
+
+static int conn_take(struct tcb *c, char *dst, int want)
+{
+    int n = c->rxq_len < want ? c->rxq_len : want;
+    if (n <= 0)
+        return 0;
+    umemcpy(dst, c->rxq, (unsigned long)n);
+    conn_drop(c, n);
     return n;
 }
 
 /* Called whenever something might unblock somebody: data queued, a peer
    closing, a connection reaching ESTABLISHED. */
+#define RETRY_MS 20
+
 static void net_wakeups(void)
 {
+    int refused = 0;
+
     for (int i = 0; i < NTCB; i++) {
         struct tcb *c = &tcbs[i];
         if (c->state == T_FREE)
@@ -1794,9 +1822,13 @@ static void net_wakeups(void)
         if (!c->reader.used)
             continue;
         if (c->rxq_len > 0) {
-            char buf[VFS_DATA_MAX];
-            int n = conn_take(c, buf, c->reader.len);
-            reply_read(&c->reader, buf, n);
+            /* Copied, offered, and only then consumed: a reply the client is
+               too busy to take must not eat the bytes it was carrying. */
+            int n = c->rxq_len < c->reader.len ? c->rxq_len : c->reader.len;
+            if (reply_read(&c->reader, c->rxq, n) == 0)
+                conn_drop(c, n);
+            else
+                refused = 1;
         } else if (conn_eof(c)) {
             reply_read(&c->reader, 0, 0);       /* end of file, not a wait */
         }
@@ -1804,6 +1836,7 @@ static void net_wakeups(void)
 
     /* An accept waiting on a listener, and a connection on that port that
        nobody has been given yet. */
+    (void)0;
     for (int i = 0; i < NTCB; i++) {
         struct tcb *l = &tcbs[i];
         if (l->state != T_LISTEN || !l->reader.used)
@@ -1814,22 +1847,29 @@ static void net_wakeups(void)
                 continue;
             if (c->state != T_ESTABLISHED || c->accepted)
                 continue;
-            c->accepted = 1;
-
-            struct parked p = l->reader;
-            l->reader.used = 0;
-
-            int pi = p.fd - FD_CTL0;
-            char *o = pfd[pi].buf;
-            int   n = 0;
-            n = app(o, n, "ok ");
-            n += uutoa((unsigned long)k, o + n);
-            o[n++] = '\n';
-            pfd[pi].len = n;
-            pfd[pi].off = 0;
-            reply_done(p.task, p.fd, VFS_WRITE, p.len);
+            char ok[16];
+            int  n = app(ok, 0, "ok ");
+            n += uutoa((unsigned long)k, ok + n);
+            ok[n++] = '\n';
+            ok[n]   = 0;
+            if (!l->reader.used)                /* answered by ctl_answer */
+                break;
+            ctl_answer(&l->reader, ok, 0);
+            if (!l->reader.used)
+                c->accepted = 1;                /* only once it was taken */
+            else
+                refused = 1;
             break;
         }
+    }
+
+    uint64 now = unow_ms();
+    if (refused) {
+        retry_at = now + RETRY_MS;
+        timers_rearm();
+    } else if (retry_at && retry_at <= now) {
+        retry_at = 0;
+        timers_rearm();
     }
 }
 
@@ -2006,6 +2046,7 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
 int net_vfs(int from, struct vfs_req *r)
 {
     reap_dead_clients();
+    net_wakeups();          /* any reply refused earlier gets another go */
 
     switch (r->op) {
     case VFS_OPEN: {

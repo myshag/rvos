@@ -51,8 +51,21 @@ static int deliver(struct task *snd, uint64 sva, int slen,
     return n;
 }
 
-/* SYS_SEND: a0 = dest id, a1 = message address, a2 = length. */
-static void ipc_send(void)
+/* SYS_SEND / SYS_TRYSEND: a0 = dest id, a1 = message address, a2 = length.
+
+   The difference is what happens when the destination is not waiting. send
+   parks and blocks; trysend gives up and returns -1.
+
+   That distinction is not a convenience. A rendezvous deadlocks the moment
+   two tasks each decide to send to the other: each parks on the other's
+   queue, and neither will ever reach a recv to collect it. Every task in this
+   system avoided that by accident until now — a client sends, then receives,
+   and never has two things outstanding with one server. A proxy that holds a
+   read parked on the network while also writing to it has two, and the two
+   directions collide. A server answering a request it parked earlier must
+   therefore be able to *fail* rather than wait: it is the one that knows the
+   client might be busy. */
+static void ipc_send(int nonblock)
 {
     int    dst_id = (int)A0(current);
     uint64 sva    = A1(current);
@@ -77,6 +90,11 @@ static void ipc_send(void)
         dst->waiting_recv = 0;
         dst->state        = T_RUNNABLE;
         A0(current)       = 0;
+        return;
+    }
+
+    if (nonblock) {
+        A0(current) = -1;               /* not waiting: the caller decides */
         return;
     }
 
@@ -133,7 +151,8 @@ static void ipc_recv(void)
 int ipc_syscall(uint64 num)
 {
     switch (num) {
-    case SYS_SEND: ipc_send(); return 1;
+    case SYS_SEND:    ipc_send(0); return 1;
+    case SYS_TRYSEND: ipc_send(1); return 1;
     case SYS_RECV: ipc_recv(); return 1;
     default:       return 0;
     }

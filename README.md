@@ -75,6 +75,9 @@ which is how the sandbox in the demo is silenced without knowing it.
 | `prog/hello.c`     | a real program: its own ELF, loaded from the filesystem |
 | `prog/netd.c`      | a program that owns TCP port 7 and answers callers |
 | `prog/get.c`       | an HTTP client: resolve, connect, fetch — all through files |
+| `prog/exportfs.c`  | hands this machine's namespace to whoever connects |
+| `prog/import.c`    | mounts another machine's namespace into this one |
+| `src/fsproto.h`    | the file protocol on a wire: explicit fields, not a struct |
 | `src/kmain.c`      | boot, initial namespace, the demo shell |
 
 ## Design notes
@@ -351,6 +354,8 @@ $ read the fs server's private data region
 28. `unmount`, and namespaces that come back when the task holding one dies
 29. union mounts: `bind -a` / `-b`, two directories appearing as one, and the
     search for which member has a name
+30. a namespace from another machine: a wire protocol, `exportfs`, `import`,
+    and the non-blocking send the whole thing turned out to need
 
 ## Loading a program
 
@@ -1541,8 +1546,118 @@ observably different: rebind `/net/tcp/0` and everything bound onto it moves.
 Eight mounts per namespace is a hard ceiling with no error a program is likely
 to check.
 
+## A namespace from another machine
+
+This is what Plan 9's namespace is *for*, and the surprise is how little it
+took. A mount takes a task; a task is a thing that answers `vfs_req`; nothing
+says where the answers have to come from. So a remote mount is a program that
+holds a TCP connection and is mounted like any other server:
+
+```
+rvos# import 10.0.2.2 9564 /r/
+mounted, task 518
+rvos# ls /r/
+hello.txt
+motd
+host.txt
+rvos# cat /r/motd
+rvos reached across a TCP connection for these bytes.
+rvos# mounts
+/ -> task 0
+/net/ -> task 11
+/r/ -> task 518            <- indistinguishable from a local server
+```
+
+Not one line of `vfs.c` knows about this.
+
+### The protocol is not the struct
+
+Inside one machine a request is a `struct vfs_req` and the kernel copies 576
+bytes between two address spaces. Between machines that will not do, and the
+reason is worth stating: 576 is what the compiler chose, padding included. A
+protocol whose meaning depends on a compiler's padding is not a protocol. So
+`src/fsproto.h` writes the fields out one at a time, little-endian, with an
+explicit length for everything that has one — 32 bytes of header, then the
+path and the data. A one-byte read is 33 bytes on the wire instead of 576.
+
+The header carries a tag. This implementation keeps one request outstanding at
+a time and does not need it; a format is the wrong place to economise, and
+pipelining is the obvious next thing.
+
+### The deadlock that had been waiting
+
+`import` is the first task in this system with **two things outstanding with
+one server at once**: a read parked on the network, and a request in flight to
+it. Every task before this sent, then received, and so could never be the
+target of a message while it was itself sending.
+
+A rendezvous deadlocks exactly there. Import sends; the network server is not
+in a `recv`, so import parks on its queue and blocks. The network server
+answers the parked read; import is not in a `recv`, so it parks on import's
+queue and blocks. Neither will ever reach a `recv` to collect the other.
+
+```c
+SYS_TRYSEND   /* send, but -1 rather than block if nobody is waiting */
+```
+
+A server answering a request it parked earlier must be able to *fail*: it is
+the one that knows the client might be busy. A refused reply leaves the
+request parked with nothing consumed on its behalf — which is why the bytes of
+a read are now copied out, offered, and only removed from the queue once the
+answer has been taken. And a refusal arms a deadline of its own, because the
+next packet might be a long way off and an answer must not sit in a queue with
+nobody to nudge it.
+
+It follows that `import` cannot use `vfs_read` and `vfs_write`: those send and
+then receive, assuming the next message is the answer. Here the next message
+may be a client arriving, the parked read completing, or the reply being
+waited for. Its loop is raw `send`/`recv`, dispatching on who sent it.
+
+### Two bugs it turned up
+
+`exportfs.elf` is 8776 bytes and the shell said only "cannot run". The
+filesystem server reads a whole file into an 8 KiB buffer, and `fat16_read`
+**silently returned the first 8192 bytes** — a truncated file the caller had no
+way to recognise as truncated. Only a bounds check in the ELF loader stopped a
+mangled program from being run. A file that does not fit is an error now, and
+the buffer matches the loaders' scratch size — two numbers that are coupled
+with nothing to enforce it.
+
+And a proxy cannot know its own mount point: every server here is handed the
+whole path and knows its own prefix, but somebody *else* mounts a proxy. So it
+is told, and strips it, and the far end is asked about a name in its own tree.
+
+### Checked against something that was not built from this source
+
+Both halves were tested against an independent implementation on the host —
+`/tmp/rvos/fsclient.py` and `fsserver.py`, written from the format above. If
+the two agree, the format is a format and not an accident of one compiler.
+
+The demonstration worth keeping is the host writing to the guest's *network
+stack* through nothing but open/write/read/close:
+
+```
+$ python3 fsclient.py
+open /net/ctl -> 0
+write "listen 99" -> 9
+read -> b'ok 3\n'
+--- the guest status, read remotely ---
+tcp 3 listen       :99
+```
+
+### No authentication whatsoever
+
+Anyone who reaches the port gets the namespace, and can write to it. Plan 9
+has `factotum` and an auth file descriptor in the mount call; this has
+nothing. That is a sentence in this README rather than a `TODO` in the source
+because it is not a detail — it is the difference between a demonstration and
+a system.
+
 ## Next steps
 
+- authentication on `exportfs`, without which none of the above should be
+  pointed at a network anybody else is on
+- more than one request in flight per connection: the tag is already there
 - `old` held as a channel rather than re-resolved as a string, so rebinding
   what a bind points at does not move everything bound onto it
 - `wait()`, so `run` can return when the program does, and job control so a

@@ -13,7 +13,11 @@
 
 #define FS_MAXFD  3
 /* Large enough for a small executable: the loader reads whole ELF files. */
-#define FS_BUFSZ  8192
+/* A whole file at a time, because the FAT16 driver only reads forward. That
+   makes this the largest file the system can open — and it has to be at least
+   as big as the loaders' scratch buffers, or a program on the disk cannot be
+   run. The two numbers are coupled and there is nothing to enforce it. */
+#define FS_BUFSZ  16384
 
 struct fs_file {
     int    used;

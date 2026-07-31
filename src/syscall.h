@@ -72,6 +72,10 @@ enum {
     SYS_ALIVE   = 19,     /* a0 = task id -> 1 or 0 */
     SYS_MOUNT   = 20,     /* a0 = prefix, a1 = server, a2 = flags */
     SYS_UNMOUNT = 21,     /* a0 = name — take it back */
+    /* send, but -1 rather than blocking if the destination is not in a
+       recv. What a server uses to answer a request it parked, since it
+       must never be left waiting on a client. */
+    SYS_TRYSEND = 22,     /* a0 = dest, a1 = message, a2 = length */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -224,6 +228,11 @@ static inline int sys_pgdump(int task_id, unsigned long va, void *out, int cap)
 static inline int sys_send(int dst, const void *msg, int len)
 {
     return (int)_ecall3(SYS_SEND, dst, (long)msg, len);
+}
+
+static inline int sys_trysend(int dst, const void *msg, int len)
+{
+    return (int)_ecall3(SYS_TRYSEND, dst, (long)msg, len);
 }
 
 /* Whether a task id still names the task it named when it was handed out. */

@@ -146,7 +146,15 @@ int fat16_read(const char *name, void *out, int maxlen)
 
             uint32 size = rd32(d + 28);
             uint16 clus = rd16(d + 26);
-            int cap = (size < (uint32)maxlen) ? (int)size : maxlen;
+            /* A file that does not fit is an error, not a short answer. This
+               used to hand back whatever fitted and say nothing, so a caller
+               got a truncated file it had no way to recognise as truncated —
+               which is exactly what happened to a program one byte over the
+               limit: it loaded, and only a bounds check in the ELF loader
+               stopped it from running as garbage. */
+            if (size > (uint32)maxlen)
+                return -1;
+            int cap = (int)size;
             int got = 0;
             while (clus >= 2 && clus < 0xFFF8 && got < cap) {
                 uint32 base = fs.data_start + (uint32)(clus - 2) * fs.sec_per_clus;

@@ -24,7 +24,9 @@ ELF     := $(BUILD)/kernel.elf
 PROG    := $(BUILD)/hello.elf
 NETD    := $(BUILD)/netd.elf
 GET     := $(BUILD)/get.elf
-PROGS   := $(PROG) $(NETD) $(GET)
+EXPORT  := $(BUILD)/exportfs.elf
+IMPORT  := $(BUILD)/import.elf
+PROGS   := $(PROG) $(NETD) $(GET) $(EXPORT) $(IMPORT)
 # -MMD -MP for the same reason the kernel has it: these programs are built
 # from headers in src/, and without dependency tracking a change to vfs.h
 # leaves a stale .elf on the disk image that disagrees with the kernel it is
@@ -49,7 +51,7 @@ DISK_ADDR := 0x84000000
 # listening from boot. `nc localhost 5556` is a login.
 QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic \
            -global virtio-mmio.force-legacy=false -kernel $(ELF) \
-           -netdev user,id=n0,hostfwd=tcp::5555-:7,hostfwd=tcp::5556-:23 \
+           -netdev user,id=n0,hostfwd=tcp::5555-:7,hostfwd=tcp::5556-:23,hostfwd=tcp::5564-:564 \
            -device virtio-net-device,netdev=n0
 
 .PHONY: all run rundisk runpcap disk prog clean
