@@ -49,20 +49,6 @@ static const char *state_name(int s)
     }
 }
 
-static int append_hex(char *out, int o, unsigned long v)
-{
-    if (!v) { out[o++] = '0'; return o; }
-    int start = 1;
-    for (int i = 15; i >= 0; i--) {
-        int d = (int)((v >> (i * 4)) & 15);
-        if (start && !d)
-            continue;
-        start = 0;
-        out[o++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
-    }
-    return o;
-}
-
 static int append(char *out, int o, const char *s)
 {
     int l = (int)ustrlen(s);
@@ -460,35 +446,6 @@ static int fetch_paged(int id, unsigned long cmd, const char *mine,
     return o;
 }
 
-/* Where a task started and how its space is laid out. The entry point is the
-   one fact here that was never written down before: the kernel set epc from
-   it and moved on, and after the first instruction nothing remembered where
-   the first instruction had been. */
-static int format_entry(int who, char *out, int cap)
-{
-    (void)cap;
-    for (int i = 0; i < PROC_NTASK; i++) {
-        struct taskinfo ti;
-        if (sys_taskinfo(i, &ti) < 0 || ti.id != who)
-            continue;
-        int o = append(out, 0, "name       ");
-        o = append(out, o, ti.name);
-        o = append(out, o, "\nentry      0x");
-        o = append_hex(out, o, ti.entry);
-        o = append(out, o, "\nstack top  0x");
-        o = append_hex(out, o, ti.sp);
-        o = append(out, o, "\nheap break 0x");
-        o = append_hex(out, o, ti.brk);
-        o = append(out, o, "\nsatp       0x");
-        o = append_hex(out, o, ti.satp);
-        o = append(out, o, "\ngeneration ");
-        o += uutoa((unsigned long)ti.gen, out + o);
-        o = append(out, o, "  (times this slot has been used)\n");
-        return o;
-    }
-    return -1;
-}
-
 /* What that task has open, asked of everybody who might be holding it. */
 static int format_fd(int who, char *out, int cap)
 {
@@ -549,7 +506,7 @@ static void proc_do_open(struct vfs_req *r, int caller)
             n = -1;
         else if (leaf[0] == 0) {
             n = append(f->data, 0, "- 0 mounts\n- 0 pagetable\n- 0 ipc\n"
-                                   "- 0 ctl\n- 0 entry\n- 0 fd\n");
+                                   "- 0 ctl\n- 0 fd\n");
             /* Only a task that answers for a name has anything to say about
                itself, and its presence here is the shortest way to ask
                whether this task is a server at all. */
@@ -562,8 +519,6 @@ static void proc_do_open(struct vfs_req *r, int caller)
             n = fetch_paged(who, IOCTL_CONF, proc_conf, f->data, PROC_BUFSZ);
         else if (ustr_has_prefix(leaf, "fd"))
             n = format_fd(who, f->data, PROC_BUFSZ);
-        else if (ustr_has_prefix(leaf, "entry"))
-            n = format_entry(who, f->data, PROC_BUFSZ);
         else if (ustr_has_prefix(leaf, "ipc"))
             n = format_task_ipc(who, f->data, PROC_BUFSZ);
         else if (ustr_has_prefix(leaf, "ctl")) {

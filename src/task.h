@@ -54,7 +54,6 @@ struct task {
     int    irq_pending;         /* a device it drives fired while it was busy */
     uint64 dma_next;            /* next free VA in its DMA window */
     uint64 brk;                 /* top of its heap; UHEAP_BASE + a page at birth */
-    uint64 entry;               /* where it was started, which nothing kept */
     uint64 alarm_at;            /* absolute time to wake it, 0 = no alarm */
     int    timer_pending;       /* the alarm went off while it was busy */
     int    wait_for;            /* blocked until this task id is gone, or 0 */

@@ -3546,16 +3546,16 @@ servers needs the number. The device server now answers its own entry without
 sending anything, which is the only way anybody can.
 
 
-## What a task has open, and where it began
+## What a task has open
 
-`ls /proc/<id>` is eight files now, and each one is a different thing the
+`ls /proc/<id>` is seven files now, and each one is a different thing the
 kernel or a server knows about a task that is not you:
 
 ```
-mounts      what it can see           entry   where it started
-pagetable   where it lives            fd      what it has open
-ipc         whom it is waiting for    doc     its own words, if it is a server
-ctl         write `kill`              conf    the numbers it was built with
+mounts      what it can see           fd      what it has open
+pagetable   where it lives            doc     its own words, if it is a server
+ipc         whom it is waiting for    conf    the numbers it was built with
+ctl         write `kill`
 ```
 
 ### `fd`, and why it has to be asked rather than looked up
@@ -3585,24 +3585,6 @@ one it listens on. Unix would answer this by walking one array in the kernel;
 here it is a question asked of everybody who might know, which is what having
 no central table costs — and what it buys is that there is no central table to
 keep in step with reality.
-
-### `entry`, which nothing remembered
-
-```
-rvos$ cat /proc/11/entry
-name       net
-entry      0x8000920e
-stack top  0x2ffffce0
-heap break 0x28003000
-satp       0x8000000000082f53
-generation 0  (times this slot has been used)
-```
-
-The entry point was set once and forgotten: the kernel put it in `epc` and the
-program counter moved on, and after the first instruction nothing said where
-the first instruction had been. It is one field in `struct task` now. The
-generation is the other half of a task id and the reason a stale number is
-refused rather than answered by whoever moved into the slot.
 
 ### `conf`, which is not `doc`
 
