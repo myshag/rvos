@@ -46,6 +46,13 @@ static struct fs_file fs_tab[FS_MAXFD];
    and the name last means a reader needs no rules at all: two fields, then
    everything to the end of the line. Making it pretty is `ls`'s job, which is
    where presentation belongs. */
+static int append_str(char *out, int o, const char *s)
+{
+    int l = (int)ustrlen(s);
+    umemcpy(out + o, s, (unsigned long)l);
+    return o + l;
+}
+
 static int fs_format_dir(const char *path, char *out, int cap)
 {
     /* Not on the stack: a long name is 96 bytes and two dozen of them is more
@@ -301,6 +308,32 @@ void fs_server(void)
                     "\n"
                     "A file open by a task that has died is reclaimed when the\n"
                     "last slot is wanted, and not written back.\n");
+            } else if (r->ioctl_cmd == IOCTL_CONF) {
+                r->result = vfs_doc_reply(r,
+                    "open files   3    each a whole file in one buffer\n"
+                    "file size    as much memory as there is: the buffer is\n"
+                    "             allocated at the size the directory entry\n"
+                    "             says and grown by half again on a write\n"
+                    "             past the end\n"
+                    "listing      grows until the driver stops filling it\n"
+                    "name         96 bytes, which is a long name in VFAT\n"
+                    "sector       512 bytes, one cluster\n");
+            } else if (r->ioctl_cmd == IOCTL_HOLDS) {
+                char t[VFS_DATA_MAX];
+                int o = 0;
+                for (int i = 0; i < FS_MAXFD && o < VFS_DATA_MAX - 160; i++)
+                    if (fs_tab[i].used && fs_tab[i].owner == r->len) {
+                        int l = (int)ustrlen(fs_tab[i].name);
+                        umemcpy(t + o, fs_tab[i].name, (unsigned long)l);
+                        o += l;
+                        t[o++] = ' ';
+                        o += uutoa(fs_tab[i].size, t + o);
+                        o = append_str(t, o, fs_tab[i].dirty
+                                             ? " bytes, not yet on the disk\n"
+                                             : " bytes\n");
+                    }
+                t[o] = 0;
+                r->result = vfs_reply_text(r, t);
             } else if (r->ioctl_cmd == IOCTL_MKDIR) {
                 /* On the path, not on the descriptor: there is nothing to
                    open yet. The fd is ignored and the path carries it. */

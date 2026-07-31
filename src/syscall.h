@@ -164,6 +164,12 @@ struct taskinfo {
     int  peer;           /* whom, where that means anything */
     int  msglen;         /* the message it is holding out, for IPC_SEND */
     int  senders;        /* how many tasks are queued sending to it */
+    /* Where it started and how it is laid out. The entry point was set once
+       and then forgotten — the program counter moves, and after the first
+       instruction there was nothing left saying where the first instruction
+       had been. */
+    unsigned long entry, sp, brk, satp;
+    int  gen;            /* how many tasks have used this slot before it */
 };
 
 static inline long _ecall1(long n, long a0)

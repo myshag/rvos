@@ -49,6 +49,20 @@ static const char *state_name(int s)
     }
 }
 
+static int append_hex(char *out, int o, unsigned long v)
+{
+    if (!v) { out[o++] = '0'; return o; }
+    int start = 1;
+    for (int i = 15; i >= 0; i--) {
+        int d = (int)((v >> (i * 4)) & 15);
+        if (start && !d)
+            continue;
+        start = 0;
+        out[o++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+    }
+    return o;
+}
+
 static int append(char *out, int o, const char *s)
 {
     int l = (int)ustrlen(s);
@@ -281,6 +295,11 @@ static int format_task_ipc(int who, char *out, int cap)
     return -1;
 }
 
+static const char proc_conf[] =
+    "open files   2    each a rendering, made at open\n"
+    "buffer       4096 bytes, allocated per open\n"
+    "tasks shown  18   as many slots as the kernel has\n";
+
 static const char proc_doc[] =
 "proc — kernel state as files, and nothing behind it.\n"
                     "\n"
@@ -340,13 +359,81 @@ static int is_mounted_server(int id)
     return 0;
 }
 
+/* Ask every mounted server the same question about one task, and put the
+   answers end to end. This is what having no descriptor table costs and what
+   it buys: nobody has to keep the list in step, and finding it out is a
+   question asked of everybody who might know. */
+static int ask_all(unsigned long cmd, int about, char *out, int cap)
+{
+    char mounts[512];
+    int n = sys_mounts(-1, mounts, (int)sizeof(mounts));
+    int o = 0;
+
+    for (int i = 0; i < n && o < cap - VFS_DATA_MAX - 32; ) {
+        int s = i;
+        while (i < n && mounts[i] != '\n') i++;
+        int e = i;
+        if (i < n) i++;
+
+        int a = -1;
+        for (int k = s; k + 8 < e; k++)
+            if (mounts[k] == '-' && mounts[k+1] == '>' && mounts[k+3] == 't' &&
+                mounts[k+4] == 'a' && mounts[k+5] == 's' && mounts[k+6] == 'k')
+                a = k + 8;
+        if (a < 0)
+            continue;
+        int id = 0;
+        for (int k = a; k < e && mounts[k] >= '0' && mounts[k] <= '9'; k++)
+            id = id * 10 + (mounts[k] - '0');
+
+        /* One question per server, however many names it answers for. */
+        int already = 0;
+        for (int k = 0; k < s; ) {
+            int t0 = k;
+            while (k < n && mounts[k] != '\n') k++;
+            int t1 = k;
+            if (k < n) k++;
+            int a2 = -1;
+            for (int q = t0; q + 8 < t1; q++)
+                if (mounts[q] == '-' && mounts[q+1] == '>' &&
+                    mounts[q+3] == 't' && mounts[q+4] == 'a')
+                    a2 = q + 8;
+            if (a2 < 0) continue;
+            int id2 = 0;
+            for (int q = a2; q < t1 && mounts[q] >= '0' && mounts[q] <= '9'; q++)
+                id2 = id2 * 10 + (mounts[q] - '0');
+            if (id2 == id) already = 1;
+        }
+        if (already || id == sys_self())
+            continue;                   /* itself is asked by the caller */
+
+        struct vfs_req q;
+        q.op = VFS_IOCTL;
+        q.fd = -1;
+        q.ioctl_cmd = cmd;
+        q.len = about;
+        q.path[0] = 0;
+        if (vfs_call(id, &q) <= 0)
+            continue;
+        int got = q.result;
+        if (got > cap - o - 1)
+            got = cap - o - 1;
+        if (got > 0) {
+            umemcpy(out + o, q.data, (unsigned long)got);
+            o += got;
+        }
+    }
+    return o;
+}
+
 /* That task's own words about itself, fetched a message at a time. The same
    text /doc/<name> gives, reached from the task rather than from the name —
    which is what a namespace is for. */
-static int fetch_doc(int id, char *out, int cap)
+static int fetch_paged(int id, unsigned long cmd, const char *mine,
+                       char *out, int cap)
 {
     if (id == sys_self())
-        return append(out, 0, proc_doc);    /* nobody can ask themselves */
+        return append(out, 0, mine);        /* nobody can ask themselves */
     if (!is_mounted_server(id))
         return -1;
 
@@ -355,8 +442,8 @@ static int fetch_doc(int id, char *out, int cap)
         struct vfs_req q;
         q.op = VFS_IOCTL;
         q.fd = -1;
-        q.ioctl_cmd = IOCTL_DOC;
-        q.len = o;
+        q.ioctl_cmd = cmd;
+        q.len = o;                      /* how far we have got */
         q.path[0] = 0;
         if (vfs_call(id, &q) <= 0)
             break;
@@ -369,7 +456,49 @@ static int fetch_doc(int id, char *out, int cap)
         o += n;
     }
     if (!o)
-        o = append(out, 0, "this server does not describe itself\n");
+        o = append(out, 0, "this server does not answer that\n");
+    return o;
+}
+
+/* Where a task started and how its space is laid out. The entry point is the
+   one fact here that was never written down before: the kernel set epc from
+   it and moved on, and after the first instruction nothing remembered where
+   the first instruction had been. */
+static int format_entry(int who, char *out, int cap)
+{
+    (void)cap;
+    for (int i = 0; i < PROC_NTASK; i++) {
+        struct taskinfo ti;
+        if (sys_taskinfo(i, &ti) < 0 || ti.id != who)
+            continue;
+        int o = append(out, 0, "name       ");
+        o = append(out, o, ti.name);
+        o = append(out, o, "\nentry      0x");
+        o = append_hex(out, o, ti.entry);
+        o = append(out, o, "\nstack top  0x");
+        o = append_hex(out, o, ti.sp);
+        o = append(out, o, "\nheap break 0x");
+        o = append_hex(out, o, ti.brk);
+        o = append(out, o, "\nsatp       0x");
+        o = append_hex(out, o, ti.satp);
+        o = append(out, o, "\ngeneration ");
+        o += uutoa((unsigned long)ti.gen, out + o);
+        o = append(out, o, "  (times this slot has been used)\n");
+        return o;
+    }
+    return -1;
+}
+
+/* What that task has open, asked of everybody who might be holding it. */
+static int format_fd(int who, char *out, int cap)
+{
+    int o = ask_all(IOCTL_HOLDS, who, out, cap);
+    /* And this server's own, which cannot be asked for by message. */
+    for (int i = 0; i < PROC_MAXFD && o < cap - 32; i++)
+        if (p_tab[i].used && p_tab[i].owner == who)
+            o = append(out, o, "a rendering of /proc\n");
+    if (!o)
+        o = append(out, 0, "nothing\n");
     return o;
 }
 
@@ -420,15 +549,21 @@ static void proc_do_open(struct vfs_req *r, int caller)
             n = -1;
         else if (leaf[0] == 0) {
             n = append(f->data, 0, "- 0 mounts\n- 0 pagetable\n- 0 ipc\n"
-                                   "- 0 ctl\n");
+                                   "- 0 ctl\n- 0 entry\n- 0 fd\n");
             /* Only a task that answers for a name has anything to say about
                itself, and its presence here is the shortest way to ask
                whether this task is a server at all. */
             if (who == sys_self() || is_mounted_server(who))
-                n = append(f->data, n, "- 0 doc\n");
+                n = append(f->data, n, "- 0 doc\n- 0 conf\n");
         }
         else if (ustr_has_prefix(leaf, "doc"))
-            n = fetch_doc(who, f->data, PROC_BUFSZ);
+            n = fetch_paged(who, IOCTL_DOC, proc_doc, f->data, PROC_BUFSZ);
+        else if (ustr_has_prefix(leaf, "conf"))
+            n = fetch_paged(who, IOCTL_CONF, proc_conf, f->data, PROC_BUFSZ);
+        else if (ustr_has_prefix(leaf, "fd"))
+            n = format_fd(who, f->data, PROC_BUFSZ);
+        else if (ustr_has_prefix(leaf, "entry"))
+            n = format_entry(who, f->data, PROC_BUFSZ);
         else if (ustr_has_prefix(leaf, "ipc"))
             n = format_task_ipc(who, f->data, PROC_BUFSZ);
         else if (ustr_has_prefix(leaf, "ctl")) {
@@ -514,6 +649,17 @@ void proc_server(void)
                 r->result = 0;
             else if (r->ioctl_cmd == IOCTL_DOC)
                 r->result = vfs_doc_reply(r, proc_doc);
+            else if (r->ioctl_cmd == IOCTL_CONF)
+                r->result = vfs_doc_reply(r, proc_conf);
+            else if (r->ioctl_cmd == IOCTL_HOLDS) {
+                char t[VFS_DATA_MAX];
+                int o = 0;
+                for (int i = 0; i < PROC_MAXFD; i++)
+                    if (p_tab[i].used && p_tab[i].owner == r->len)
+                        o = append(t, o, "a rendering of /proc\n");
+                t[o] = 0;
+                r->result = vfs_reply_text(r, t);
+            }
             else if (r->ioctl_cmd == IOCTL_GETSIZE &&
                 r->fd >= 0 && r->fd < PROC_MAXFD && p_tab[r->fd].used)
                 r->result = p_tab[r->fd].size;

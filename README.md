@@ -3546,6 +3546,92 @@ servers needs the number. The device server now answers its own entry without
 sending anything, which is the only way anybody can.
 
 
+## What a task has open, and where it began
+
+`ls /proc/<id>` is eight files now, and each one is a different thing the
+kernel or a server knows about a task that is not you:
+
+```
+mounts      what it can see           entry   where it started
+pagetable   where it lives            fd      what it has open
+ipc         whom it is waiting for    doc     its own words, if it is a server
+ctl         write `kill`              conf    the numbers it was built with
+```
+
+### `fd`, and why it has to be asked rather than looked up
+
+There is no descriptor table in this system. A descriptor is
+`(server << 16) | that server's own number`, and the client keeps nothing — so
+the only record of what a task has open is scattered across the servers
+holding it, one field each:
+
+```c
+struct { int used; int task; } refs[NREF];   /* net_ip.c  */
+int owner;                                   /* srv_fs.c, srv_proc.c, srv_dev.c */
+```
+
+Those fields already existed. They are what the reapers read when a task dies,
+and until now that was all they were for. `IOCTL_HOLDS` asks a server what it
+is keeping for a named task, and `/proc/<id>/fd` puts the answers end to end:
+
+```
+rvos# cat /proc/13/fd
+/net/tcp/0  established  100.95.222.7:35898
+/net/tcp/1  listen
+```
+
+That is the remote shell, holding the connection you are typing into and the
+one it listens on. Unix would answer this by walking one array in the kernel;
+here it is a question asked of everybody who might know, which is what having
+no central table costs — and what it buys is that there is no central table to
+keep in step with reality.
+
+### `entry`, which nothing remembered
+
+```
+rvos$ cat /proc/11/entry
+name       net
+entry      0x8000920e
+stack top  0x2ffffce0
+heap break 0x28003000
+satp       0x8000000000082f53
+generation 0  (times this slot has been used)
+```
+
+The entry point was set once and forgotten: the kernel put it in `epc` and the
+program counter moved on, and after the first instruction nothing said where
+the first instruction had been. It is one field in `struct task` now. The
+generation is the other half of a task id and the reason a stale number is
+refused rather than answered by whoever moved into the slot.
+
+### `conf`, which is not `doc`
+
+Two kinds of fact about a server, kept apart because they are different: `doc`
+is what it accepts, `conf` is what it can hold.
+
+```
+rvos$ cat /proc/11/conf
+connections   4    fixed: a stack that allocates one per arriving SYN can be
+                   pushed out of memory by a stranger
+send buffer   2048 bytes, allocated when a block is claimed
+held segments 3    of up to 1200 bytes, taken only when one actually arrives
+                   out of order
+time-wait     2000 ms, which is not 2*MSL but a virtual wire
+```
+
+Every one of those numbers used to exist only as a `#define` in a file nobody
+reading the system from the outside could see.
+
+### The bug worth keeping
+
+`IOCTL_HOLDS` carries a task id in `len`, and `IOCTL_DOC` carries an *offset*
+there — and the first version answered HOLDS through the paging helper. The
+network server duly treated the id as an offset and cut thirteen characters
+off the front of its answer, which is exactly `/net/tcp/0  e`. Two meanings
+for one field is a thing this protocol can afford exactly once per field, and
+the fix is a second helper whose name says which it is.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

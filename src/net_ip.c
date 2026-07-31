@@ -2262,6 +2262,53 @@ int net_vfs(int from, struct vfs_req *r)
                 "Four control blocks, fixed on purpose: a stack that allocates\n"
                 "one per arriving SYN can be pushed out of memory by a\n"
                 "stranger.\n");
+        } else if (r->ioctl_cmd == IOCTL_CONF) {
+            r->result = vfs_doc_reply(r,
+                "connections   4    fixed: a stack that allocates one per\n"
+                "                   arriving SYN can be pushed out of memory\n"
+                "                   by a stranger\n"
+                "holders each  3\n"
+                "send buffer   2048 bytes, allocated when a block is claimed\n"
+                "receive queue 2048 bytes, and therefore the window\n"
+                "mss           1024\n"
+                "held segments 3    of up to 1200 bytes, taken only when one\n"
+                "                   actually arrives out of order\n"
+                "open files    4    control and status\n"
+                "rto           200..8000 ms, 300 to start\n"
+                "time-wait     2000 ms, which is not 2*MSL but a virtual wire\n");
+        } else if (r->ioctl_cmd == IOCTL_HOLDS) {
+            /* Everything this server keeps on that task's behalf: the
+               connections it holds a reference to, and the control files it
+               has open. Both are already recorded — they are what the reaper
+               reads when the task dies. */
+            char t[VFS_DATA_MAX];
+            int o = 0;
+            for (int i = 0; i < NTCB && o < VFS_DATA_MAX - 64; i++) {
+                struct tcb *c = &tcbs[i];
+                if (c->state == T_FREE)
+                    continue;
+                for (int k = 0; k < NREF; k++)
+                    if (c->refs[k].used && c->refs[k].task == r->len) {
+                        o = app(t, o, "/net/tcp/");
+                        o += uutoa((unsigned long)i, t + o);
+                        o = app(t, o, "  ");
+                        o = app(t, o, state_name(c->state));
+                        if (c->rport) {
+                            o = app(t, o, "  ");
+                            o = app_ip(t, o, c->raddr);
+                            t[o++] = ':';
+                            o += uutoa(c->rport, t + o);
+                        }
+                        t[o++] = '\n';
+                        break;
+                    }
+            }
+            for (int i = 0; i < NPFD && o < VFS_DATA_MAX - 32; i++)
+                if (pfd[i].used && pfd[i].owner == r->len) {
+                    o = app(t, o, "/net/ctl or status\n");
+                }
+            t[o] = 0;
+            r->result = vfs_reply_text(r, t);
         } else if (r->ioctl_cmd == IOCTL_INTR) {
             struct tcb *c = conn_of(r->fd);
             if (!c) {

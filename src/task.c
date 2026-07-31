@@ -59,6 +59,7 @@ struct task *task_create(const char *name, void (*entry)(void))
     t->ctx.x[2]   = USTACK_TOP;                        /* sp -> stack top */
     t->ctx.satp   = MAKE_SATP(t->pt);
     t->ctx.epc    = (uint64)entry;
+    t->entry      = (uint64)entry;
     /* sret returns to S-mode (SPP=1) with interrupts enabled (SPIE -> SIE) */
     t->ctx.status = SSTATUS_SPP | SSTATUS_SPIE;
     t->state = T_RUNNABLE;
@@ -355,6 +356,12 @@ void syscall_dispatch(uint64 num)
         ti.senders = 0;
         for (struct task *q = t->wait_sender; q; q = q->send_next)
             ti.senders++;
+
+        ti.entry = t->entry;
+        ti.sp    = t->ctx.x[2];
+        ti.brk   = t->brk;
+        ti.satp  = t->ctx.satp;
+        ti.gen   = TASK_GEN(t->id);
         int k = 0;
         for (; k < 15 && t->name[k]; k++)
             ti.name[k] = t->name[k];
@@ -577,6 +584,7 @@ void syscall_dispatch(uint64 num)
         vm_copy_across(kernel_pagetable, (uint64)&si,
                        current->pt, current->ctx.x[11], sizeof(si));
         t->ctx.epc    = si.entry;
+        t->entry      = si.entry;
         t->ctx.x[2]   = si.sp ? si.sp : USTACK_TOP;   /* sp */
         t->ctx.x[10]  = si.a0;                        /* argc */
         t->ctx.x[11]  = si.a1;                        /* argv */

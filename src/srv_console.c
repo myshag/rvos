@@ -212,6 +212,16 @@ void console_server(void)
                     "                went off. This is what a tty does with\n"
                     "                SIGINT, without signals or groups.\n"
                     "          PING, DOC\n");
+            } else if (r->ioctl_cmd == IOCTL_CONF) {
+                r->result = vfs_doc_reply(r,
+                    "key ring     256 bytes, filled at interrupt time and\n"
+                    "             dropped on overflow rather than overwritten\n"
+                    "readers      1    a second is told 0\n"
+                    "irq          10   the number the device tree gives\n");
+            } else if (r->ioctl_cmd == IOCTL_HOLDS) {
+                /* One stream, and it belongs to whoever is reading it now. */
+                r->result = vfs_reply_text(r,
+                    waiter == r->len ? "/dev/console  waiting for a key\n" : "");
             } else if (r->ioctl_cmd == IOCTL_INTR) {
                 /* Clearing the nomination answers whether it went off. */
                 r->result  = r->len > 0 ? 0 : intr_fired;

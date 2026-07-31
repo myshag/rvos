@@ -55,6 +55,16 @@ enum {
        Like a ping, it is about the server and not about a descriptor, and is
        answered before the fd is looked at. */
     IOCTL_DOC,
+    /* "What are you holding for task N?" — the id in `len`, the answer as
+       text in `data`, one message. A task's open files are not in one place
+       in this system: there is no client-side descriptor table, only each
+       server's own record of who asked it for what. So the only way to ask
+       what a task has open is to ask everybody, and this is the question. */
+    IOCTL_HOLDS,
+    /* "What numbers were you built with?" Answered like DOC, and separate
+       from it because they are different kinds of fact: DOC is what a server
+       accepts, this is what it can hold. */
+    IOCTL_CONF,
 };
 
 /* Long names need somewhere to fit. 32 was enough while every name was 8.3;
@@ -283,6 +293,20 @@ static inline int vfs_write(int fd, const void *buf, int len)
 
 /* No out-pointer any more: whatever the command yields comes home in
    `result`, because an address would not survive the trip. */
+/* One message of text, with no offset — for the answers that fit in one and
+   whose `len` means something else. IOCTL_HOLDS carries a task id there, and
+   using the paging helper by mistake made the network server treat the id as
+   an offset and cut thirteen characters off the front of its answer. */
+static inline int vfs_reply_text(struct vfs_req *r, const char *text)
+{
+    int l = 0;
+    while (text[l]) l++;
+    if (l > VFS_DATA_MAX)
+        l = VFS_DATA_MAX;
+    vfs__cpy(r->data, text, l);
+    return l;
+}
+
 /* The other half of IOCTL_DOC: what a server does to answer one. Shared here
    so that six servers do not each write it out. */
 static inline int vfs_doc_reply(struct vfs_req *r, const char *text)

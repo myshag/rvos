@@ -343,6 +343,21 @@ void dev_server(void)
                 r->result = 0;
             else if (r->ioctl_cmd == IOCTL_DOC)
                 r->result = vfs_doc_reply(r, dev_doc);
+            else if (r->ioctl_cmd == IOCTL_CONF)
+                r->result = vfs_doc_reply(r,
+                    "open files   2    each a rendering, made at open\n"
+                    "buffer       4096 bytes, allocated per open\n"
+                    "pci buses    2    of 256; the window maps the first two\n"
+                    "pci found    16   at most\n");
+            else if (r->ioctl_cmd == IOCTL_HOLDS) {
+                char t[VFS_DATA_MAX];
+                int o = 0;
+                for (int i = 0; i < DEV_MAXFD; i++)
+                    if (d_tab[i].used && d_tab[i].owner == r->len)
+                        o = append(t, o, "a rendering of /dev\n");
+                t[o] = 0;
+                r->result = vfs_reply_text(r, t);
+            }
             else if (r->ioctl_cmd == IOCTL_GETSIZE &&
                      r->fd >= 0 && r->fd < DEV_MAXFD && d_tab[r->fd].used)
                 r->result = d_tab[r->fd].size;
