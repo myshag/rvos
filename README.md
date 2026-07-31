@@ -2311,17 +2311,54 @@ Three things fall out of those four lines:
   reply against 89.9 for the bare message: about 3 µs, three per cent. Every
   open, read and write in this system is a message and a rounding error.
 
-So a message costs 86 µs, and everything built on it costs 3. If this ever
-needed to be fast, the place to look is the context switch — save and restore
-thirty-two registers, change `satp`, flush the TLB — and not the interface at
-all.
+So a message costs 86 µs and everything built on it costs 3 — and then the
+obvious conclusion from that is wrong, which is the most useful thing in this
+section.
 
-### What these numbers are not
+### Is that real time, or the emulator's?
 
-They are QEMU's, under software translation, and they say nothing about
-hardware. And they move with load: `/dev/console` measured 128 µs on a quiet
-system and 187 µs while somebody was typing at it over telnet. A benchmark
-reports the system it ran on.
+Real. `rdtime` reads the CLINT, and QEMU without `icount` drives it from the
+*host* clock rather than from instructions executed, so the guest's stopwatch
+is a stopwatch. Checked from outside: the guest reported 430 ms for 4000 round
+trips and the host measured 457 ms for the whole command, the difference being
+the shell, an ELF load and a 50 ms polling interval.
+
+But real time spent on emulated execution is not the same as the time that
+work would take, and the emulation is **not uniformly slow**. So `bench`
+measures one more thing — a two-instruction loop, written in assembly so the
+compiler cannot have an opinion about it:
+
+```
+  plain code          : 861 million instructions per second
+```
+
+Nearly native: a tight loop is translated once and then runs as host code.
+Which means a round trip at 86 µs costs about **74,000 instruction-times** —
+and the actual work in it is two `ecall`s, two saves and restores of
+thirty-two registers, a walk of the scheduler, and a copy. Call it a couple of
+thousand instructions. The other seventy thousand are not in the guest at all.
+
+They are in the two writes to `satp`. Changing an address space makes QEMU
+throw away its software TLB, and every memory access afterwards takes the slow
+path until it refills. Real silicon has a real TLB and an ASID; there, a
+context switch is on the order of a microsecond, not eighty-six.
+
+### Which inverts the conclusion
+
+"The switch dominates, the interface is free" is an artifact of the emulator.
+The interface's 3 µs is plain code running at nearly native speed, so it would
+cost about 3 µs on a real processor too — while the 86 µs switch would not.
+On hardware the two would be the same order, and quite possibly the other way
+round.
+
+The measurements are honest and the ratio between them is not transferable.
+That is worth more than the numbers: a benchmark that cannot say what it is
+measuring is exactly as useful as the first version of this one, which ran
+during the boot demonstration and reported the primitive as slower than the
+interface built on top of it.
+
+They also move with load — `/dev/console` measured 128 µs on a quiet system
+and 187 µs while somebody was typing at it over telnet.
 
 The first version of `bench` ran at boot, and reported the bare primitive as
 *slower* than the whole interface built on top of it — because it was
@@ -2342,6 +2379,8 @@ trip is waiting for one, which would be worth chasing.
 - more than one request in flight per connection: the tag is already there
 - `old` held as a channel rather than re-resolved as a string, so rebinding
   what a bind points at does not move everything bound onto it
+- a number from real hardware, or from `qemu -icount`, to put the 86 µs in
+  proportion — everything above is an emulator describing itself
 - why a round trip through a remote mount takes 25 ms when the link is
   loopback: the 20 ms retry deadline is the obvious suspect
 - a pseudo-terminal: the shell serving its children's `/dev/console`, so that

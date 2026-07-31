@@ -49,6 +49,20 @@ static void report(const char *what, unsigned long ticks, int n)
 
 #define ROUNDS 2000
 
+/* A loop whose instruction count is not a matter of opinion: two per turn,
+   written out so the compiler cannot have an idea about it. It answers the
+   only question that makes the others readable — how fast this machine runs
+   *ordinary* code — because a round trip that is expensive on an emulator
+   may be cheap on a processor, and the ratio is the only way to tell. */
+static unsigned long spin(unsigned long n)
+{
+    unsigned long i = 0;
+    __asm__ volatile("1: addi %0, %0, 1\n"
+                     "   bltu %0, %1, 1b\n"
+                     : "+r"(i) : "r"(n));
+    return i;
+}
+
 /* Run when asked, not at boot. The first version measured during the boot
    demonstration — while the network was resolving a name, a program was
    being loaded and a retransmission timer was running — and reported the bare
@@ -97,6 +111,22 @@ void bench_main(void)
         uputs("  ("); uputs(b); uputs(" bytes is one vfs_req)\n");
     }
     report("vfs_req, closed recv", t1 - t0, ROUNDS);
+
+    /* And plain arithmetic, for scale. Instructions per microsecond is the
+       same number as millions of instructions per second, which is a
+       coincidence of units worth not tripping over. */
+    unsigned long n = 20000000UL;
+    t0 = r_time();
+    spin(n);
+    t1 = r_time();
+    {
+        unsigned long us = (t1 - t0) / 10UL;
+        if (!us) us = 1;
+        char b[24];
+        int k = uutoa((2UL * n) / us, b); b[k] = 0;
+        uputs("  plain code          : "); uputs(b);
+        uputs(" million instructions per second\n");
+    }
 
   }
 }
