@@ -2843,6 +2843,78 @@ every open, at 177–217 µs before and 182–218 µs after. The allocation is l
 in the two messages around it.
 
 
+### There is no defragmenter, and there cannot be one
+
+Not an oversight. `malloc` hands the caller a bare pointer, so a block that is
+in use cannot be moved: nothing knows where the pointers to it are. The
+systems that did compact their heaps — Mac OS before X, 16-bit Windows — did
+not hand out pointers at all. They handed out *handles*, and you locked one to
+get an address and unlocked it again so the manager could shuffle the block
+underneath you. The other way is a garbage collector, which can move things
+precisely because it knows every reference. C's contract forbids both.
+
+What there is instead is coalescing: when a block comes back, it is joined to
+its free neighbours. `/BIN/FRAG.ELF` is what that is worth, and what it is
+not:
+
+```
+at rest                    taken 4K    free 3K    in 1 pieces    largest 4064
+2000 x 64 bytes            taken 160K  free 3K    in 1 pieces    largest 3216
+all freed                  taken 4K    free 3K    in 1 pieces    largest 4064
+every second one freed     taken 160K  free 81K   in 1001 pieces largest 3216
+after asking for 4096      taken 168K  free 85K   in 1001 pieces largest 7296
+200 x (1K then 48 bytes)   taken 216K  free 0K    in 1 pieces    largest 336
+only the 1K ones freed     taken 216K  free 203K  in 201 pieces  largest 1040
+after asking for 64K       taken 284K  free 207K  in 201 pieces  largest 4416
+everything freed           taken 4K    free 3K    in 1 pieces    largest 4064
+```
+
+Read the third line first: two thousand blocks taken and given back leave the
+heap in **one** piece and 4 KiB taken from the kernel. Coalescing is not a
+detail; without it that line would read "in 2000 pieces" and the next
+allocation of anything larger than 64 bytes would grow the heap for ever.
+
+Then read the second group. Two hundred kilobyte blocks, each with a
+forty-eight byte block wedged behind it, and then the kilobyte ones freed:
+**203 KiB free, in 201 pieces, and the largest is 1040 bytes.** Asking for
+64 KiB had to go to the kernel for 68 KiB more, while holding three times that
+much idle. That is external fragmentation, and no allocation policy fixes it —
+best fit rather than first fit changes which hole is chosen, and every hole
+here is 1040 bytes.
+
+The last line is the consolation and it is a real one: when the small blocks
+go, everything joins up again and the heap falls back to a single page. The
+memory was never lost, only unusable while something small was standing in
+the middle of it.
+
+### The one thing an MMU could do here, and why it is not done
+
+Compaction is impossible, but *this* machine has an option a flat address
+space does not. The scarce resource is physical frames, not addresses, and the
+two are not the same thing here — so the whole pages inside a large free hole
+could have their frames handed back to the kernel while the addresses stay
+reserved, and be filled again before the block is next used. Unix spells that
+`madvise(MADV_DONTNEED)`, and it is perhaps sixty lines: a syscall that unmaps
+a range, a flag bit in the block header (blocks are 16-aligned, so the low
+bits are free), and a rule that a dropped block is filled again before it is
+merged or handed out.
+
+It is not here because the measurement says it would recover nothing. The
+holes this system actually produces are of two kinds, and neither qualifies.
+The small ones — 80 bytes, 1040 bytes — do not contain a whole page. The large
+ones are at the end of the heap, where the tail trim already returns them:
+opening a 60000-byte file twice and closing it twice leaves the free-page
+count at 11985 both times, so the filesystem server's high-water mark is not
+permanent and there is nothing to reclaim. A feature that recovers nothing on
+any workload the system has is a feature with a demonstration and no purpose.
+
+The honest summary is that this heap is not fragmenting because of what it is
+asked for: a whole file, an ELF image, two TCP buffers, the text in an editor
+— few, large, long-lived, and freed in something close to the order they were
+taken. The pattern that breaks it is in `frag`, and `frag` is the only program
+that performs it.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

@@ -218,15 +218,26 @@ static inline void *realloc(void *p, unsigned long n)
     return q;
 }
 
-/* How much this task has taken from the kernel, and how much of that is
-   sitting on the free list. Not part of anybody's standard; it is here
-   because a system that can now leak needs a way to be asked whether it is. */
-static inline void malloc_stat(unsigned long *taken, unsigned long *idle)
+/* What this task has taken from the kernel, how much of it is idle, how many
+   pieces that idle memory is in and how big the largest piece is. Not part of
+   anybody's standard. It is here because a system that can now leak needs a
+   way to be asked whether it is — and because the difference between `idle`
+   and `largest` is the entire subject of fragmentation, which cannot be
+   discussed without being measured. */
+static inline void malloc_stat(unsigned long *taken, unsigned long *idle,
+                               int *pieces, unsigned long *largest)
 {
     struct mheap *h = m__heap();
-    unsigned long f = 0;
-    for (struct mblk *b = h->free; b; b = b->next)
+    unsigned long f = 0, big = 0;
+    int n = 0;
+    for (struct mblk *b = h->free; b; b = b->next) {
         f += b->size;
-    if (taken) *taken = h->top - UHEAP_BASE;
-    if (idle)  *idle  = f;
+        n++;
+        if (b->size > big)
+            big = b->size;
+    }
+    if (taken)   *taken   = h->top - UHEAP_BASE;
+    if (idle)    *idle    = f;
+    if (pieces)  *pieces  = n;
+    if (largest) *largest = big;
 }
