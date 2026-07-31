@@ -2457,7 +2457,9 @@ One character written is one message. A screen is about two thousand of them,
 which at the measured cost would be a fifth of a second per keystroke. So the
 screen is built in a buffer and sent in a handful of calls — and that is the
 first place in this project where the number from `bench` changed how
-something was written rather than merely describing it.
+something was written rather than merely describing it. (The next section
+takes the same number further: the buffer moved into a library, which sends
+not the whole screen but the part of it that changed.)
 
 ### Asking the terminal how big it is
 
@@ -2497,9 +2499,121 @@ where you run things. The menu bar along the top is painted, not wired; the
 keys under it are the ones on the strip. And one session at a time, which by
 now is a familiar sentence.
 
+## The screen becomes a data structure
+
+Everything full-screen written here had done the same three things by hand: a
+buffer of escape sequences, a column counter that knew UTF-8, and a parser for
+the bytes an arrow key is made of. None of that is about files, and all of it
+is the job of a library that has existed since 1980. So `prog/curses.h` is a
+subset of X/Open curses — the real names, the real constants, the real octal
+key codes — and `mc` is now written against it:
+
+```c
+initscr();
+cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0);
+start_color();
+init_pair(P_PANEL, COLOR_WHITE, COLOR_BLUE);
+
+WINDOW *w = newwin(LINES - 4, COLS / 2, 1, 0);
+wattrset(w, COLOR_PAIR(P_FRAME) | A_BOLD);
+box(w, 0, 0);
+mvwaddstr(w, 1, 1, " Name");
+wrefresh(w);
+```
+
+The program lost two hundred and fifty lines and gained page-up, page-down,
+Home and End, which cost four lines each once there was something that could
+tell a key from a byte.
+
+### The idea worth copying is the second screen
+
+A curses program does not write to the terminal. It writes into an array of
+cells; `doupdate` compares that array against a second one holding what the
+terminal is believed to be showing, and sends the difference. Here that is not
+a nicety. Moving the cursor down one row in a file panel changes two rows out
+of twenty-four, and the same key on the same screen costs:
+
+|                        | by hand   | curses   |
+|------------------------|-----------|----------|
+| first full screen      | 8732 B    | 7554 B   |
+| one arrow key          | ~4344 B   | ~138 B   |
+| keystroke to redrawn    | 5.8 ms    | 2.6 ms   |
+
+Thirty-one times fewer bytes for a keystroke, and the round trip that carries
+them — measured from the other end of a real connection, key sent to last byte
+back — is less than half as long. **The library is faster than the code it
+replaced because it knows more, not less.** The hand-written version could not
+have done this: it had no idea what was already on the screen.
+
+The other saving is smaller and comes from the same place. A cell holds a
+character *and* its colour in one 32-bit `chtype`, so the update loop emits an
+SGR sequence only when the attribute actually changes from one cell to the
+next. Colour stops being something you remember to turn off.
+
+```c
+typedef unsigned int chtype;    /* 21 bits of code point, 11 of attribute */
+#define A_BOLD      0x00200000u
+#define COLOR_PAIR(n) (((chtype)(n) << 26) & A_COLOR)
+```
+
+The original spends eight bits on the character because it predates Unicode by
+a decade. This one spends twenty-one, because a box corner is U+250C and
+drawing a frame is the first thing anybody asks a screen library for. The
+`ACS_ULCORNER` names are kept anyway — a program written against them ports
+both ways.
+
+### What initscr knows, and how
+
+Real curses learns the terminal from terminfo and the line discipline from
+termios. Neither exists here, so `initscr` asks the namespace what
+`/dev/console` resolves to; if the answer is called `/net/tcp/N` then the
+console is a connection, and the library negotiates character mode itself and
+asks the far end how big it is. `cbreak()` and `noecho()` are one telnet
+negotiation, because a telnet client is the line discipline this system does
+not have.
+
+That is a better answer than terminfo gives, and worth saying why: terminfo is
+a guess about what the far end probably is, keyed on a string the far end sent
+about itself. Resolution is not a guess. It is the system reporting which of
+its own servers will answer for a name.
+
+### A window is a view, not a page
+
+`newwin` returns a pen with a margin — an origin and a clipping rectangle —
+and every window draws into the one virtual screen. Real curses gives each
+window its own array of cells, which is what lets an overlapping window
+remember what was underneath it. That costs a screen of memory per window,
+there is no `malloc` here, and nothing in this system overlaps anything. So
+`wrefresh(win)` does not mean "paint this over that"; it means "I am done,
+update the screen". `panel(3)` is the library that stacks windows properly,
+and this is not it.
+
+Also absent, and for reasons rather than by omission: `printw`, because there
+is no vsnprintf; and `nodelay`, because the console server answers a read when
+a key arrives and there is no way to ask it whether one is waiting. Blocking
+is a server declining to answer yet, and it does not do partial refusals.
+
+### Two things the port found
+
+The panel used to compute its list height from the screen height, arrive at
+one row too many, draw the last entry and then paint over it with the bottom
+frame. A window that knows its own size cannot make that mistake, and the
+mistake was invisible until something else did the arithmetic.
+
+And `mc` stopped fitting. A program with ten kilobytes of code is a
+seventeen-kilobyte ELF file here: a page of padding before the text, so that
+file offset and load address agree modulo the page size, and another between
+text and data, so the two segments land on pages that can carry different
+permissions. The filesystem server holds a whole file in one buffer and the
+loaders read a whole ELF into another; both were 16 KiB, which is the largest
+file this system could open. Both are 32 KiB now. It is the same coupled pair
+of numbers with nothing enforcing it, only twice as large.
+
+
 ## Next steps
-- the menu bar in `mc` is a picture of a menu; pulling it down needs a way to
-  draw over the panels and put them back
+- the menu bar in `mc` is a picture of a menu; pulling it down needs windows
+  that remember what was under them, which is `panel(3)` and a cell array per
+  window
 - each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
   pointed at a network anybody else is on

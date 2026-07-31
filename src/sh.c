@@ -12,7 +12,7 @@
 #include "servers.h"
 
 #define LINEMAX 128
-#define ELFMAX  16384
+#define ELFMAX  32768
 
 static char line[LINEMAX];
 static char elfbuf[ELFMAX];

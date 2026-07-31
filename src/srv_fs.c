@@ -12,12 +12,17 @@
 #include "ulib.h"
 
 #define FS_MAXFD  3
-/* Large enough for a small executable: the loader reads whole ELF files. */
 /* A whole file at a time, because the FAT16 driver only reads forward. That
    makes this the largest file the system can open — and it has to be at least
    as big as the loaders' scratch buffers, or a program on the disk cannot be
-   run. The two numbers are coupled and there is nothing to enforce it. */
-#define FS_BUFSZ  16384
+   run. The two numbers are coupled and there is nothing to enforce it.
+
+   Doubled when the first program grew past it. Most of an ELF file here is
+   padding — a page before the text so that the file offset and the load
+   address agree, and another between text and data so that the two segments
+   land on pages that can carry different permissions — so a program with ten
+   kilobytes of code is a seventeen-kilobyte file. */
+#define FS_BUFSZ  32768
 
 struct fs_file {
     int    used;

@@ -23,7 +23,7 @@
 #include "servers.h"
 
 #define LINEMAX 128
-#define ELFMAX  16384
+#define ELFMAX  32768
 #define INBUF   256
 
 static char line[LINEMAX];

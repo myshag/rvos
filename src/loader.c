@@ -126,7 +126,7 @@ int spawn(const char *path, char *scratch, int scratchsz,
 }
 
 /* ---- the boot-time demo: load one program and report what it did -------- */
-#define ELFMAX 16384
+#define ELFMAX 32768
 static char elfbuf[ELFMAX];
 
 static void say_num(const char *label, unsigned long v, const char *tail)
