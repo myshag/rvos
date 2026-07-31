@@ -160,14 +160,15 @@ static void do_cat(const char *path)
 static void do_help(void)
 {
     puts_conn("commands:\n"
-              "  cat <path>     print a file, a report, or a connection\n"
-              "  ls             what is on the disk\n"
-              "  ps             the task table\n"
-              "  mem            free pages\n"
-              "  net            the interface, the ARP cache, the connections\n"
+              "  ls [path]      list a directory (default /)\n"
+              "  cat <path>...  print a file, a report, or a connection\n"
+              "  ps             running tasks              (/proc/tasks)\n"
+              "  mounts         this shell's namespace     (/proc/mounts)\n"
+              "  net            interface, ARP, connections (/net/status)\n"
+              "  mem            free and total pages\n"
               "  run <path> ..  start a program (its output goes to the serial\n"
               "                 console, not here — see the source for why)\n"
-              "  echo <words>\n"
+              "  echo <words>   write them back\n"
               "  exit           hang up\n");
 }
 
@@ -204,9 +205,15 @@ static void session(int slot)
                 for (int i = 1; i < argc; i++)
                     do_cat(argv[i]);
         } else if (streq(argv[0], "ls")) {
-            do_cat("/");
+            do_cat(argc > 1 ? argv[1] : "/");
         } else if (streq(argv[0], "ps")) {
             do_cat("/proc/tasks");
+        } else if (streq(argv[0], "mounts")) {
+            /* Whose namespace? This shell's — and the answer would differ for
+               a task that had cloned and rebound its own. That is why the
+               proc server has to be told which task to report on rather than
+               having "the" mount table to look at. */
+            do_cat("/proc/mounts");
         } else if (streq(argv[0], "net")) {
             do_cat("/net/status");
         } else if (streq(argv[0], "echo")) {

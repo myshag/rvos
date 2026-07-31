@@ -1221,6 +1221,30 @@ the shell, nor the connection carrying the answer can tell which. The second
 line of that transcript is the stack describing, over one of its own
 connections, the connection it is describing it over.
 
+Every other command is the same trick with the path filled in: `ls` is `cat`
+of a directory, `ps` is `/proc/tasks`, `net` is `/net/status`, and `mounts` is
+`/proc/mounts` — which reports *this shell's* namespace, and would answer
+differently for a task that had cloned and rebound its own. That is why the
+proc server has to be told whose to report rather than having "the" mount
+table to look at:
+
+```
+rvos# mounts
+/ -> task 0
+/dev/ -> task 1
+/proc/ -> task 2
+/net/ -> task 11
+
+rvos# ls
+HELLO.TXT  (54 bytes)
+README.TXT  (105 bytes)
+DOCS/
+HELLO.ELF  (6416 bytes)
+```
+
+`ls /DOCS` fails, and honestly: the filesystem server does not walk into
+subdirectories yet, which is a limit of the server and not of the shell.
+
 It is a task in `kernel.elf` rather than a program on the disk for one reason:
 `spawn()` lives in the shared user text that this image links, and a program
 loaded from FAT16 cannot reach it. Everything else it does, a disk program
