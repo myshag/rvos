@@ -3866,6 +3866,21 @@ be freed by the closer — a thread is standing on it — nor by the thread, whi
 would be freeing the ground under itself. It belongs to the slot now and the
 next line reuses it: eight slots, and that is the whole budget.
 
+### And one it inherited: Enter arrived twice
+
+Not caused by the terminal, but found the moment there was somewhere to fix
+it. RFC 854 has a telnet send a carriage return as **CR NUL**, and a client in
+line mode sends **CR LF** — one keypress, two bytes. A full-screen program
+reading bytes saw two Enters and did two things: in `mc`, Enter walked into a
+directory and immediately walked back out of it.
+
+`mc` was right to treat both 13 and 10 as Enter. **Knowing that a device sends
+them in pairs is the terminal's business**, and until there was a terminal
+there was nowhere to put that knowledge — so every full-screen program would
+have had to carry it, or live with the doubling. In raw mode the discipline
+now drops a NUL or LF that follows a carriage return, and one keypress is one
+key for everything that reads.
+
 ### What it cost
 
 Measured, and the interesting part is which number moved.
