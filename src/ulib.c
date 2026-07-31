@@ -90,3 +90,15 @@ void uputs(const char *s)
     while (*s)
         _ecall1(SYS_PUTC, *s++);
 }
+
+/* The clock. This is the one piece of hardware a user program touches without
+   the kernel's help — smain sets scounteren.TM, and rdtime becomes legal.
+   QEMU's time base is 10 MHz, so a millisecond is 10000 ticks. */
+uint64 unow_ticks(void)
+{
+    uint64 x;
+    __asm__ volatile("rdtime %0" : "=r"(x));
+    return x;
+}
+
+uint64 unow_ms(void) { return unow_ticks() / 10000UL; }

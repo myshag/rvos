@@ -35,9 +35,14 @@ DISK_ADDR := 0x84000000
 # force-legacy=false matters: QEMU presents virtio-mmio as a *legacy* (version
 # 1) transport by default, whose queue registers are laid out differently. The
 # driver speaks virtio 1.x, so the transport has to be the modern one.
+# hostfwd is what makes the guest reachable at all: QEMU's user-mode network
+# is a NAT, so nothing on the host can open a connection inward unless a port
+# is forwarded. localhost:5555 becomes 10.0.2.15:7 inside the guest, which is
+# the port the stack listens on — `nc localhost 5555` is a call into rvos.
 QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic \
            -global virtio-mmio.force-legacy=false -kernel $(ELF) \
-           -netdev user,id=n0 -device virtio-net-device,netdev=n0
+           -netdev user,id=n0,hostfwd=tcp::5555-:7 \
+           -device virtio-net-device,netdev=n0
 
 .PHONY: all run rundisk runpcap disk prog clean
 all: $(ELF)

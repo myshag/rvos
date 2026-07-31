@@ -129,6 +129,11 @@ static inline uint64 r_sepc(void)     { return R("sepc"); }
 static inline uint64 r_stval(void)    { return R("stval"); }
 static inline uint64 r_satp(void)     { return R("satp"); }
 static inline void   w_satp(uint64 v)    { W("satp", v); }
+/* scounteren gates the counters U-mode may read. Bit 1 (TM) is rdtime: with
+   it clear, a user program asking what time it is takes an illegal-instruction
+   trap; with it set, the clock costs a single instruction and no syscall. */
+#define SCOUNTEREN_TM   (1UL << 1)
+static inline void   w_scounteren(uint64 v) { W("scounteren", v); }
 
 /* stimecmp (0x14d), Sstc: S-mode's own timer compare register. */
 static inline void w_stimecmp(uint64 v)

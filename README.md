@@ -214,6 +214,14 @@ The boot demo runs first; when it settles you get a prompt and can type:
 ```
 rvos$ /HELLO.ELF one two
 rvos$ mem
+rvos$ cat /net/status
+```
+
+The guest is reachable while it runs — port 5555 on the host is forwarded to
+the port the stack listens on:
+
+```bash
+nc localhost 5555
 ```
 
 Exit QEMU with `Ctrl-A` then `X`.
@@ -311,6 +319,8 @@ $ read the fs server's private data region
 17. UDP, and enough TCP to open a connection, talk and close it
 18. alarms in the kernel, and TCP retransmission that survives a lost segment
 19. the network bound into the namespace: `/net/status`, `/net/tcp`
+20. a connection table and the RFC 793 state machine; passive open, ARP and
+    ICMP answered, DNS, and a page fetched from a real server
 
 ## Loading a program
 
@@ -473,9 +483,9 @@ here. The checksum covers a *pseudo-header* that never goes on the wire — the
 two addresses, the protocol and the length — which is what makes a datagram
 delivered to the wrong host fail rather than be accepted.
 
-**TCP is still not complete, and it is worth being exact about what is
-missing.** What works is a client that opens a connection, sends, receives,
-closes in order, and *retransmits what goes unacknowledged*:
+**At this stage TCP was not complete, and it is worth being exact about what
+was missing.** What worked was a client that opens a connection, sends,
+receives, closes in order, and *retransmits what goes unacknowledged*:
 
 ```
 tcp: SYN -> 10.0.2.2:9998
@@ -486,9 +496,12 @@ tcp: closing
 tcp: closed
 ```
 
-What is still absent: out-of-order reassembly, window management beyond a
-fixed advertised window, congestion control, and a fixed initial sequence
-number instead of a random one.
+Absent at this point: any second connection, any way for a host to call *in*,
+out-of-order reassembly, window management beyond a fixed advertised window,
+congestion control, and a fixed initial sequence number instead of a clock-
+derived one. Most of that is the subject of
+[TCP that answers](#tcp-that-answers) below; reassembly and congestion control
+are still on the list at the end.
 
 Retransmission needed something the system did not have — a way for a task to
 act on the passage of time. `SYS_ALARM` wakes a task after a delay, and it
@@ -551,17 +564,194 @@ card to return the descriptor. That wait sat inside `sys_recv`, and would have
 swallowed whatever a client happened to send at that moment. Eight transmit
 buffers used round-robin remove the wait entirely.
 
+## TCP that answers
+
+Up to here "the TCP connection" was a set of globals: one peer, one pair of
+ports, one sequence number. That is enough to *make* a call and nothing else.
+Three things had to change together to make the stack something a host can
+call, and none of them is optional on its own.
+
+**The globals became a table.** A control block per connection, found by the
+four numbers that identify it: local port, remote address, remote port — and,
+failing an exact match, a listener on that local port. The order matters.
+Match the listener first and an established connection's segments get handed
+to the listener, which looks from the outside like a peer that has gone mad.
+
+**The if-ladder became the state machine.** All eleven states, named as RFC 793
+names them, including the three that only exist so that a close can be
+completed by either side in either order:
+
+```
+listen  syn-sent  syn-rcvd  established
+fin-wait-1  fin-wait-2  closing  time-wait  close-wait  last-ack
+```
+
+A SYN arriving at a listener does not consume the listener — it allocates a
+second control block and leaves the first listening. That single decision is
+the difference between a program that can be called once and a server.
+
+**ARP grew its other half.** A host that wants to reach us asks who has our
+address first, and if nothing answers, the connection never gets as far as
+TCP. So ARP is a small cache now, filled from both directions: from replies to
+our own requests, and from requests addressed to us — the latter is not an
+optimisation, because a host that asks for us is about to send to us, and we
+will need its address to answer. ICMP echo is answered the same way, for the
+same reason: a stack that only initiates is not reachable.
+
+### Three smaller things that turned out to be load-bearing
+
+*The initial sequence number.* RFC 793 wants it taken from a clock ticking
+every four microseconds, so that a stray segment from an older incarnation of
+the same connection cannot be mistaken for a current one. A fixed 1000 makes
+that failure a certainty rather than a risk.
+
+*A clock in user mode.* One alarm exists per task, and there are now several
+deadlines competing for it — a retransmission timer per connection, plus
+TIME-WAIT. Picking the nearest requires knowing what time it is, not merely
+being able to ask for a wake-up. `scounteren.TM` makes `rdtime` legal in user
+mode, so the stack reads the clock in one instruction with no trap, and
+`sys_alarm` is set to whichever deadline comes first.
+
+*A window that means something.* The advertised window is the space actually
+left in the read queue, so a peer that outruns its reader is told to stop.
+That is only half of it: when a program drains the queue the window opens
+again, and a peer that has been told to stop will not restart until it is told
+so. A stack that throttles a connection and then forgets to send the window
+update deadlocks it.
+
+### Calling in
+
+`hostfwd` makes the guest reachable — QEMU's user-mode network is a NAT, so
+without it nothing on the host can open a connection inward. `localhost:5555`
+becomes `10.0.2.15:7`, which is the port the stack listens on:
+
+```
+$ nc localhost 5555
+rvos: you have reached the guest on port 7
+knock knock
+```
+
+and in the guest:
+
+```
+tcp: listening on port 7
+arp: told 10.0.2.2 where we are
+tcp: SYN from 10.0.2.2:53060, accepted; SYN-ACK sent
+tcp: connection established (inbound)
+tcp: received 12 bytes, queued for readers
+tcp: peer closed its half
+tcp: closing (peer went first)
+tcp: closed
+```
+
+The greeting is the demo's, not the stack's, and it is in the file's demo
+section with a note saying so. It exists because nothing in the guest is yet
+running to answer for itself — the connection is at `/net/tcp/2` waiting to be
+read, and a program to read it is the next stage's business.
+
+### Checking it against something that does not have to be kind
+
+A local `nc` is a forgiving examiner. QEMU's user network is a NAT onto the
+machine's real one, so a segment addressed outside `10.0.2.0/24` leaves for
+the actual internet. That needs a name turned into an address, which needs
+DNS — a single UDP datagram out and a single one back, which is exactly what
+the UDP already here is for:
+
+```
+arp: who has 10.0.2.3?
+arp: 10.0.2.3 is at 52:55:0a:00:02:03
+dns: who is example.com?
+dns: it is at 172.66.147.243
+tcp: SYN -> 172.66.147.243:80
+tcp: connection established
+http: GET / -> example.com
+HTTP/1.1 200 OK
+Date: Fri, 31 Jul 2026 00:26:30 GMT
+Content-Type: text/html
+Server: cloudflare
+...
+<!doctype html><html lang="en"><head><title>Example Domain</title>...
+tcp: peer closed its half
+tcp: closed
+```
+
+The DNS reply is worth one note. A name on the wire is a chain of
+length-prefixed labels ending in a zero byte — except that a length byte with
+its top two bits set is not a length at all but a pointer to a name earlier in
+the same message, which is how an answer repeats the question without
+repeating the bytes. A parser that does not expect that walks off the end of
+the packet.
+
+And one piece of honesty about what this does and does not prove. The bytes
+are genuinely from `example.com`, and the address genuinely came from a real
+resolver. The *TCP peer*, however, is QEMU's slirp: it terminates the
+connection and relays over a host socket, so the sequence numbers and segment
+sizes are its, not Cloudflare's. What the exchange demonstrates is a stack
+talking to an implementation it has never seen, over a route it did not have
+hardcoded, to fetch content nobody put in the source tree. A real remote
+stack on the other end needs a TAP device and a routed host, which needs
+privileges this project does not ask for.
+
+The capture confirms it independently — `make runpcap`, then decode
+`build/net.pcap` and recompute every checksum from the bytes rather than
+trusting the driver's account:
+
+```
+ 8 TCP 10.0.2.15:40002 -> 172.66.147.243:80 SYN      seq=26870 win=512  ip-ok sum-ok
+ 9 TCP 172.66.147.243:80 -> 10.0.2.15:40002 SYN|ACK  seq=1 ack=26871    ip-ok sum-ok
+11 TCP 10.0.2.15:40002 -> 172.66.147.243:80 PSH|ACK  len=56  'GET / HTTP/1.0...'
+13 TCP 172.66.147.243:80 -> 10.0.2.15:40002 ACK      len=512 'HTTP/1.1 200 OK...'
+15 TCP 172.66.147.243:80 -> 10.0.2.15:40002 FIN|PSH|ACK len=316
+18 TCP 10.0.2.15:40002 -> 172.66.147.243:80 FIN|ACK  seq=26927 ack=831
+```
+
+Note the two data segments: 512 bytes and then 316. The peer had more to send
+and sent 512, because 512 is what we advertised. The window is not decoration.
+
+### The files
+
+| path | read | write |
+|------|------|-------|
+| `/net/status` | interface, ARP cache, every connection in the table | — |
+| `/net/tcp` | the connection this system opened | send on it |
+| `/net/tcp/N` | connection *N*, including the ones it answered | send on it |
+
+```
+rvos$ cat /net/status
+mac      52:54:00:12:34:56
+address  10.0.2.15/24
+gateway  10.0.2.2
+arp      10.0.2.2 -> 52:55:0a:00:02:02
+arp      10.0.2.3 -> 52:55:0a:00:02:03
+tcp 0 listen       :7
+tcp 1 established  :40001 <-> 10.0.2.2:9998  rx 0
+```
+
+`cat` is a shell builtin as of this stage, which is less trivial than it
+sounds: none of the interesting paths are files. `/proc/tasks` is rendered by
+a server and `/net/status` by the protocol stack, and the shell cannot tell.
+It did expose one thing the stack had wrong — a rendered report that hands
+back its whole text on every read never ends, and `cat` reads until a read
+returns nothing. A status file needs an offset per open, like any other file.
+
+Closing the last descriptor on a connection closes the connection. That is
+what a file interface means by close, and it happens to be what TCP means by
+it too — with the distinction TCP makes and a file does not: if the peer
+closed first the close is a LAST-ACK, and if we go first it is a FIN-WAIT.
+
 ## Next steps
 
-- a blocking `read()` on the console, so the shell stops polling the driver
-  (the driver is interrupt-driven now; its client is not)
-- more than one TCP connection: the interface is a file, but there is still
-  exactly one connection behind it
-- answering ARP and ICMP rather than only initiating them
+- out-of-order reassembly: a segment that arrives early is currently dropped
+  and re-requested with a duplicate ack
+- more than one segment in flight — a send buffer indexed by `snd_una`,
+  instead of one retransmit slot — and an RTO estimated from measured
+  round-trip times rather than fixed at 300 ms
+- congestion control: slow start and congestion avoidance
+- `/net/ctl`, so a program can open a connection or listen on a port instead
+  of the stack's demo deciding
+- a blocking `read()`, so a program serving a connection stops polling
 - capabilities on the task-building syscalls, which are currently open to all
 - freeing a retired task's pages and page table (nothing is reclaimed yet)
-- a `virtio-blk` driver, replacing the RAM image with a real disk
-- `argv`/`envp`, and a shell that execs what you type
 - a `virtio-blk` driver, replacing the RAM image with a real disk
 - FAT16 writes; subdirectory traversal
 - run under OpenSBI in supervisor mode

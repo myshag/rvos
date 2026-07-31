@@ -19,3 +19,10 @@ int    ustr_has_prefix(const char *s, const char *p);
 /* Console of last resort: one character per trap, needing no server. Servers
    use it for their startup line, before anyone is listening. */
 void   uputs(const char *s);
+
+/* The clock, read directly. sys_alarm says "wake me in N milliseconds", which
+   is enough for a task with one deadline; a task juggling several has to know
+   the current time to work out which comes first. scounteren.TM makes rdtime
+   legal in user mode, so this is one instruction and no trap. */
+uint64 unow_ticks(void);
+uint64 unow_ms(void);

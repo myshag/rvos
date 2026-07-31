@@ -171,6 +171,12 @@ void smain(void)
 
     trap_init();
     timer_init();
+    /* Let user mode read the clock. A protocol stack needs to know not just
+       "wake me in 300 ms" but *what time it is now* — several connections have
+       deadlines and only one alarm exists to serve them, so the nearest has to
+       be computed. Making that a syscall would put a trap on a path taken per
+       packet; one CSR bit puts it in a single instruction instead. */
+    w_scounteren(SCOUNTEREN_TM);
     plic_init();
     plic_init_hart();
     kprintf("[boot] PLIC up; UART irq %d routed to S-mode\n", UART0_IRQ);

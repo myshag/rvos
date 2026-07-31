@@ -33,6 +33,36 @@ static int getc_blocking(int fd)
     }
 }
 
+static int streq(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+/* Print a file. The point of "everything is a file" is lost if the shell
+   cannot look at one, and the things worth looking at are not files at all:
+   /proc/tasks is rendered by a server, /net/status by the protocol stack.
+   This does not know or care which. */
+static void cat(const char *path)
+{
+    int fd = vfs_open(path);
+    if (fd < 0) {
+        uputs("sh: cannot open ");
+        uputs(path);
+        uputs("\n");
+        return;
+    }
+    for (;;) {
+        char buf[VFS_DATA_MAX + 1];
+        int n = vfs_read(fd, buf, VFS_DATA_MAX);
+        if (n <= 0)
+            break;
+        buf[n] = 0;
+        uputs(buf);
+    }
+    vfs_close(fd);
+}
+
 static int split(char *s, char **out, int max)
 {
     int n = 0;
@@ -90,10 +120,18 @@ void sh_main(void)
         if (argc == 0)
             continue;
 
-        /* One builtin, because it answers the question a loader raises:
+        if (streq(argv[0], "cat")) {
+            if (argc < 2)
+                uputs("usage: cat <path>\n");
+            else
+                for (int i = 1; i < argc; i++)
+                    cat(argv[i]);
+            continue;
+        }
+
+        /* The other builtin, because it answers the question a loader raises:
            does running programs cost memory permanently? */
-        if (argv[0][0] == 'm' && argv[0][1] == 'e' && argv[0][2] == 'm' &&
-            argv[0][3] == 0) {
+        if (streq(argv[0], "mem")) {
             int mem[2] = { 0, 0 };
             char n[24];
             sys_meminfo(mem);
