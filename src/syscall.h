@@ -19,7 +19,8 @@ enum {
        no task maps those any more — so introspection had to become a kernel
        service the moment address spaces were separated. */
     SYS_PGDUMP = 4,
-    /* a0 = path, a1 = out buffer, a2 = cap -> server task id, and in `out`
+    /* a0 = path, a1 = out, a2 = cap, a3 = which member of the union at that
+       name -> server task id, and in `out`
        the name that server should be asked about — not the same name if a
        bind was crossed on the way. Resolution reads the caller's mount table,
        which lives in kernel memory; a user-mode task cannot look at it
@@ -35,7 +36,7 @@ enum {
     /* Namespace mutation: also kernel-side per-task state. Plan 9's two
        operations, kept apart because they are not the same thing: mount puts
        a server behind a name, bind makes one name mean another. */
-    SYS_BIND     = 9,  /* a0 = old path, a1 = new path */
+    SYS_BIND     = 9,  /* a0 = old path, a1 = new path, a2 = flags */
     SYS_NSCLONE  = 10,
     /* Loading a program. Three primitives, matched to what an ELF program
        header actually says, so the loader can live in user space and the
@@ -69,7 +70,7 @@ enum {
        answers "no" for a slot that has been reused as well as for one that is
        empty. */
     SYS_ALIVE   = 19,     /* a0 = task id -> 1 or 0 */
-    SYS_MOUNT   = 20,     /* a0 = prefix, a1 = server task id */
+    SYS_MOUNT   = 20,     /* a0 = prefix, a1 = server, a2 = flags */
     SYS_UNMOUNT = 21,     /* a0 = name — take it back */
 };
 
@@ -148,9 +149,9 @@ static inline int sys_meminfo(int out[2])
 {
     return (int)_ecall1(SYS_MEMINFO, (long)out);
 }
-static inline int sys_mount(const char *prefix, int server_task)
+static inline int sys_mount(const char *prefix, int server_task, int flags)
 {
-    return (int)_ecall2(SYS_MOUNT, (long)prefix, server_task);
+    return (int)_ecall3(SYS_MOUNT, (long)prefix, server_task, flags);
 }
 static inline int sys_unmount(const char *name)
 {
@@ -158,9 +159,9 @@ static inline int sys_unmount(const char *name)
 }
 /* bind(old, new): `new` means `old` from now on. The second argument is the
    one that changes — Plan 9's order, and the one everybody gets backwards. */
-static inline int sys_bind(const char *old, const char *new)
+static inline int sys_bind(const char *old, const char *new, int flags)
 {
-    return (int)_ecall2(SYS_BIND, (long)old, (long)new);
+    return (int)_ecall3(SYS_BIND, (long)old, (long)new, flags);
 }
 static inline int sys_nsclone(void)
 {
@@ -205,9 +206,9 @@ static inline void sys_exit(void)
     for (;;) ;                 /* not reached */
 }
 
-static inline int sys_resolve(const char *path, char *out, int cap)
+static inline int sys_resolve(const char *path, char *out, int cap, int nth)
 {
-    return (int)_ecall3(SYS_RESOLVE, (long)path, (long)out, cap);
+    return (int)_ecall4(SYS_RESOLVE, (long)path, (long)out, cap, nth);
 }
 
 /* Render one task's translation of `va` as text into our own buffer. */

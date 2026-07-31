@@ -158,6 +158,39 @@ static void do_cat(const char *path)
     vfs_close(fd);
 }
 
+/* A directory that is a union is *every* member of it, one after another —
+   which is the whole point of joining two names, and the one place a program
+   has to know the union exists. Opening a file takes the first answer;
+   listing a directory takes all of them. */
+static void do_ls(const char *path)
+{
+    char real[VFS_PATH_MAX];
+    int shown = 0;
+    for (int nth = 0; ; nth++) {
+        int srv = sys_resolve(path, real, (int)sizeof(real), nth);
+        if (srv < 0)
+            break;
+        int fd = vfs_open_at(srv, real);
+        if (fd < 0)
+            continue;                   /* this member does not have it */
+        for (;;) {
+            char buf[VFS_DATA_MAX];
+            int n = vfs_read(fd, buf, VFS_DATA_MAX);
+            if (n <= 0)
+                break;
+            if (wr(buf, n) < 0)
+                break;
+        }
+        vfs_close(fd);
+        shown++;
+    }
+    if (!shown) {
+        puts_conn("rsh: cannot open ");
+        puts_conn(path);
+        puts_conn("\n");
+    }
+}
+
 static void do_help(void)
 {
     puts_conn("commands:\n"
@@ -165,9 +198,9 @@ static void do_help(void)
               "  cat <path>...  print a file, a report, or a connection\n"
               "  ps             running tasks              (/proc/tasks)\n"
               "  mounts         this shell's namespace     (/proc/mounts)\n"
-              "  bind <old> <new>   make <new> mean <old>, here and in\n"
-              "                     anything started from here\n"
-              "  mount <pfx> <task> put a server behind a name\n"
+              "  bind [-a|-b] <old> <new>   make <new> mean <old>; -a and -b\n"
+              "                     join what is there instead of replacing it\n"
+              "  mount [-a|-b] <pfx> <task> put a server behind a name\n"
               "  unmount <name>     take a name back\n"
               "  net            interface, ARP, connections (/net/status)\n"
               "  mem            free and total pages\n"
@@ -209,7 +242,7 @@ static void session(int slot)
                 for (int i = 1; i < argc; i++)
                     do_cat(argv[i]);
         } else if (streq(argv[0], "ls")) {
-            do_cat(argc > 1 ? argv[1] : "/");
+            do_ls(argc > 1 ? argv[1] : "/");
         } else if (streq(argv[0], "ps")) {
             do_cat("/proc/tasks");
         } else if (streq(argv[0], "mounts")) {
@@ -218,22 +251,27 @@ static void session(int slot)
                proc server has to be told which task to report on rather than
                having "the" mount table to look at. */
             do_cat("/proc/mounts");
-        } else if (streq(argv[0], "bind")) {
-            /* Plan 9's order: the second name is the one that changes. */
-            if (argc < 3)
-                puts_conn("usage: bind <old> <new>\n");
-            else if (sys_bind(argv[1], argv[2]) < 0)
-                puts_conn("bind: no room in the mount table\n");
-        } else if (streq(argv[0], "mount")) {
-            if (argc < 3) {
-                puts_conn("usage: mount <prefix> <task>\n");
-            } else {
+        } else if (streq(argv[0], "bind") || streq(argv[0], "mount")) {
+            /* -a and -b are Plan 9's spelling of "join what is already there,
+               after it" and "…before it". Without one, replace. */
+            int f = MREPL, a = 1;
+            if (argc > 1 && argv[1][0] == '-' && argv[1][2] == 0) {
+                if (argv[1][1] == 'a') { f = MAFTER;  a = 2; }
+                if (argv[1][1] == 'b') { f = MBEFORE; a = 2; }
+            }
+            int mnt = streq(argv[0], "mount");
+            if (argc < a + 2) {
+                puts_conn(mnt ? "usage: mount [-a|-b] <prefix> <task>\n"
+                              : "usage: bind [-a|-b] <old> <new>\n");
+            } else if (mnt) {
                 int t = 0;
-                const char *d = argv[2];
+                const char *d = argv[a + 1];
                 while (*d >= '0' && *d <= '9')
                     t = t * 10 + (*d++ - '0');
-                if (sys_mount(argv[1], t) < 0)
+                if (sys_mount(argv[a], t, f) < 0)
                     puts_conn("mount: no room in the mount table\n");
+            } else if (sys_bind(argv[a], argv[a + 1], f) < 0) {
+                puts_conn("bind: no room in the mount table\n");
             }
         } else if (streq(argv[0], "unmount")) {
             if (argc < 2)
@@ -386,7 +424,7 @@ void rsh_main(void)
            starts — /dev/console now means this connection. The programs know
            nothing about it, and neither does the network server: it is asked
            for /net/tcp/N, which is a name it has always understood. */
-        sys_bind(path, "/dev/console");
+        sys_bind(path, "/dev/console", MREPL);
 
         uputs("  [rsh] someone logged in\n");
         session(slot);

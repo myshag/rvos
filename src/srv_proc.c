@@ -118,7 +118,11 @@ static void proc_do_open(struct vfs_req *r, int caller)
     struct proc_file *f = &p_tab[fd];
 
     int n;
-    if (ustr_has_prefix(r->path, "/proc/tasks"))
+    /* "/proc/" and "/proc" name the directory itself, and a directory that
+       will not say what is in it is no use in a union. */
+    if (r->path[5] == 0 || r->path[6] == 0)
+        n = append(f->data, 0, "tasks\nmounts\npagetable\n");
+    else if (ustr_has_prefix(r->path, "/proc/tasks"))
         n = format_tasks(f->data, PROC_BUFSZ);
     else if (ustr_has_prefix(r->path, "/proc/mounts"))
         n = sys_mounts(caller, f->data, PROC_BUFSZ);

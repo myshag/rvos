@@ -117,23 +117,58 @@ static int streq(const char *a, const char *b)
     return *a == *b;
 }
 
-/* An entry for this exact name, reused if there is one. Plan 9's default is
-   MREPL — a second bind on the same point replaces the first rather than
-   stacking — and it is what makes rebinding on every connection work without
-   filling the table. */
-static struct mount *slot_for(struct namespace *ns, const char *prefix)
+/* Where a new entry for `prefix` goes, under Plan 9's three flags.
+
+   MREPL throws away whatever was at that name and puts this there — the
+   default, and what makes the shell rebind on every connection without
+   filling the table. MBEFORE and MAFTER leave what is there and join it: the
+   name then has several answers, tried in order, which is a union.
+
+   Order in this table used to mean nothing, and the previous stage said so
+   while filling an unmounted hole with the last entry. That stopped being
+   true the moment a name could have more than one answer, and the unmount
+   below shifts now. A property that was safe to rely on can be repealed by a
+   feature. */
+static struct mount *insert_at(struct namespace *ns, const char *prefix,
+                               int flags)
 {
-    for (int i = 0; i < ns->n; i++)
-        if (streq(ns->mnt[i].prefix, prefix))
-            return &ns->mnt[i];
+    if (flags == MREPL) {
+        for (int i = 0; i < ns->n; ) {
+            if (streq(ns->mnt[i].prefix, prefix)) {
+                for (int k = i; k + 1 < ns->n; k++)
+                    ns->mnt[k] = ns->mnt[k + 1];
+                ns->n--;
+            } else {
+                i++;
+            }
+        }
+    }
     if (ns->n >= VFS_NMOUNT)
         return 0;
-    return &ns->mnt[ns->n++];
+
+    int at = ns->n;                     /* MREPL, or nothing there yet */
+    if (flags == MAFTER) {
+        for (int i = ns->n - 1; i >= 0; i--)
+            if (streq(ns->mnt[i].prefix, prefix)) {
+                at = i + 1;
+                break;
+            }
+    } else if (flags == MBEFORE) {
+        for (int i = 0; i < ns->n; i++)
+            if (streq(ns->mnt[i].prefix, prefix)) {
+                at = i;
+                break;
+            }
+    }
+    for (int k = ns->n; k > at; k--)
+        ns->mnt[k] = ns->mnt[k - 1];
+    ns->n++;
+    return &ns->mnt[at];
 }
 
-int vfs_mount(const char *prefix, int server_task)
+int vfs_mount(const char *prefix, int server_task, int flags)
 {
-    struct mount *m = slot_for(cur_ns(), prefix);
+    struct mount *m = insert_at(cur_ns(), prefix, flags);
     if (!m)
         return -1;
     strcpy(m->prefix, prefix);
@@ -146,9 +181,9 @@ int vfs_mount(const char *prefix, int server_task)
 /* bind(old, new): `new` now means whatever `old` means. The order is Plan 9's
    and it is the thing everybody gets backwards — the *second* argument is the
    name that changes. */
-int vfs_bind(const char *old, const char *new)
+int vfs_bind(const char *old, const char *new, int flags)
 {
-    struct mount *m = slot_for(cur_ns(), new);
+    struct mount *m = insert_at(cur_ns(), new, flags);
     if (!m)
         return -1;
     strcpy(m->prefix, new);
@@ -174,36 +209,55 @@ static int prefix_matches(const char *path, const char *prefix)
     return c == 0 || c == '/';
 }
 
-/* Plan 9's unmount(nil, old): take the name back. There are no unions here,
-   so there is nothing to remove it *from* — the entry either exists or does
-   not. The hole is filled with the last entry rather than shifted over,
-   because resolution is longest-prefix-wins and the order of the table has
-   never meant anything. */
+/* Plan 9's unmount(nil, old): take the name back — all of it, however many
+   things have been joined there. Entries are shifted rather than swapped,
+   because with unions the order of the table is the order they are searched
+   in and moving one past another would silently reorder a union. */
 int vfs_unmount(const char *name)
 {
     struct namespace *ns = cur_ns();
-    for (int i = 0; i < ns->n; i++)
+    int found = 0;
+    for (int i = 0; i < ns->n; ) {
         if (streq(ns->mnt[i].prefix, name)) {
-            ns->mnt[i] = ns->mnt[--ns->n];
-            return 0;
+            for (int k = i; k + 1 < ns->n; k++)
+                ns->mnt[k] = ns->mnt[k + 1];
+            ns->n--;
+            found = 1;
+        } else {
+            i++;
         }
-    return -1;
+    }
+    return found ? 0 : -1;
 }
 
-static struct mount *longest_match(struct namespace *ns, const char *path)
+/* The longest prefix still decides *which* name matched; every entry holding
+   that same name is then a member of the union, searched in table order. */
+static struct mount *nth_match(struct namespace *ns, const char *path, int nth)
 {
-    struct mount *best = 0;
     size_t bestlen = 0;
+    int    any = 0;
     for (int i = 0; i < ns->n; i++) {
         if (!prefix_matches(path, ns->mnt[i].prefix))
             continue;
         size_t l = strlen(ns->mnt[i].prefix);
-        if (!best || l > bestlen) {
-            best = &ns->mnt[i];
+        if (!any || l > bestlen) {
             bestlen = l;
+            any = 1;
         }
     }
-    return best;
+    if (!any)
+        return 0;
+
+    int k = 0;
+    for (int i = 0; i < ns->n; i++) {
+        if (!prefix_matches(path, ns->mnt[i].prefix))
+            continue;
+        if (strlen(ns->mnt[i].prefix) != bestlen)
+            continue;
+        if (k++ == nth)
+            return &ns->mnt[i];
+    }
+    return 0;                           /* the union has no nth member */
 }
 
 /* Resolve a name to the server that answers for it, and to the name that
@@ -211,7 +265,7 @@ static struct mount *longest_match(struct namespace *ns, const char *path)
    crossed on the way. */
 #define RESOLVE_HOPS 4
 
-int vfs_resolve(const char *path, char *out, int cap)
+int vfs_resolve(const char *path, char *out, int cap, int nth)
 {
     char buf[VFS_PATH_MAX];
     int n = 0;
@@ -223,7 +277,11 @@ int vfs_resolve(const char *path, char *out, int cap)
 
     struct namespace *ns = cur_ns();
     for (int hop = 0; hop < RESOLVE_HOPS; hop++) {
-        struct mount *m = longest_match(ns, buf);
+        /* The choice among a union's members is made once, at the name the
+           caller actually asked for. Anything reached by following a bind
+           from there takes that name's first answer — nesting unions inside
+           unions is a generality this does not need and could not explain. */
+        struct mount *m = nth_match(ns, buf, hop == 0 ? nth : 0);
         if (!m)
             return -1;                          /* nothing bound over it */
         if (m->kind == MNT_SERVER) {

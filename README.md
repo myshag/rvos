@@ -349,6 +349,8 @@ $ read the fs server's private data region
 27. `bind` as Plan 9 means it — a name onto a name — which deletes the
     machinery stage 26 needed to work around not having it
 28. `unmount`, and namespaces that come back when the task holding one dies
+29. union mounts: `bind -a` / `-b`, two directories appearing as one, and the
+    search for which member has a name
 
 ## Loading a program
 
@@ -1467,19 +1469,82 @@ rvos# mounts
 
 Ten runs of a program that clones a namespace and exits leave it at 3.
 
+### Two names, one directory
+
+`bind -a` and `bind -b` join a name instead of replacing it, and the name then
+has more than one answer. Plan 9's flags, spelled the same way:
+
+```
+rvos# ls
+HELLO.TXT  (54 bytes)
+README.TXT  (105 bytes)
+HELLO.ELF  (6888 bytes)
+
+rvos# bind -a /proc/ /
+rvos# ls
+HELLO.TXT  (54 bytes)
+README.TXT  (105 bytes)
+HELLO.ELF  (6888 bytes)
+tasks                      <- the same directory, second member
+mounts
+pagetable
+
+rvos# cat /tasks           <- the filesystem does not have this file
+0  blocked  fs
+1  blocked  console
+2  running  proc  (me)
+```
+
+`cat /README.TXT` still comes off the disk and `cat /tasks` comes from the
+proc server, and neither the shell nor either server knows the other is there.
+`bind -b` puts the new member first, which is visible immediately: the listing
+starts with the proc entries instead of ending with them.
+
+**The search is in the client, not the kernel**, and that is the design
+decision worth stating. "Which member has this name" cannot be answered by
+looking at the mount table: the kernel holds the table but not the files, and
+only an *open* can tell. So `vfs_resolve` gained a member index — give it 0, 1,
+2 and it hands back successive candidates — and `vfs_open` walks them until
+one succeeds. Plan 9 does this search in the kernel because the kernel holds
+channels; here the equivalent place is the library where `open` already lives.
+
+Opening a file takes the first member that has it; listing a directory takes
+all of them, which is the one place a program has to know a union exists. In
+the shell that is `ls` versus `cat`, and `/proc/` had to learn to list itself,
+because a directory that will not say what is in it is no use in a union.
+
+**A property was repealed.** The previous stage filled an unmounted hole with
+the last entry in the table, on the grounds that resolution is
+longest-prefix-wins and the order of the table has never meant anything. That
+was true when it was written and stopped being true here: order is now the
+order a union is searched in, and swapping one entry past another would
+silently reorder it. `unmount` shifts, and takes the whole union at that name
+at once — Plan 9's `unmount(nil, old)`:
+
+```
+rvos# unmount /
+rvos# ls
+rsh: cannot open /
+```
+
 ### What it still is not
+
+The choice among a union's members is made once, at the name the caller asked
+for; anything reached by following a bind from there takes that name's first
+answer. Unions inside unions are a generality this does not need and could not
+explain.
 
 Plan 9 evaluates `old` at bind time and holds the resulting channel, so
 rebinding what `old` refers to afterwards does not disturb the bind. This
 stores the string and re-resolves it on every open, which is simpler and
 observably different: rebind `/net/tcp/0` and everything bound onto it moves.
-There is no union mount (`MAFTER`/`MBEFORE`), and eight mounts per namespace
-is a hard ceiling with no error a program is likely to check.
+Eight mounts per namespace is a hard ceiling with no error a program is likely
+to check.
 
 ## Next steps
 
-- union mounts, so two directories can appear as one — the piece of Plan 9's
-  namespace that is still missing
+- `old` held as a channel rather than re-resolved as a string, so rebinding
+  what a bind points at does not move everything bound onto it
 - `wait()`, so `run` can return when the program does, and job control so a
   program that never exits does not have to be left running blind
 - `poll`/`select`, or a second task per connection — either would let `netd`

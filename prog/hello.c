@@ -58,7 +58,7 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
         if (sys_nsclone() < 0) {
             hputs("  [hello] no private namespace left\n");
         } else {
-            sys_bind("/", "/mine");
+            sys_bind("/", "/mine", MREPL);
             hputs("  [hello] cloned a namespace, bound /mine, exiting\n");
         }
         sys_exit();

@@ -229,7 +229,8 @@ void syscall_dispatch(uint64 num)
     case SYS_RESOLVE: {
         char kpath[VFS_PATH_MAX], kout[VFS_PATH_MAX];
         copy_string_in(current->ctx.x[10], kpath, VFS_PATH_MAX);
-        int srv = vfs_resolve(kpath, kout, VFS_PATH_MAX);
+        int srv = vfs_resolve(kpath, kout, VFS_PATH_MAX,
+                              (int)current->ctx.x[13]);
         uint64 out = current->ctx.x[11];
         int    cap = (int)current->ctx.x[12];
         if (srv >= 0 && out) {
@@ -295,14 +296,16 @@ void syscall_dispatch(uint64 num)
     case SYS_MOUNT: {
         char kp[VFS_PREFIX_MAX];
         copy_string_in(current->ctx.x[10], kp, VFS_PREFIX_MAX);
-        current->ctx.x[10] = (uint64)(long)vfs_mount(kp, (int)current->ctx.x[11]);
+        current->ctx.x[10] = (uint64)(long)
+            vfs_mount(kp, (int)current->ctx.x[11], (int)current->ctx.x[12]);
         break;
     }
     case SYS_BIND: {
         char kold[VFS_PATH_MAX], knew[VFS_PREFIX_MAX];
         copy_string_in(current->ctx.x[10], kold, VFS_PATH_MAX);
         copy_string_in(current->ctx.x[11], knew, VFS_PREFIX_MAX);
-        current->ctx.x[10] = (uint64)(long)vfs_bind(kold, knew);
+        current->ctx.x[10] = (uint64)(long)
+            vfs_bind(kold, knew, (int)current->ctx.x[12]);
         break;
     }
     case SYS_NSCLONE:

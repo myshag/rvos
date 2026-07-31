@@ -55,15 +55,21 @@ struct vfs_req {
 
 struct namespace;
 
-int vfs_mount(const char *prefix, int server_task); /* a server behind a name */
-int vfs_bind(const char *old, const char *new);    /* `new` means `old` now */
-int vfs_unmount(const char *name);                 /* undo either of them */
+/* Plan 9's three: replace what is at that name, or join it — before what is
+   there, or after. Joining is a union: the name then has several answers and
+   a lookup tries them in order until one has what was asked for. */
+enum { MREPL = 0, MBEFORE, MAFTER };
+
+int vfs_mount(const char *prefix, int server_task, int flags);
+int vfs_bind(const char *old, const char *new, int flags);
+int vfs_unmount(const char *name);                 /* the whole union of it */
 int vfs_ns_clone(void);                             /* private copy of it */
 void vfs_ns_gc(void);        /* release namespaces no live task refers to */
 int  vfs_ns_inuse(void);     /* how many of VFS_NNS are taken */
-/* -> the server that answers, and in `out` the name to ask it about, which
-   differs from `path` if a bind was crossed. -1 if nothing is bound over it. */
-int vfs_resolve(const char *path, char *out, int cap);
+/* -> the server that answers for the `nth` member of whatever union is at
+   that name, and in `out` the name to ask it about, which differs from `path`
+   if a bind was crossed. -1 once the union has no nth member. */
+int vfs_resolve(const char *path, char *out, int cap, int nth);
 int vfs_dump_mounts_of(int task_id, char *out, int cap);
 struct namespace *vfs_root_ns(void);
 
@@ -96,22 +102,38 @@ static inline int vfs_call(int dst, struct vfs_req *r)
     return r->result;
 }
 
-static inline int vfs_open(const char *path)
+/* Open a name on a server that has already been chosen. Split out because a
+   union has to be walked: the caller resolves candidate 0, 1, 2 … and asks
+   each in turn. */
+static inline int vfs_open_at(int srv, const char *real)
 {
-    /* Resolution answers two questions at once now: who serves this name, and
-       what name to serve. They are different questions as soon as a bind is
-       involved — /dev/console may be a connection, and the server on the far
-       end has never heard of /dev/console. */
-    char real[VFS_PATH_MAX];
-    int srv = sys_resolve(path, real, (int)sizeof(real));
-    if (srv < 0)
-        return -1;                      /* nothing bound over this path */
     struct vfs_req r;
     r.op = VFS_OPEN;
     vfs__scpy(r.path, real);
     if (vfs_call(srv, &r) < 0)
         return -1;
     return (srv << 16) | (r.result & 0xffff);
+}
+
+/* Resolution answers two questions at once: who serves this name, and what
+   name to serve — different questions as soon as a bind is involved, since
+   /dev/console may be a connection and the server on the far end has never
+   heard of that name.
+
+   With a union there is a third: *which* of them has it. The search is here,
+   in the client, rather than in the kernel, because only an open can answer
+   it — the kernel holds the table but not the files. */
+static inline int vfs_open(const char *path)
+{
+    char real[VFS_PATH_MAX];
+    for (int nth = 0; ; nth++) {
+        int srv = sys_resolve(path, real, (int)sizeof(real), nth);
+        if (srv < 0)
+            return -1;                  /* no more members: nobody has it */
+        int fd = vfs_open_at(srv, real);
+        if (fd >= 0)
+            return fd;
+    }
 }
 
 static inline int vfs_read(int fd, void *buf, int len)
