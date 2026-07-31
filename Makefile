@@ -42,12 +42,23 @@ DRIVE   := -drive file=$(DISK),if=none,format=raw,id=hd0 \
 # driver speaks virtio 1.x, so the transport has to be the modern one.
 # hostfwd is what makes the guest reachable at all: QEMU's user-mode network
 # is a NAT, so nothing on the host can open a connection inward unless a port
-# is forwarded. localhost:5555 becomes 10.0.2.15:7 — the port /NETD.ELF takes
-# once you start it — and localhost:5556 becomes port 23, where the shell is
-# listening from boot. `nc localhost 5556` is a login.
+# is forwarded. 5555 becomes 10.0.2.15:7 — the port /BIN/NETD.ELF takes once
+# you start it — 5556 becomes port 23, where the shell listens from boot, and
+# 5564 becomes 564, where /BIN/EXPORTFS.ELF hands out the namespace.
+#
+# HOSTIP is the address they listen on, and the default is not decoration.
+# Writing `hostfwd=tcp::5556-:23`, with the host address left empty, binds to
+# every interface — which on a machine with a public address and no firewall
+# puts an unauthenticated shell, and a filesystem anyone may write to, on the
+# internet. It did, here, for about a day. Override it deliberately:
+#
+#   make run HOSTIP=100.95.222.7      # a private overlay address
+#   make run HOSTIP=0.0.0.0           # everybody, and you mean it
+HOSTIP  ?= 127.0.0.1
 QFLAGS  := -machine virt -cpu rv64,sstc=true -bios none -nographic \
            -global virtio-mmio.force-legacy=false -kernel $(ELF) \
-           -netdev user,id=n0,hostfwd=tcp::5555-:7,hostfwd=tcp::5556-:23,hostfwd=tcp::5564-:564 \
+           -netdev user,id=n0,hostfwd=tcp:$(HOSTIP):5555-:7,\
+hostfwd=tcp:$(HOSTIP):5556-:23,hostfwd=tcp:$(HOSTIP):5564-:564 \
            -device virtio-net-device,netdev=n0 $(DRIVE)
 
 .PHONY: all run rundisk runpcap disk prog clean
