@@ -80,6 +80,11 @@ enum {
        a while, but it burns a slice per check and a shell running a command
        spends all its time there. */
     SYS_WAIT    = 23,     /* a0 = task id -> 0 when it has exited */
+    /* recv, but from one named task and nobody else. A reply is not an event:
+       whoever sent a request knows who owes the answer, and taking the next
+       message from anybody is not a race but a wrong answer. Anything from
+       another sender stays queued. */
+    SYS_RECVFROM = 24,   /* a0 = sender, a1 = buffer, a2 = cap */
 };
 
 /* sys_recv() returns this instead of a task id when what arrived was an
@@ -250,8 +255,17 @@ static inline int sys_alive(int task_id)
     return (int)_ecall1(SYS_ALIVE, task_id);
 }
 
-/* Blocks until a message arrives; returns the sender's task id. */
+/* Blocks until a message arrives from anybody; returns the sender's task id,
+   or IRQ_SENDER / TIMER_SENDER. What a server and a driver wait on. */
 static inline int sys_recv(void *buf, int len)
 {
     return (int)_ecall2(SYS_RECV, (long)buf, len);
+}
+
+/* Blocks until *that* task sends. -1 if it is already gone, or dies while
+   this is waiting — otherwise a client whose server died would wait for ever
+   with somebody else's message queued behind it. */
+static inline int sys_recv_from(int src, void *buf, int len)
+{
+    return (int)_ecall3(SYS_RECVFROM, src, (long)buf, len);
 }

@@ -95,12 +95,23 @@ void task_retire(struct task *t)
     t->waiting_recv = 0;
     /* Anyone waiting for this task has been waiting for exactly this. Done
        before the id is retired, since that is what they named. */
-    for (int i = 0; i < NTASK; i++)
+    for (int i = 0; i < NTASK; i++) {
         if (tasks[i].state == T_BLOCKED && tasks[i].wait_for == t->id) {
             tasks[i].wait_for  = 0;
             tasks[i].ctx.x[10] = 0;
             tasks[i].state     = T_RUNNABLE;
         }
+        /* And anyone blocked waiting to hear from it in particular. A closed
+           receive is the one wait that can be aimed at a task that then
+           disappears, and it has to fail rather than last for ever. */
+        if (tasks[i].state == T_BLOCKED && tasks[i].waiting_recv &&
+            tasks[i].recv_closed && tasks[i].recv_from == t->id) {
+            tasks[i].waiting_recv = 0;
+            tasks[i].recv_closed  = 0;
+            tasks[i].ctx.x[10]    = (uint64)-1;
+            tasks[i].state        = T_RUNNABLE;
+        }
+    }
 
     vm_free_task(t);                    /* also clears t->pt */
     t->state = T_UNUSED;

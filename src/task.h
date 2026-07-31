@@ -46,6 +46,11 @@ struct task {
     uint64 recv_va;             /* blocked receiver: where it wants one */
     int    recv_len;
     int    waiting_recv;        /* 1 => blocked in recv (vs. blocked in send) */
+    /* A closed receive: waiting for one particular sender and nobody else.
+       Anything from anyone else stays queued instead of being taken for the
+       answer this task is waiting for. */
+    int    recv_closed;
+    int    recv_from;
     int    irq_pending;         /* a device it drives fired while it was busy */
     uint64 dma_next;            /* next free VA in its DMA window */
     uint64 alarm_at;            /* absolute time to wake it, 0 = no alarm */

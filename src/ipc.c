@@ -30,12 +30,35 @@ static void enqueue_sender(struct task *recv, struct task *snd)
     }
 }
 
-static struct task *dequeue_sender(struct task *recv)
+/* The head of the queue for an open receive, or the first entry from a named
+   sender for a closed one — which has to unlink from the middle, because
+   everybody else stays where they are. That is the whole point: a message
+   nobody asked for is kept, not consumed. */
+static struct task *dequeue_sender(struct task *recv, int closed, int want)
 {
-    struct task *s = recv->wait_sender;
-    if (s)
-        recv->wait_sender = s->send_next;
-    return s;
+    struct task *s = recv->wait_sender, *prev = 0;
+    while (s) {
+        if (!closed || s->id == want) {
+            if (prev)
+                prev->send_next = s->send_next;
+            else
+                recv->wait_sender = s->send_next;
+            s->send_next = 0;
+            return s;
+        }
+        prev = s;
+        s = s->send_next;
+    }
+    return 0;
+}
+
+/* Is this receiver waiting for *us*? A task parked in a closed receive is
+   blocked, but not available to anyone it did not name. */
+static int wants(struct task *dst, struct task *src)
+{
+    if (dst->state != T_BLOCKED || !dst->waiting_recv)
+        return 0;
+    return !dst->recv_closed || dst->recv_from == src->id;
 }
 
 /* Move a message from one address space to the other, truncating to whatever
@@ -80,7 +103,7 @@ static void ipc_send(int nonblock)
         return;
     }
 
-    if (dst->state == T_BLOCKED && dst->waiting_recv) {
+    if (wants(dst, current)) {
         /* Receiver is parked in recv(): copy straight across and free both. */
         if (deliver(current, sva, slen, dst, dst->recv_va, dst->recv_len) < 0) {
             A0(current) = -1;
@@ -88,6 +111,7 @@ static void ipc_send(int nonblock)
         }
         A0(dst)           = current->id;    /* recv() returns the sender id */
         dst->waiting_recv = 0;
+        dst->recv_closed  = 0;
         dst->state        = T_RUNNABLE;
         A0(current)       = 0;
         return;
@@ -108,26 +132,42 @@ static void ipc_send(int nonblock)
     schedule();
 }
 
-/* SYS_RECV: a0 = buffer address, a1 = capacity. Returns sender id in a0. */
-static void ipc_recv(void)
-{
-    uint64 rva  = A0(current);
-    int    rlen = (int)A1(current);
+/* SYS_RECV:     a0 = buffer, a1 = capacity          -> sender id
+   SYS_RECVFROM: a0 = sender,  a1 = buffer, a2 = cap -> that sender, or -1
 
-    /* An interrupt that arrived while we were busy outranks queued messages:
-       the device is masked until it is acked. */
-    if (current->irq_pending) {
+   The closed form exists because a *reply* is not an event. A client that has
+   sent a request knows exactly who owes it an answer, and taking the next
+   message from anybody is not a race — it is answering the wrong question.
+   The open form stays what a server and a driver need: three kinds of event,
+   one call. */
+static void ipc_recv(int closed)
+{
+    uint64 rva  = closed ? A1(current) : A0(current);
+    int    rlen = (int)(closed ? A2(current) : A1(current));
+    int    want = closed ? (int)A0(current) : 0;
+
+    if (closed) {
+        /* Naming a task that no longer exists is an error, not a wait. */
+        if (!task_by_id(want)) {
+            A0(current) = (uint64)-1;
+            return;
+        }
+    } else if (current->irq_pending) {
+        /* An interrupt that arrived while we were busy outranks queued
+           messages: the device is masked until it is acked. A closed receive
+           leaves both flags alone — they are sticky, and the next open
+           receive will find them. */
         current->irq_pending = 0;
         A0(current) = (uint64)(long)IRQ_SENDER;
         return;
     }
-    if (current->timer_pending) {
+    if (!closed && current->timer_pending) {
         current->timer_pending = 0;
         A0(current) = (uint64)(long)TIMER_SENDER;
         return;
     }
 
-    struct task *s = dequeue_sender(current);
+    struct task *s = dequeue_sender(current, closed, want);
     if (s) {
         /* A sender was already parked: complete the rendezvous now. */
         if (deliver(s, s->send_va, s->send_len, current, rva, rlen) < 0) {
@@ -143,6 +183,8 @@ static void ipc_recv(void)
     current->recv_va      = rva;
     current->recv_len     = rlen;
     current->waiting_recv = 1;
+    current->recv_closed  = closed;
+    current->recv_from    = want;
     current->state        = T_BLOCKED;
     schedule();
 }
@@ -151,9 +193,10 @@ static void ipc_recv(void)
 int ipc_syscall(uint64 num)
 {
     switch (num) {
-    case SYS_SEND:    ipc_send(0); return 1;
-    case SYS_TRYSEND: ipc_send(1); return 1;
-    case SYS_RECV: ipc_recv(); return 1;
+    case SYS_SEND:     ipc_send(0); return 1;
+    case SYS_TRYSEND:  ipc_send(1); return 1;
+    case SYS_RECV:     ipc_recv(0); return 1;
+    case SYS_RECVFROM: ipc_recv(1); return 1;
     default:       return 0;
     }
 }

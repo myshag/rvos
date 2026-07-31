@@ -375,6 +375,7 @@ $ read the fs server's private data region
 36. enough of the telnet protocol to be talked to by `telnet`
 37. VFAT long names: UTF-16 on disk, UTF-8 in the system, and quotes in the
     shells because a file can have a space in it now
+38. a closed receive, because a reply is not an event
 
 ## Loading a program
 
@@ -2187,6 +2188,64 @@ UTF-8, and one longer is refused rather than quietly shortened. Case folding
 is ASCII-only, which is exactly what a FAT volume promises: `Файл.txt` and
 `файл.txt` are two names.
 
+## A reply is not an event
+
+`sys_recv` blocks until *anybody* sends and reports who it was, and in the
+kernel that is literally "take the head of the queue". It is open, and for the
+two things it was written for that is not a choice but a definition: a server
+does not know who will ask next, and the design went further and made the same
+call report interrupts and alarms as well — three kinds of event, one blocking
+primitive. That is why this system has no `poll`. `sys_recv` *is* the poll,
+and the network driver has waited on a card, a clock and its clients in one
+place since stage 16.
+
+The mistake was somewhere else, in the client library every program includes:
+
+```c
+static inline int vfs_call(int dst, struct vfs_req *r)
+{
+    sys_send(dst, r, sizeof *r);
+    sys_recv(r, sizeof *r);        /* the next message, from anybody */
+    return r->result;
+}
+```
+
+That is not waiting for an event. It is waiting for a **reply**, and a reply
+has a sender that is known in advance. Taking something else is not a race; it
+is an answer to a different question.
+
+The assumption underneath — *the next message to arrive is mine* — holds only
+while a task has at most one thing outstanding and is not itself a server.
+Every task satisfied that until `import`, which holds a read parked on the
+network while sending to it; and a shell that serves its children's console
+breaks it thoroughly, which is how an attempt at that turned into four
+separate failures with one cause.
+
+```c
+SYS_RECVFROM    /* a0 = sender, a1 = buffer, a2 = cap */
+```
+
+Three changes make it work, and each of them is about *not consuming* things:
+
+- `dequeue_sender` takes the head for an open receive and searches for a named
+  one otherwise, **unlinking from the middle** — everybody else stays where
+  they were. A message nobody asked for is kept, not thrown away;
+- `ipc_send` grows a filter. A task parked in a closed receive is blocked, but
+  not available to anyone it did not name, so a sender parks instead of being
+  delivered. That also makes `sys_trysend` mean the right thing for a server
+  answering a request it parked earlier;
+- the interrupt and timer flags are sticky, and a closed receive leaves them
+  alone. The next open receive finds them.
+
+The buffering that all of this needed turned out to be in the kernel already.
+`wait_sender` has been there since stage 3; it was simply always drained from
+the head.
+
+And the hazard the primitive introduces is closed in the same breath: a closed
+receive can name a task that then dies, so `task_retire` wakes anyone waiting
+to hear from it with -1. Without that, a client of a server that crashed would
+wait for ever with somebody else's message queued behind it.
+
 ## Next steps
 - each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
@@ -2194,6 +2253,9 @@ is ASCII-only, which is exactly what a FAT volume promises: `Файл.txt` and
 - more than one request in flight per connection: the tag is already there
 - `old` held as a channel rather than re-resolved as a string, so rebinding
   what a bind points at does not move everything bound onto it
+- a pseudo-terminal: the shell serving its children's `/dev/console`, so that
+  output is ordered and line endings are added in one place. It was attempted
+  before the closed receive existed and failed four different ways
 - redirection, which in this system wants to be a bind rather than a `>`
 - `poll`/`select`, or a second task per connection — either would let `netd`
   serve more than one caller at a time

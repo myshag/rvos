@@ -105,7 +105,12 @@ static inline int vfs_call(int dst, struct vfs_req *r)
        leave this task blocked for ever on a reply that cannot come. */
     if (sys_send(dst, r, (int)sizeof(*r)) < 0)
         return r->result = -1;
-    sys_recv(r, (int)sizeof(*r));
+    /* From that server and nobody else. This used to be an open receive, and
+       the assumption underneath it — that the next message to arrive is my
+       reply — held only while a task had one thing outstanding and was not
+       itself a server. It is not an assumption any more. */
+    if (sys_recv_from(dst, r, (int)sizeof(*r)) < 0)
+        return r->result = -1;
     return r->result;
 }
 
