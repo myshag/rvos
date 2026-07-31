@@ -2855,7 +2855,8 @@ precisely because it knows every reference. C's contract forbids both.
 
 What there is instead is coalescing: when a block comes back, it is joined to
 its free neighbours. `/BIN/FRAG.ELF` is what that is worth, and what it is
-not:
+not. This is what it printed when the heap was one free list and every object
+carried a header:
 
 ```
 at rest                    taken 4K    free 3K    in 1 pieces    largest 4064
@@ -2887,6 +2888,77 @@ go, everything joins up again and the heap falls back to a single page. The
 memory was never lost, only unusable while something small was standing in
 the middle of it.
 
+### Size classes: what the modern ones do instead of moving
+
+jemalloc, tcmalloc, mimalloc and the glibc allocator do not defragment. They
+arrange for the fragmentation not to happen, by never letting two different
+sizes share a page. Small objects come from a **run**: one page carved into
+slots of a single size, with a free list threaded through the empty ones. A
+forty-eight byte object and a kilobyte object are then not neighbours and
+cannot wedge each other, because they are not in the same page.
+
+```c
+struct mrun {
+    struct mrun *next;          /* the next run of this class with room */
+    void        *slots;         /* free slots, threaded through themselves */
+    unsigned short cls, used;
+};
+```
+
+Everything at or under 512 bytes is rounded up to one of sixteen sizes — 16,
+32, 48 … 384, 448, 512 — so nothing is rounded up by more than about an eighth
+of itself. Anything larger goes to the free list as before, which is right:
+the large allocations this system makes are a file, an ELF image, a TCP
+buffer, and they are few, long-lived, and freed in something close to the
+order they were taken.
+
+Two things follow that are not obvious until you build it.
+
+**A slot needs no header.** Where an object came from is a property of its
+page, not of the object, so `free` finds the run by masking off the low twelve
+bits of the pointer and asking a page map — one byte per page of heap, saying
+which class lives there, which is the same structure tcmalloc keeps under the
+same name. Sixty-four byte objects that cost eighty bytes each now cost
+sixty-four.
+
+**A run page is an ordinary block of the same pool**, not a separate arena. An
+empty run is given straight back to the free list, where it coalesces with its
+neighbours and is trimmed to the kernel like anything else. The alternative —
+a private pool of run pages — is simpler and gives up the thing that makes the
+last line of `frag` read the way it does.
+
+The same program, on the same three patterns:
+
+|                                   | one free list | size classes |
+|-----------------------------------|---------------|--------------|
+| 2000 × 64 bytes, in use           | 160K taken    | **132K** taken |
+| every second one freed            | 81K free in **1001** pieces | 1K free in **1** piece, 32 runs holding 63K spare |
+| 200 × (1K + 48B), the 1K ones freed | 203K free in **201** pieces, largest **1040** | 205K free in **4** pieces, largest **90112** |
+| …then asking for 64 KiB           | heap grew 216K → **284K** | heap stayed at **220K** |
+
+The row that matters is the last one. Two hundred kilobytes were free in both
+cases; only in the second was any of it usable. And the row above it is the
+mechanism: two hundred and one pieces became four, because the forty-eight
+byte objects that used to be standing between the holes are all in three pages
+of their own.
+
+Two mistakes, both worth keeping:
+
+*The page map was allocated through a size class.* A class needs a run, a run
+needs a page, a page needs a map entry, and the map needed a run — the
+allocator recursed until the filesystem server's stack ran eight bytes off the
+bottom of its last page. The fault was a store to `0x2fffbff8` in a task that
+had allocated nothing, which is as far from the mistake as a report can get.
+The map is taken from the large path now, and its smallest size is chosen to
+be past the last class so that it stays there.
+
+*The run page was given a block header in front of it.* That is the ordinary
+way to do aligned allocation, and here it meant a page could never be carved
+from the front of a freshly grown region — the first page always went to
+holding the header. Every run cost two pages, and the first line of the table
+read 260K instead of 132K. Run pages carry no header at all: the run knows its
+own address and its own size, which is everything `free` needs.
+
 ### The one thing an MMU could do here, and why it is not done
 
 Compaction is impossible, but *this* machine has an option a flat address
@@ -2900,19 +2972,13 @@ bits are free), and a rule that a dropped block is filled again before it is
 merged or handed out.
 
 It is not here because the measurement says it would recover nothing. The
-holes this system actually produces are of two kinds, and neither qualifies.
-The small ones — 80 bytes, 1040 bytes — do not contain a whole page. The large
-ones are at the end of the heap, where the tail trim already returns them:
-opening a 60000-byte file twice and closing it twice leaves the free-page
-count at 11985 both times, so the filesystem server's high-water mark is not
-permanent and there is nothing to reclaim. A feature that recovers nothing on
-any workload the system has is a feature with a demonstration and no purpose.
-
-The honest summary is that this heap is not fragmenting because of what it is
-asked for: a whole file, an ELF image, two TCP buffers, the text in an editor
-— few, large, long-lived, and freed in something close to the order they were
-taken. The pattern that breaks it is in `frag`, and `frag` is the only program
-that performs it.
+holes this system produces are of two kinds and neither qualifies. The small
+ones do not contain a whole page. The large ones are at the end of the heap,
+where the tail trim already returns them: opening a 60000-byte file twice and
+closing it twice leaves the free-page count unchanged, so the filesystem
+server's high-water mark is not permanent and there is nothing to reclaim. A
+feature that recovers nothing on any workload the system has is a
+demonstration, not a feature.
 
 
 ## Next steps

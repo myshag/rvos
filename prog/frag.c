@@ -24,14 +24,17 @@ static void pad_to(const char *s, int cols)
 
 static void line(const char *what)
 {
-    unsigned long taken, idle, big; int pieces;
-    malloc_stat(&taken, &idle, &pieces, &big);
+    struct mstat st;
+    malloc_stat(&st);
     say(what);
     pad_to(what, 26);
-    say(" taken "); sayn(taken / 1024);
-    say("K  free "); sayn(idle / 1024);
-    say("K  in "); sayn((unsigned long)pieces);
-    say(" pieces  largest "); sayn(big); say("\n");
+    say(" taken "); sayn(st.taken / 1024);
+    say("K  free "); sayn(st.idle / 1024);
+    say("K  in "); sayn((unsigned long)st.pieces);
+    say(" pieces  largest "); sayn(st.largest);
+    say("  runs "); sayn((unsigned long)st.runs);
+    say(" ("); sayn(st.run_free / 1024); say("K spare)");
+    say("\n");
 }
 
 #define N 2000
