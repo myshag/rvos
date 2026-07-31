@@ -173,6 +173,66 @@ static inline int vfs_open(const char *path)
     }
 }
 
+/* The names in a directory that no server put there.
+
+   A listing comes from whichever server answers for the directory, and that
+   server has never heard of the mount table: /proc is not on the FAT16 volume
+   and the filesystem is right not to mention it. Only the client knows what
+   has been grafted where, because the namespace is the client's — so the
+   client is where the two halves of a directory are joined. Plan 9 does this
+   in its kernel, where its mount table lives; here the table is in the kernel
+   but the walking of it has always been out in the library, and this is that
+   same rule applied to reading a directory rather than to opening a file.
+
+   The answer is in the ordinary listing shape, "d 0 NAME", so that a caller
+   can feed it to the parser it already has. */
+static inline int vfs_mounts_in(const char *dir, char *out, int cap)
+{
+    char buf[512];
+    int n = sys_mounts(-1, buf, (int)sizeof(buf));
+    if (n <= 0)
+        return 0;
+
+    char d[VFS_PATH_MAX];
+    int  dl = 0;
+    while (dir[dl] && dl < VFS_PATH_MAX - 1) { d[dl] = dir[dl]; dl++; }
+    while (dl > 1 && d[dl - 1] == '/') dl--;        /* "/dev/" and "/dev" */
+    d[dl] = 0;
+
+    int o = 0, i = 0;
+    while (i < n && o < cap - VFS_PREFIX_MAX - 8) {
+        int s = i;
+        while (i < n && buf[i] != '\n') i++;
+        int e = i;
+        if (i < n) i++;
+
+        int pe = s;                                 /* the prefix ends at " -> " */
+        while (pe < e && buf[pe] != ' ') pe++;
+        while (pe > s + 1 && buf[pe - 1] == '/') pe--;
+
+        const char *P = buf + s;
+        int plen = pe - s, cut = -1;
+        for (int k = 0; k < plen; k++)
+            if (P[k] == '/') cut = k;
+        if (cut < 0 || cut == plen - 1)
+            continue;                               /* "/" names nothing in "/" */
+        int parent = cut ? cut : 1;                 /* the parent of /dev is / */
+        if (parent != dl)
+            continue;
+        int same = 1;
+        for (int k = 0; k < dl; k++)
+            if (P[k] != d[k]) { same = 0; break; }
+        if (!same)
+            continue;
+
+        out[o++] = 'd'; out[o++] = ' '; out[o++] = '0'; out[o++] = ' ';
+        for (int k = cut + 1; k < plen; k++)
+            out[o++] = P[k];
+        out[o++] = '\n';
+    }
+    return o;
+}
+
 static inline int vfs_read(int fd, void *buf, int len)
 {
     struct vfs_req r;

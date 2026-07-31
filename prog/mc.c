@@ -71,9 +71,39 @@ static void colours(void)
 
 /* ---- reading a directory ---------------------------------------------- */
 
-/* The listing is regular — "<type> <size> <name>" — so this needs no rules:
-   two fields, then everything to the end of the line is the name, spaces and
-   all. That is why the format was changed before this program was written. */
+/* One line of a listing. Two fields and then the name to the end of the line,
+   spaces and all, which is a shape that needs no rules — and why the format
+   was changed before this program was written. */
+static void take(struct panel *p, const char *line)
+{
+    if ((line[0] != 'd' && line[0] != '-') || p->n >= MAXENT)
+        return;
+    struct ent e;
+    e.isdir = line[0] == 'd';
+    const char *q = line + 2;
+    unsigned long sz = 0;
+    while (*q >= '0' && *q <= '9')
+        sz = sz * 10 + (unsigned long)(*q++ - '0');
+    e.size = sz;
+    if (*q == ' ')
+        q++;
+    int j = 0;
+    while (*q && j < NAMEW - 1)
+        e.name[j++] = *q++;
+    e.name[j] = 0;
+    /* A directory's entry for itself is on the disk and is noise in a panel;
+       the one for its parent is how you leave. */
+    if (!e.name[0] || (e.name[0] == '.' && e.name[1] == 0))
+        return;
+    /* A mount point the server also knows about is one name, not two. */
+    for (int i = 0; i < p->n; i++)
+        if (peq(p->e[i].name, e.name))
+            return;
+    /* pcpy, not an assignment: a struct copy becomes a call to memcpy, and
+       there is no libc under a program on this disk. */
+    pcpy(&p->e[p->n++], &e, (int)sizeof(e));
+}
+
 static void load(struct panel *p)
 {
     p->n = 0;
@@ -99,28 +129,26 @@ static void load(struct panel *p)
             }
             line[k] = 0;
             k = 0;
-            if ((line[0] != 'd' && line[0] != '-') || p->n >= MAXENT)
-                continue;
-            struct ent *e = &p->e[p->n];
-            e->isdir = line[0] == 'd';
-            const char *q = line + 2;
-            unsigned long sz = 0;
-            while (*q >= '0' && *q <= '9')
-                sz = sz * 10 + (unsigned long)(*q++ - '0');
-            e->size = sz;
-            if (*q == ' ')
-                q++;
-            int j = 0;
-            while (*q && j < NAMEW - 1)
-                e->name[j++] = *q++;
-            e->name[j] = 0;
-            /* A directory's entry for itself is on the disk and is noise in a
-               panel; the one for its parent is how you leave. */
-            if (e->name[0] && !(e->name[0] == '.' && e->name[1] == 0))
-                p->n++;
+            take(p, line);
         }
     }
     vfs_close(fd);
+
+    /* And the names the namespace grafted into this directory, which the
+       server that answered for it has never heard of. */
+    char extra[512];
+    int n = vfs_mounts_in(p->path, extra, (int)sizeof(extra));
+    k = 0;
+    for (int i = 0; i < n; i++) {
+        if (extra[i] != '\n') {
+            if (k < (int)sizeof(line) - 1)
+                line[k++] = extra[i];
+            continue;
+        }
+        line[k] = 0;
+        k = 0;
+        take(p, line);
+    }
 }
 
 /* "/DOCS" + "NOTE.TXT" -> "/DOCS/NOTE.TXT", and "/" + anything has no extra

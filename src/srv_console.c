@@ -72,6 +72,24 @@ static int ring_get(void)
 static int             waiter = -1;
 static struct vfs_req  waiting;
 
+/* Two things are open-able here and they could not be less alike: the console
+   itself, and the directory it lives in. Reading the first waits for a key;
+   reading the second must not, or `ls /dev` hangs the shell until somebody
+   presses one — which is what it did. */
+#define CON_FD_TTY 0
+#define CON_FD_DIR 1
+
+static const char con_dir[] = "- 0 console\n";
+static int con_dir_pos;
+
+/* "/dev" and "/dev/" name the directory; anything else under it is the
+   console, because there is nothing else under it. */
+static int is_dev_dir(const char *p)
+{
+    return p[0] == '/' && p[1] == 'd' && p[2] == 'e' && p[3] == 'v' &&
+           (p[4] == 0 || (p[4] == '/' && p[5] == 0));
+}
+
 void console_server(void)
 {
     uputs("  [console] up (user mode), UART driven by interrupts\n");
@@ -109,7 +127,12 @@ void console_server(void)
         struct vfs_req *r = &req;
         switch (r->op) {
         case VFS_OPEN:
-            r->result = 0;                      /* one stream, local fd 0 */
+            if (is_dev_dir(r->path)) {
+                con_dir_pos = 0;
+                r->result = CON_FD_DIR;
+            } else {
+                r->result = CON_FD_TTY;         /* one stream, local fd 0 */
+            }
             break;
         case VFS_WRITE: {
             for (int i = 0; i < r->len && i < VFS_DATA_MAX; i++)
@@ -118,6 +141,16 @@ void console_server(void)
             break;
         }
         case VFS_READ: {
+            if (r->fd == CON_FD_DIR) {
+                int n = (int)sizeof(con_dir) - 1 - con_dir_pos;
+                if (n > r->len) n = r->len;
+                if (n < 0) n = 0;
+                for (int i = 0; i < n; i++)
+                    r->data[i] = con_dir[con_dir_pos + i];
+                con_dir_pos += n;
+                r->result = n;
+                break;
+            }
             int c = ring_get();
             if (c >= 0) {
                 r->data[0] = (char)c;

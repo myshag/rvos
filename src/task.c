@@ -314,6 +314,8 @@ void syscall_dispatch(uint64 num)
         int    tid = (int)current->ctx.x[10];
         uint64 out = current->ctx.x[11];
         int    cap = (int)current->ctx.x[12];
+        if (tid < 0)
+            tid = current->id;          /* -1: mine, whoever I turn out to be */
         int n = vfs_dump_mounts_of(tid, kbuf, (int)sizeof(kbuf));
         if (n > cap) n = cap;
         if (n > 0)

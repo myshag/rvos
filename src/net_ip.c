@@ -2099,6 +2099,45 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
     return 1;
 }
 
+/* Is this path exactly `name`, with or without a trailing slash? A directory
+   answers to both spellings, because a person types one and a program that
+   joins a name onto a prefix produces the other. */
+static int net_is_name(const char *p, const char *name)
+{
+    int i = 0;
+    while (name[i] && p[i] == name[i])
+        i++;
+    if (name[i])
+        return 0;
+    return p[i] == 0 || (p[i] == '/' && p[i + 1] == 0);
+}
+
+/* What is in /net, and what is in /net/tcp. The same two-fields-then-a-name
+   shape the filesystem uses, because a listing is a listing and `ls` should
+   not have to know which server produced it. A connection appears here the
+   moment it exists, which makes `ls /net/tcp` the shortest way to ask what
+   this machine is talking to. */
+static int net_dir(const char *path, char *out, int cap)
+{
+    int o = 0;
+    if (net_is_name(path, "/net")) {
+        const char *fixed = "- 0 ctl\n- 0 status\nd 0 tcp\n";
+        while (fixed[o] && o < cap - 1) { out[o] = fixed[o]; o++; }
+        return o;
+    }
+    for (int i = 0; i < NTCB && o < cap - 24; i++) {
+        if (tcbs[i].state == T_FREE)
+            continue;
+        out[o++] = '-';
+        out[o++] = ' ';
+        out[o++] = '0';
+        out[o++] = ' ';
+        o += uutoa((unsigned long)i, out + o);
+        out[o++] = '\n';
+    }
+    return o;
+}
+
 int net_vfs(int from, struct vfs_req *r)
 {
     reap_dead_clients();
@@ -2106,8 +2145,15 @@ int net_vfs(int from, struct vfs_req *r)
 
     switch (r->op) {
     case VFS_OPEN: {
-        int base = -1;
-        if (ustr_has_prefix(r->path, "/net/status"))
+        int base = -1, dir = 0;
+        /* The directories first: "/net/tcp/0" begins with "/net/tcp" and the
+           order of these tests is the difference between a connection and a
+           listing of them. */
+        if (net_is_name(r->path, "/net") || net_is_name(r->path, "/net/tcp")) {
+            base = FD_STATUS0;
+            dir  = 1;
+        }
+        else if (ustr_has_prefix(r->path, "/net/status"))
             base = FD_STATUS0;
         else if (ustr_has_prefix(r->path, "/net/ctl"))
             base = FD_CTL0;
@@ -2121,7 +2167,10 @@ int net_vfs(int from, struct vfs_req *r)
                     pfd[i].off   = 0;
                     /* The status file is rendered once, here: what the caller
                        reads is the system as it was when it opened it. */
-                    pfd[i].len   = base == FD_STATUS0
+                    pfd[i].len   = dir
+                                 ? net_dir(r->path, pfd[i].buf,
+                                           (int)sizeof(pfd[i].buf))
+                                 : base == FD_STATUS0
                                  ? net_status(pfd[i].buf, (int)sizeof(pfd[i].buf))
                                  : 0;
                     r->result = base + i;

@@ -2981,6 +2981,79 @@ feature that recovers nothing on any workload the system has is a
 demonstration, not a feature.
 
 
+## Why `ls /` did not show /proc
+
+Because nothing was wrong, and that is the interesting part.
+
+`ls /` asks whichever server answers for `/` — the filesystem — and gets back
+what is in the FAT16 root directory. `/proc` is not there. It is not anywhere
+on the volume, and the filesystem server is right not to mention it: it has
+never heard of it. The name exists in the **mount table**, which belongs to
+the task doing the asking, and a listing had no way of saying so.
+
+That is a real gap and not a cosmetic one. A namespace whose names cannot be
+enumerated is a namespace you have to already know about, which is the
+opposite of what "everything is a file" is for.
+
+Three things were wrong underneath it, and they are worth taking in order.
+
+**`/proc` was not a name.** The servers are mounted at `/dev/`, `/proc/`,
+`/net/` — with the slash — and `prefix_matches` required the path to *start*
+with the prefix, so `/proc/` resolved and `/proc` did not. `cat /proc/` worked
+and `cat /proc` said "cannot open". A prefix ending in a slash now also
+matches the name without it, because that is what a person types and what
+joining a directory to a name produces.
+
+**A server did not list its own directory.** `/proc` had a listing already —
+"a directory that will not say what is in it is no use in a union", as the
+comment there says. `/net` had none, and `/dev` had something worse: opening
+it opened the console, so `ls /dev` blocked the shell until somebody pressed a
+key and then printed the keystroke. The console server now answers a read of
+`/dev` with `- 0 console` and keeps the keyboard for the console itself. The
+network server answers `/net` with `ctl`, `status` and `tcp`, and `/net/tcp`
+with one entry per live connection — which makes `ls /net/tcp` the shortest
+way to ask what this machine is talking to.
+
+**The mount points had to be merged in by the client.** This is the one with a
+design in it. The kernel holds the mount table but not the files; the servers
+hold the files but not the table. Plan 9 joins them in its kernel, where its
+mount table lives. Here the table is in the kernel and the *walking* of it has
+always been in the library — the union search in `vfs_open` is a client-side
+loop over `sys_resolve(path, …, nth)` for exactly that reason. So the merge
+belongs in the same place:
+
+```c
+/* the names in a directory that no server put there */
+static inline int vfs_mounts_in(const char *dir, char *out, int cap);
+```
+
+It asks the kernel for the caller's own mount table (`sys_mounts(-1, …)` — a
+task can now ask about itself without knowing its number), keeps the prefixes
+whose parent is the directory being listed, and returns them in the ordinary
+`d 0 NAME` shape so that a caller can feed them to the parser it already has.
+`ls` and `mc` each gained six lines and a check against printing a name twice,
+which `/dev/console` in the sandbox namespace would otherwise do.
+
+```
+rvos$ ls
+HELLO.TXT  (54 bytes)      rvos$ ls /net        rvos$ ls /net/tcp
+README.TXT  (105 bytes)    ctl  (0 bytes)       1  (0 bytes)
+DOCS/                      status  (0 bytes)
+BIN/                       tcp/
+dev/
+proc/
+net/
+```
+
+The panels show them too, and browsing into `/net` from `mc` works the way
+browsing into `/DOCS` does, which is the whole claim of the thing being made
+good on: the network is a directory, and now it is one you can find without
+being told.
+
+`ping /` is unchanged at 111–114 µs a message — resolution grew one string
+comparison and it does not show.
+
+
 ## Next steps
 - the menu bar in `mc` is a picture of a menu; pulling it down needs windows
   that remember what was under them, which is `panel(3)` and a cell array per

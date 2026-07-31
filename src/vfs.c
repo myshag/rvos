@@ -198,10 +198,19 @@ int vfs_bind(const char *old, const char *new, int flags)
    "/dev/", and "/" itself — already end at a boundary by construction. */
 static int prefix_matches(const char *path, const char *prefix)
 {
-    if (!str_has_prefix(path, prefix))
-        return 0;
     size_t l = strlen(prefix);
     if (l == 0)
+        return 0;
+
+    /* A server mounted at "/proc/" owns the directory as well as everything
+       in it, and "/proc" is what a person types. Without this the name
+       existed only with the slash on the end, which nothing else in the
+       system requires and no listing showed. */
+    if (prefix[l - 1] == '/' && strlen(path) == l - 1 &&
+        str_has_prefix(prefix, path))
+        return 1;
+
+    if (!str_has_prefix(path, prefix))
         return 0;
     if (prefix[l - 1] == '/')
         return 1;

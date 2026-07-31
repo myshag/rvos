@@ -164,6 +164,8 @@ static inline int sys_taskinfo(int idx, struct taskinfo *out)
 {
     return (int)_ecall2(SYS_TASKINFO, idx, (long)out);
 }
+/* task_id < 0 asks about the caller's own namespace, which is the only one a
+   program can be sure of the number of. */
 static inline int sys_mounts(int task_id, char *out, int cap)
 {
     return (int)_ecall3(SYS_MOUNTS, task_id, (long)out, cap);
