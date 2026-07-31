@@ -2378,18 +2378,28 @@ trip is waiting for one, which would be worth chasing.
 ## Two panels, in colour
 
 ```
- /                                       /BIN
- HELLO.TXT                          54  /..
- README.TXT                        105   CAT.ELF                          5608
-/DOCS                                    CP.ELF                           5792
-/BIN                                     ECHO.ELF                         5256
-                                         EXPORTFS.ELF                     8776
-                                         GET.ELF                          6528
-                                         MC.ELF                          12872
-
- /BIN/CAT.ELF
- arrows move  tab panel  enter open  v view  c copy  k delete  r reread  q quit
+  Left  File  Command  Options  Right
+┌─ / ──────────────────────────────────┐┌─ /BIN ───────────────────────────────┐
+│ Name                         Size    ││ Name                         Size    │
+│ HELLO.TXT                          54││/..                           DIR     │
+│ README.TXT                        105││ CAT.ELF                          5608│
+│/DOCS                         DIR     ││ CP.ELF                           5792│
+│/BIN                          DIR     ││ ECHO.ELF                         5256│
+│                                      ││ EXPORTFS.ELF                     8776│
+│                                      ││ FREE.ELF                         5400│
+│                                      ││ GET.ELF                          6528│
+└─ HELLO.TXT ──────────────────────────┘└─ .. ─────────────────────────────────┘
+Hint: everything here is a file, including this.
+/$
+1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit
 ```
+
+Blue panels, cyan frames, white directories, green programs, the cursor black
+on cyan. It is a copy of a program from 1994, and the copying is not
+decoration: a frame, a header and a footer are three more things the eye can
+find without reading, and the key strip along the bottom is the only
+documentation a full-screen program ever gets to show. Arrows and Tab move,
+Enter opens, and F3 F5 F7 F8 F10 do what the strip says they do.
 
 `/BIN/MC.ELF` is an ordinary program on the disk. It opens `/dev/console` and
 reads and writes it; it opens directories and reads them. Those are the same
@@ -2449,16 +2459,47 @@ screen is built in a buffer and sent in a handful of calls — and that is the
 first place in this project where the number from `bench` changed how
 something was written rather than merely describing it.
 
+### Asking the terminal how big it is
+
+A framed screen has to know where its edges are, and there is nobody in this
+system to ask: no window manager, no `TIOCGWINSZ`, and the console server
+counts bytes rather than columns. So the program asks the *terminal*, in the
+terminal's own language, and it asks twice:
+
+```c
+/* telnet's answer, if this is telnet: IAC DO NAWS, and the client sends the
+   size now and again whenever the window changes */
+"\xff\xfd\x1f"
+/* and the answer any terminal can give: go as far right and down as you can,
+   then report where that turned out to be */
+"\x1b[999;999H\x1b[6n\x1b[H"
+```
+
+The first arrives as a subnegotiation, the second as `ESC [ h ; w R` through
+the same keyboard the arrow keys come through — so both are handled in
+`getkey`, next to the arrows, and a resize is just another key (`K_RESIZE`,
+which redraws). Neither can hang: if nothing answers, 80×24 stands, which is
+what the serial line does. Checked at 80×24 and at 58×22, and the frames close
+in both.
+
+The mistake that cost the most time here was not in the program. Its output
+looked one column short in my own test harness, and the harness was a
+byte-per-cell renderer — every box character is three bytes, and it was
+charging three columns for each. The guest was right and the tool was wrong,
+which is worth remembering the *next* time something only looks broken.
+
 ### What it does not do
 
-It assumes 80×24. Telnet carries the real size in the NAWS subnegotiation,
-which this skips whole. It cannot run anything: a program loaded from the disk
-cannot start another, because `spawn` lives in the shared user text of the
-kernel image — so the panels can copy, delete and view, and the shell is still
-where you run things. And one session at a time, which by now is a familiar
-sentence.
+It cannot run anything: a program loaded from the disk cannot start another,
+because `spawn` lives in the shared user text of the kernel image — so the
+panels can copy, delete, make directories and view, and the shell is still
+where you run things. The menu bar along the top is painted, not wired; the
+keys under it are the ones on the strip. And one session at a time, which by
+now is a familiar sentence.
 
 ## Next steps
+- the menu bar in `mc` is a picture of a menu; pulling it down needs a way to
+  draw over the panels and put them back
 - each driver mapped only its own virtio slot, which needs a device tree
 - authentication on `exportfs`, without which none of the above should be
   pointed at a network anybody else is on

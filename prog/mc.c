@@ -34,12 +34,17 @@
    usage: /BIN/MC.ELF [left] [right]                                       */
 #include "lib.h"
 
-#define COLS   80
-#define ROWS   24
-#define PANEW  39                       /* two panels and a gap */
-#define LISTH  18                       /* rows of entries */
+/* Measured if the terminal will say, and assumed if it will not. Assuming
+   was not a harmless simplification: on a narrower screen the right panel ran
+   past the edge, wrapped, and overwrote the left panel's names on the line
+   below — a display that is wrong rather than merely cramped. */
 #define MAXENT 48
 #define NAMEW  64
+
+static int term_w = 80, term_h = 24;
+
+#define PANEW (((term_w) - 1) / 2)      /* two panels and a gap between */
+#define LISTH ((term_h) - 6)
 
 struct ent {
     char          name[NAMEW];
@@ -191,14 +196,34 @@ static void go_up(struct panel *p)
     load(p);
 }
 
-/* ---- drawing --------------------------------------------------------- */
+/* ---- drawing ----------------------------------------------------------
+   The look is Midnight Commander's, and copying it is not decoration: a panel
+   with a frame, a header and a footer is three more things the eye can find,
+   and the function-key strip along the bottom is the only documentation a
+   full-screen program gets to show.
+
+   Colour here is a *background* as much as a foreground. Every row is painted
+   to its full width, because a row that stops short leaves the terminal's own
+   background showing through and the panel stops looking like a panel. */
 
 #define C_RESET  "\x1b[0m"
-#define C_DIR    "\x1b[1;34m"
-#define C_PROG   "\x1b[1;32m"
-#define C_HEAD   "\x1b[1;44;37m"
-#define C_SEL    "\x1b[7m"
-#define C_KEYS   "\x1b[1;46;30m"
+#define B_PANEL  "\x1b[44;37m"          /* white on blue: the panel itself */
+#define B_FRAME  "\x1b[44;1;36m"        /* its border */
+#define B_DIR    "\x1b[44;1;37m"        /* a directory, bright */
+#define B_PROG   "\x1b[44;1;32m"        /* something runnable */
+#define B_SEL    "\x1b[46;30m"          /* the cursor: black on cyan */
+#define B_HEADC  "\x1b[44;1;33m"        /* the column titles */
+#define B_BAR    "\x1b[46;30m"          /* the menu and the key strip */
+#define B_HOT    "\x1b[46;1;33m"        /* the letter you press */
+#define B_NUM    "\x1b[47;30m"          /* the number on a key */
+#define B_STAT   "\x1b[40;37m"
+
+#define TL "┌"
+#define TR "┐"
+#define BL "└"
+#define BR "┘"
+#define HZ "─"
+#define VT "│"
 
 static int is_prog(const char *n)
 {
@@ -208,110 +233,205 @@ static int is_prog(const char *n)
            n[k - 2] == 'L' && n[k - 1] == 'F';
 }
 
-/* Pad to a width in *characters*, counting UTF-8 lead bytes only: a
-   continuation byte is not a column. */
-static int cells(const char *s, int max)
+/* Columns, not bytes: a UTF-8 continuation byte occupies no space on screen,
+   so anything that pads has to count lead bytes. */
+static int put_trim(const char *s, int max)
 {
-    int n = 0;
-    for (int i = 0; s[i] && n < max; i++)
+    int shown = 0;
+    for (int i = 0; s[i] && shown < max; i++) {
+        char c[2] = { s[i], 0 };
+        put(c);
         if (((unsigned char)s[i] & 0xC0) != 0x80)
-            n++;
-    return n;
+            shown++;
+    }
+    return shown;
 }
 
-static void draw_panel(int idx, int col)
+static void pad(int n)
+{
+    while (n-- > 0)
+        put(" ");
+}
+
+static void repeat(const char *g, int n)
+{
+    while (n-- > 0)
+        put(g);
+}
+
+static void num_into(char *out, unsigned long v)
+{
+    char t[24];
+    int k = 0, j = 0;
+    if (!v) t[k++] = '0';
+    while (v) { t[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k) out[j++] = t[--k];
+    out[j] = 0;
+}
+
+#define SIZEW 8
+
+static void draw_panel(int idx, int col, int w)
 {
     struct panel *p = &pan[idx];
+    int inner = w - 2;
 
-    at(1, col);
-    put(C_HEAD);
-    int w = 0;
+    /* Top frame, with the path let into it. */
+    at(2, col);
+    put(B_FRAME);
+    put(TL);
+    put(HZ);
+    put(B_PANEL " ");
+    int used = 2 + 1 + put_trim(p->path, inner - 4);
+    put(" " B_FRAME);
+    used += 1;
+    repeat(HZ, w - used - 1);
+    put(TR);
+
+    /* Column titles. */
+    at(3, col);
+    put(B_FRAME VT B_HEADC);
+    int nw = inner - SIZEW - 1;
+    int k = put_trim(" Name", nw);
+    pad(nw - k);
     put(" ");
-    w++;
-    for (const char *q = p->path; *q && w < PANEW - 1; q++) {
-        char c[2] = { *q, 0 };
-        put(c);
-        if (((unsigned char)*q & 0xC0) != 0x80)
-            w++;
-    }
-    while (w < PANEW) { put(" "); w++; }
-    put(C_RESET);
+    k = put_trim("Size", SIZEW);
+    pad(SIZEW - k);
+    put(B_FRAME VT);
 
     for (int r = 0; r < LISTH; r++) {
-        at(2 + r, col);
+        at(4 + r, col);
+        put(B_FRAME VT);
         int i = p->top + r;
         if (i >= p->n) {
-            for (int k = 0; k < PANEW; k++)
-                put(" ");
+            put(B_PANEL);
+            pad(inner);
+            put(B_FRAME VT);
             continue;
         }
         struct ent *e = &p->e[i];
         int selected = (i == p->sel && idx == active);
-        if (selected)
-            put(C_SEL);
-        else if (e->isdir)
-            put(C_DIR);
-        else if (is_prog(e->name))
-            put(C_PROG);
-
+        put(selected ? B_SEL : e->isdir ? B_DIR : is_prog(e->name) ? B_PROG
+                                                                   : B_PANEL);
         put(e->isdir ? "/" : " ");
-        int used = 1;
-        int nw = cells(e->name, PANEW - 12);
-        for (int k = 0, shown = 0; e->name[k] && shown < nw; k++) {
-            char c[2] = { e->name[k], 0 };
-            put(c);
-            if (((unsigned char)e->name[k] & 0xC0) != 0x80)
-                shown++;
-        }
-        used += nw;
-        char num[24];
-        int  nl = 0;
-        {
-            unsigned long v = e->size;
-            char t[24];
-            int  tk = 0;
-            if (!v) t[tk++] = '0';
-            while (v) { t[tk++] = (char)('0' + v % 10); v /= 10; }
-            while (tk) num[nl++] = t[--tk];
-            num[nl] = 0;
-        }
-        int pad = PANEW - used - nl - 1;
-        for (int k = 0; k < pad; k++)
-            put(" ");
-        if (e->isdir)
-            put(" ");
-        else
-            put(num);
+        int shown = 1 + put_trim(e->name, nw - 1);
+        pad(nw - shown);
         put(" ");
-        put(C_RESET);
+        if (e->isdir) {
+            k = put_trim("DIR", SIZEW);
+        } else {
+            char num[24];
+            num_into(num, e->size);
+            int l = 0;
+            while (num[l]) l++;
+            pad(SIZEW - l);
+            put(num);
+            k = SIZEW;
+        }
+        pad(SIZEW - k);
+        put(B_FRAME VT);
     }
+
+    /* Bottom frame, carrying what the cursor is on — MC's mini-status. */
+    at(term_h - 3, col);
+    put(B_FRAME);
+    put(BL);
+    put(HZ);
+    if (p->n) {
+        put(B_PANEL " ");
+        used = 2 + 1 + put_trim(p->e[p->sel].name, inner - 4);
+        put(" " B_FRAME);
+        used += 1;
+    } else {
+        used = 2;
+    }
+    repeat(HZ, w - used - 1);
+    put(BR);
+}
+
+/* " Left  File  Command  Options  Right", with the letter you press in
+   yellow — which is how the original tells you there is a menu without
+   spending a line explaining it. */
+static void draw_menu(void)
+{
+    static const char *items[] = { "Left", "File", "Command", "Options",
+                                   "Right", 0 };
+    at(1, 1);
+    put(B_BAR);
+    int used = 0;
+    for (int i = 0; items[i]; i++) {
+        put("  ");
+        used += 2;
+        put(B_HOT);
+        char c[2] = { items[i][0], 0 };
+        put(c);
+        put(B_BAR);
+        used += 1 + put_trim(items[i] + 1, term_w - used - 3);
+        if (used > term_w - 4)
+            break;
+    }
+    pad(term_w - used);
+}
+
+static void draw_keys(void)
+{
+    static const char *lab[] = { "Help", "Menu", "View", "Edit", "Copy",
+                                 "RenMov", "Mkdir", "Delete", "PullDn",
+                                 "Quit" };
+    at(term_h, 1);
+    int used = 0;
+    for (int i = 0; i < 10; i++) {
+        char n[4];
+        num_into(n, (unsigned long)(i + 1));
+        int nl = 0;
+        while (n[nl]) nl++;
+        int labl = 0;
+        while (lab[i][labl]) labl++;
+        if (used + nl + labl + 1 > term_w)
+            break;
+        put(B_NUM);
+        put(n);
+        put(B_BAR);
+        put_trim(lab[i], labl);
+        used += nl + labl;
+        if (used < term_w) { put(B_BAR " "); used++; }
+    }
+    put(B_BAR);
+    pad(term_w - used);
+    put(C_RESET);
 }
 
 static void draw(const char *msg)
 {
     scrlen = 0;
     put("\x1b[H");
-    draw_panel(0, 1);
-    draw_panel(1, PANEW + 2);
+    draw_menu();
 
-    at(ROWS - 2, 1);
-    put("\x1b[K");
+    int lw = term_w / 2;
+    draw_panel(0, 1, lw);
+    draw_panel(1, lw + 1, term_w - lw);
+
+    /* Hint, then the line a command line would live on. */
+    at(term_h - 2, 1);
+    put(B_STAT);
     struct panel *p = &pan[active];
+    int used = 0;
     if (msg) {
-        put(msg);
-    } else if (p->n) {
-        put(p->path);
-        if (p->path[0] && p->path[1])
-            put("/");
-        put(p->e[p->sel].name);
+        used = put_trim(msg, term_w);
+    } else {
+        used = put_trim("Hint: everything here is a file, including this.",
+                        term_w);
     }
+    pad(term_w - used);
 
-    at(ROWS, 1);
-    put(C_KEYS);
-    put(" arrows move  tab panel  enter open  v view  c copy  k delete  "
-        "r reread  q quit ");
-    put(C_RESET);
-    at(ROWS - 1, 1);
+    at(term_h - 1, 1);
+    put(B_STAT);
+    used = put_trim(p->path, term_w - 2);
+    used += put_trim("$ ", 2);
+    pad(term_w - used);
+
+    draw_keys();
+    at(term_h - 1, used + 1);
     flush();
 }
 
@@ -321,7 +441,9 @@ static void draw(const char *msg)
 #define K_DOWN  1001
 #define K_RIGHT 1002
 #define K_LEFT  1003
-#define K_EOF   (-1)
+#define K_EOF    (-1)
+#define K_RESIZE 1004
+#define K_F      1100   /* K_F + n is Fn */
 
 static int rawbyte(void)
 {
@@ -332,15 +454,25 @@ static int rawbyte(void)
     return (unsigned char)c;
 }
 
-/* One key. Escape sequences become one code; telnet's own bytes are eaten
-   here, because over a connection they arrive mixed into the same stream and
-   this program is the one reading it. */
+static void set_size(int w, int h)
+{
+    if (w >= 40 && w <= 300)
+        term_w = w;
+    if (h >= 10 && h <= 100)
+        term_h = h;
+}
+
+/* One key. Three other things arrive in the same stream and are swallowed
+   here: telnet's negotiations, telnet's window-size subnegotiation, and the
+   terminal's answer to "where is the cursor" — which is how a screen that
+   speaks no telnet still says how wide it is. */
 static int getkey(void)
 {
     for (;;) {
         int c = rawbyte();
         if (c == K_EOF)
             return K_EOF;
+
         if (c == 255) {                 /* IAC */
             int b = rawbyte();
             if (b == K_EOF)
@@ -352,38 +484,87 @@ static int getkey(void)
                     return K_EOF;
                 continue;
             }
-            if (b == 250) {             /* a subnegotiation, to its end */
-                int prev = 0;
+            if (b == 250) {             /* SB … IAC SE */
+                int opt = rawbyte();
+                int p[8], np = 0, prev = 0;
                 for (;;) {
                     int k = rawbyte();
                     if (k == K_EOF)
                         return K_EOF;
                     if (prev == 255 && k == 240)
                         break;
+                    if (k != 255 && np < 8)
+                        p[np++] = k;
                     prev = k;
                 }
+                if (opt == 31 && np >= 4)   /* NAWS: width then height */
+                    set_size((p[0] << 8) | p[1], (p[2] << 8) | p[3]);
+                continue;
             }
             continue;
         }
+
         if (c != 27)
             return c;
+
         int b = rawbyte();
         if (b == K_EOF)
             return K_EOF;
         if (b != '[' && b != 'O')
             return 27;
-        int d = rawbyte();
-        if (d == K_EOF)
-            return K_EOF;
+
+        /* Collect the parameters, then act on the final byte. */
+        int p[4] = { 0, 0, 0, 0 }, np = 0;
+        int d;
+        for (;;) {
+            d = rawbyte();
+            if (d == K_EOF)
+                return K_EOF;
+            if (d >= '0' && d <= '9') {
+                if (np < 4)
+                    p[np] = p[np] * 10 + (d - '0');
+                continue;
+            }
+            if (d == ';') {
+                if (np < 3)
+                    np++;
+                continue;
+            }
+            break;
+        }
         switch (d) {
         case 'A': return K_UP;
         case 'B': return K_DOWN;
         case 'C': return K_RIGHT;
         case 'D': return K_LEFT;
+        case 'R':                       /* the cursor is at row;col */
+            set_size(p[1], p[0]);
+            return K_RESIZE;
+        /* A strip along the bottom promising F3 and F5 has to mean it. xterm
+           sends the first four function keys as ESC O P Q R S and the rest as
+           ESC [ n ~; other terminals send the whole run in the second form.
+           F3 is missing from the first list on purpose — ESC O R and the
+           cursor report end in the same letter, and the report is the one
+           this program cannot do without. Terminals that send F3 the other
+           way still get it. */
+        case 'P': return K_F + 1;
+        case 'Q': return K_F + 2;
+        case 'S': return K_F + 4;
+        case '~':
+            switch (p[0]) {
+            case 11: return K_F + 1;
+            case 12: return K_F + 2;
+            case 13: return K_F + 3;
+            case 14: return K_F + 4;
+            case 15: return K_F + 5;
+            case 17: return K_F + 6;
+            case 18: return K_F + 7;
+            case 19: return K_F + 8;
+            case 20: return K_F + 9;
+            case 21: return K_F + 10;
+            default: continue;
+            }
         default:
-            /* Anything else with a numeric tail: swallow to its final byte. */
-            while (d >= '0' && d <= '9')
-                d = rawbyte();
             continue;
         }
     }
@@ -395,10 +576,10 @@ static void view(const char *path)
 {
     scrlen = 0;
     put("\x1b[2J\x1b[H");
-    put(C_HEAD);
+    put(B_BAR);
     put(" ");
     put(path);
-    put(" — any key to return ");
+    put("  — any key to return ");
     put(C_RESET);
     put("\r\n");
     flush();
@@ -425,6 +606,53 @@ static void view(const char *path)
         vfs_close(fd);
     }
     getkey();
+}
+
+/* A line of text, typed into the status row. The terminal is in character
+   mode by now, so this program does its own echo and its own backspace —
+   which is what a line discipline is, and there is not one here. */
+static int prompt(const char *label, char *out, int cap)
+{
+    int k = 0;
+    for (;;) {
+        scrlen = 0;
+        at(term_h - 2, 1);
+        put(B_STAT);
+        int used = put_trim(label, term_w);
+        used += put_trim(out, term_w - used - 1);
+        pad(term_w - used);
+        at(term_h - 2, used + 1);
+        flush();
+
+        int c = getkey();
+        if (c == K_EOF || c == 27)
+            return -1;
+        if (c == 13 || c == 10)
+            return k;
+        if ((c == 8 || c == 127) && k > 0) {
+            out[--k] = 0;
+            continue;
+        }
+        if (c >= 32 && c < 256 && k < cap - 1) {
+            out[k++] = (char)c;
+            out[k] = 0;
+        }
+    }
+}
+
+static void do_mkdir(struct panel *p)
+{
+    char name[64];
+    name[0] = 0;
+    if (prompt(" new directory: ", name, (int)sizeof(name)) <= 0) {
+        draw(0);
+        return;
+    }
+    char full[VFS_PATH_MAX];
+    join(full, p->path, name);
+    int r = vfs_ioctl_path(full, IOCTL_MKDIR);
+    load(p);
+    draw(r < 0 ? " mkdir refused" : " made it");
 }
 
 static void confirm_delete(struct panel *p)
@@ -516,6 +744,12 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
     raw_mode(1);
     scrlen = 0;
     put("\x1b[2J\x1b[?25l");             /* clear, and hide the cursor */
+    if (telnet)
+        put("\xff\xfd\x1f");            /* IAC DO NAWS: tell me your size */
+    /* And the way that works on any terminal, telnet or not: drive the cursor
+       past the far corner, where it stops at the real one, and ask where it
+       is. Neither question blocks — if nothing answers, 80x24 stands. */
+    put("\x1b[999;999H\x1b[6n\x1b[H");
     flush();
     draw(0);
 
@@ -523,7 +757,7 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
         int k = getkey();
         struct panel *p = &pan[active];
 
-        if (k == K_EOF || k == 'q')
+        if (k == K_EOF || k == 'q' || k == K_F + 10)
             break;
         if (k == 9) {                    /* tab */
             active ^= 1;
@@ -556,22 +790,29 @@ __attribute__((section(".text.start"))) void _start(int argc, char **argv)
                     put("\x1b[2J");
                 }
             }
-        } else if (k == 'v') {
+        } else if (k == 'v' || k == K_F + 3) {
             if (p->n && !p->e[p->sel].isdir) {
                 char full[VFS_PATH_MAX];
                 join(full, p->path, p->e[p->sel].name);
                 view(full);
                 put("\x1b[2J");
             }
-        } else if (k == 'c') {
+        } else if (k == 'c' || k == K_F + 5) {
             copy_over();
             continue;
-        } else if (k == 'k') {
+        } else if (k == 'k' || k == K_F + 8) {
             confirm_delete(p);
+            continue;
+        } else if (k == K_F + 7) {
+            do_mkdir(p);
             continue;
         } else if (k == 'r') {
             load(&pan[0]);
             load(&pan[1]);
+        } else if (k == K_RESIZE) {
+            scrlen = 0;
+            put("\x1b[2J");              /* the shape changed under us */
+            flush();
         }
         draw(0);
     }
