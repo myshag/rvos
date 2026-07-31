@@ -329,6 +329,8 @@ $ read the fs server's private data region
     an RTO measured rather than guessed, and congestion control
 22. blocking reads as a server declining to answer; `/net/ctl`, and a program
     on the disk that owns a port and serves callers itself
+23. `resolve` and a blocking `connect`; the HTTP fetch leaves the stack and
+    becomes `/GET.ELF`, a program that names its own host
 
 ## Loading a program
 
@@ -991,6 +993,80 @@ rendezvous — a real system needs the kernel to tell a sender that its
 destination is gone. There is no `poll`, so a program that wants to wait on
 two things at once cannot; `netd` handles one caller at a time for exactly
 that reason.
+
+## Fetching a page, from the operating system
+
+The stack reached the outside world at stage 20, but it was the stack that
+decided to: the host name was a `#define` in `net_ip.c`, the request was a
+string literal next to the TCP state machine, and the reply was printed by the
+code that reassembled it. That was the last policy left inside the protocol
+layer, and it is gone now.
+
+Two more `/net/ctl` commands were what it took:
+
+| command | answer |
+|---------|--------|
+| `resolve <name>` | `ok <a.b.c.d>`, when the resolver replies |
+| `connect <a.b.c.d> <port>` | `ok <slot>`, when the handshake finishes |
+
+Both wait, for the same reason a read waits: there is nothing useful to do
+with a name that has not resolved or a connection that is not up, and telling
+a program otherwise only invites it to poll. `resolve` also gave DNS the one
+thing it had been missing — UDP does not retransmit, so a question with no
+answer needs a timer of its own, and it now shares the alarm with everything
+else.
+
+`prog/get.c` is then the whole of an HTTP client:
+
+```c
+ctl("resolve example.com", answer);   /* -> ok 172.66.147.243  */
+ctl("connect 172.66.147.243 80", answer);  /* -> ok 2          */
+fd = vfs_open("/net/tcp/2");
+vfs_write(fd, "GET / HTTP/1.0\r\nHost: ...\r\nConnection: close\r\n\r\n", n);
+while ((n = vfs_read(fd, buf, sizeof buf)) > 0)  say(buf);
+```
+
+It has no timers, no retry logic and no polling loop, because those live in
+the stack; and it has no notion of ethernet, ARP or sequence numbers, because
+those do too. HTTP/1.0 with an explicit close means the far end ends the body
+by hanging up, so the program does not need to understand content length
+either — `read` returning 0 is the whole protocol.
+
+```
+rvos$ /GET.ELF example.com
+  [get] resolving example.com
+  dns: who is example.com?
+  dns: it is at 172.66.147.243
+  tcp: SYN -> 172.66.147.243:80
+  tcp: connection established
+  [get] request sent; reading the reply
+
+HTTP/1.1 200 OK
+Content-Type: text/html
+Server: cloudflare
+...
+<!doctype html><html lang="en"><head><title>Example Domain</title>...
+  [get] 829 bytes
+```
+
+The name is an argument, so a different one goes somewhere else — and doing
+that turned up the first thing on this project that loss recovery had to
+handle without being asked to:
+
+```
+rvos$ /GET.ELF neverssl.com
+  dns: it is at 34.223.124.45
+  tcp: SYN -> 34.223.124.45:80
+  tcp: timeout, retransmitting (attempt 1)
+  tcp: timeout, retransmitting (attempt 2)
+  tcp: timeout, retransmitting (attempt 3)
+  tcp: connection established
+```
+
+Nothing was deliberately dropped there. The initial retransmission timeout is
+300 ms and the path to that host is slower than that, so the backoff ran for
+real: 300, 600, 1200, and the connection came up on the fourth attempt. Up to
+this point every retransmission in this project had been staged.
 
 ## Next steps
 

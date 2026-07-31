@@ -23,7 +23,8 @@ ELF     := $(BUILD)/kernel.elf
 # the FAT16 volume and loaded at run time. Not part of kernel.elf.
 PROG    := $(BUILD)/hello.elf
 NETD    := $(BUILD)/netd.elf
-PROGS   := $(PROG) $(NETD)
+GET     := $(BUILD)/get.elf
+PROGS   := $(PROG) $(NETD) $(GET)
 PCFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany \
            -ffreestanding -nostdlib -fno-common -fno-builtin \
            -Wall -Wextra -Os -I$(SRCDIR)

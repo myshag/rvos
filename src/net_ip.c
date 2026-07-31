@@ -100,6 +100,16 @@ static uint16 l4_checksum(int proto, const uint8 *src, const uint8 *dst,
 
 static int ip_eq(const uint8 *a, const uint8 *b) { return umemcmp(a, b, 4) == 0; }
 
+/* A request that has been received but not answered. See "parking a request"
+   below: this is the whole of blocking I/O in this system. */
+struct parked {
+    int used;
+    int task;                     /* who is waiting */
+    int fd;
+    int len;                      /* how much they asked for */
+};
+
+
 /* Anything inside our own /24 is reached directly; everything else goes to
    the gateway. That test is the whole of routing here, and it is the reason a
    host address and a netmask are two different things. */
@@ -317,8 +327,17 @@ static int udp_send(const uint8 *dst, unsigned sport, unsigned dport,
 static const uint8 dns_ip[4] = { 10, 0, 2, 3 };   /* QEMU's resolver */
 #define DNS_PORT       53
 #define DNS_MY_PORT 30053    /* clear of the ephemeral range TCP draws from */
+#define DNS_TIMEOUT  1000    /* milliseconds before asking again */
+#define DNS_TRIES       3
 
+/* One question outstanding at a time, and the program that asked it is parked
+   until the answer comes back. UDP has no retransmission of its own, so this
+   is where "ask again" lives. */
 static unsigned dns_id;
+static struct parked dns_waiter;
+static char     dns_name[64];
+static uint64   dns_at;                 /* absolute ms; 0 = nothing pending */
+static int      dns_tries;
 
 /* "example.com" -> 7 'example' 3 'com' 0 */
 static int dns_encode(uint8 *o, const char *name)
@@ -339,7 +358,7 @@ static int dns_encode(uint8 *o, const char *name)
     return n;
 }
 
-static void dns_query(const char *name)
+static void dns_send(const char *name)
 {
     uint8 q[300];
     dns_id = (unsigned)(unow_ticks() & 0xffff);
@@ -352,8 +371,7 @@ static void dns_query(const char *name)
     int n = 12 + dns_encode(q + 12, name);
     put16(q + n, 1);  n += 2;      /* type A */
     put16(q + n, 1);  n += 2;      /* class IN */
-    if (udp_send(dns_ip, DNS_MY_PORT, DNS_PORT, q, n) < 0)
-        return;
+    udp_send(dns_ip, DNS_MY_PORT, DNS_PORT, q, n);
     net_puts("  dns: who is ");
     net_puts(name);
     net_puts("?\n");
@@ -372,16 +390,21 @@ static const uint8 *dns_skip(const uint8 *p, const uint8 *end)
     return end;
 }
 
-static void web_fetch(const uint8 *addr);        /* the demo, below */
+static void ctl_answer(struct parked *p, const char *text, const uint8 *ip);
+static void timers_rearm(void);
 
 static void dns_input(const uint8 *m, int len)
 {
-    if (len < 12 || get16(m) != dns_id)
+    if (len < 12 || get16(m) != dns_id || !dns_at)
         return;
     const uint8 *end = m + len;
     int qd = (int)get16(m + 4), an = (int)get16(m + 6);
     if ((get16(m + 2) & 0xf) != 0) {
         net_puts("  dns: the resolver returned an error\n");
+        dns_at = 0;
+        if (dns_waiter.used)
+            ctl_answer(&dns_waiter, "error no such name\n", 0);
+        timers_rearm();
         return;
     }
 
@@ -402,12 +425,19 @@ static void dns_input(const uint8 *m, int len)
             net_puts("  dns: it is at ");
             ip_puts(p);
             net_puts("\n");
-            web_fetch(p);
+            dns_at = 0;
+            if (dns_waiter.used)
+                ctl_answer(&dns_waiter, "ok ", p);
+            timers_rearm();
             return;
         }
         p += rdlen;                              /* a CNAME, most likely */
     }
     net_puts("  dns: no address in the answer\n");
+    dns_at = 0;
+    if (dns_waiter.used)
+        ctl_answer(&dns_waiter, "error no address\n", 0);
+    timers_rearm();
 }
 
 static void udp_input(const uint8 *ip, const uint8 *u, int len)
@@ -456,15 +486,6 @@ enum {
 static int seq_lt(uint32 a, uint32 b) { return (int32)(a - b) <  0; }
 static int seq_le(uint32 a, uint32 b) { return (int32)(a - b) <= 0; }
 static int seq_gt(uint32 a, uint32 b) { return (int32)(a - b) >  0; }
-
-/* A request that has been received but not answered. See "parking a request"
-   below: this is the whole of blocking I/O in this system. */
-struct parked {
-    int used;
-    int task;                     /* who is waiting */
-    int fd;
-    int len;                      /* how much they asked for */
-};
 
 struct tcb {
     int      state;
@@ -520,13 +541,14 @@ struct tcb {
     /* On a connection: a read waiting for bytes. On a listener: an accept
        waiting for somebody to call. */
     struct parked reader;
+    /* A connect waiting for the handshake to finish. Blocking connect is the
+       same idea as blocking read, and a program wants it for the same reason:
+       there is nothing useful to do with a connection that is not up yet. */
+    struct parked opener;
     int      accepted;            /* handed to a program by accept */
 
     int      fds;                 /* how many programs hold this open */
     int      is_client;           /* the one /net/tcp names */
-    int      http;                /* the demo fetch: ask on open, print what
-                                     comes back, and keep the queue drained so
-                                     the window never shuts */
 };
 
 static struct tcb tcbs[NTCB];
@@ -577,8 +599,6 @@ static uint32 gen_iss(void) { return (uint32)(unow_ticks() / 40); }
 
 static unsigned rcv_window(const struct tcb *c)
 {
-    if (c->http)
-        return RXQ;                     /* the demo reads as fast as it arrives */
     int free_space = RXQ - c->rxq_len;
     return (unsigned)(free_space > 0 ? free_space : 0);
 }
@@ -840,17 +860,12 @@ static void tcp_close(struct tcb *c)
    So a segment ahead of rcv_nxt is held aside, and every time the gap in
    front closes, the held segments that now fit are folded in. */
 
-static void demo_received(struct tcb *c, const uint8 *data, int dlen);
 
 /* Hand `len` bytes at rcv_nxt to whoever is reading. Returns how many were
    taken: fewer than offered means the read queue is full, and the peer will
    be told so by the window in the next acknowledgement. */
 static int rcv_accept(struct tcb *c, const uint8 *data, int len)
 {
-    if (c->http) {
-        demo_received(c, data, len);
-        return len;
-    }
     int room = RXQ - c->rxq_len;
     int n = len < room ? len : room;
     if (n > 0) {
@@ -923,9 +938,8 @@ static void rcv_data(struct tcb *c, uint32 seq, const uint8 *data, int len)
     if (seq == c->rcv_nxt) {
         int n = rcv_accept(c, data, len);
         c->rcv_nxt += (uint32)n;
-        if (!c->http)
-            net_putn("  tcp: received ", (unsigned long)n,
-                     " bytes, queued for readers\n");
+        net_putn("  tcp: received ", (unsigned long)n,
+                 " bytes, queued for readers\n");
         ooo_drain(c);
     } else {
         ooo_store(c, seq, data, len);
@@ -936,6 +950,7 @@ static void rcv_data(struct tcb *c, uint32 seq, const uint8 *data, int len)
 
 static void demo_opened(struct tcb *c);
 static void net_wakeups(void);       /* answer anyone whose wait is over */
+static void abort_waiters(struct tcb *c, const char *why);
 
 /* A segment for a connection that does not exist. RFC 793 is specific about
    what a reset carries: if the offending segment had an ACK, the reset takes
@@ -1119,6 +1134,7 @@ static void tcp_segment(const uint8 *sip, const uint8 *t, int seglen)
 
     if (flags & TCP_RST) {
         net_puts("  tcp: reset by peer\n");
+        abort_waiters(c, "error refused\n");
         tcb_free(c);
         timers_rearm();
         return;
@@ -1297,7 +1313,7 @@ static void tcp_input(const uint8 *sip, const uint8 *t, int seglen)
 
 static void timers_rearm(void)
 {
-    uint64 now = unow_ms(), best = 0;
+    uint64 now = unow_ms(), best = dns_at;
     for (int i = 0; i < NTCB; i++) {
         struct tcb *c = &tcbs[i];
         if (c->state == T_FREE)
@@ -1314,9 +1330,29 @@ static void timers_rearm(void)
     sys_alarm(best > now ? (int)(best - now) : 1);
 }
 
+/* A question with no answer. UDP will not ask again by itself, so this does —
+   which is the whole reason a resolver needs a timer at all. */
+static void dns_retry(uint64 now)
+{
+    if (!dns_at || dns_at > now)
+        return;
+    if (++dns_tries >= DNS_TRIES) {
+        net_puts("  dns: no answer\n");
+        dns_at = 0;
+        if (dns_waiter.used)
+            ctl_answer(&dns_waiter, "error no answer\n", 0);
+        return;
+    }
+    net_puts("  dns: no answer yet, asking again\n");
+    dns_send(dns_name);
+    dns_at = now + DNS_TIMEOUT;
+}
+
 void net_timeout(void)
 {
     uint64 now = unow_ms();
+
+    dns_retry(now);
 
     for (int i = 0; i < NTCB; i++) {
         struct tcb *c = &tcbs[i];
@@ -1333,6 +1369,7 @@ void net_timeout(void)
 
         if (++c->rt_tries > RTO_TRIES) {
             net_puts("  tcp: giving up after 5 retransmissions\n");
+            abort_waiters(c, "error unreachable\n");
             tcb_free(c);
             continue;
         }
@@ -1584,6 +1621,40 @@ static void reply_done(int task, int fd, int op, int result)
     net_reply(task, &r);
 }
 
+/* Put an answer into the ctl slot the caller will read next, and release the
+   write that asked. Every ctl command that cannot be answered on the spot —
+   resolve, connect, accept — comes back through here. */
+static void ctl_answer(struct parked *p, const char *text, const uint8 *ip)
+{
+    int pi = p->fd - FD_CTL0;
+    if (pi < 0 || pi >= NPFD) {
+        p->used = 0;
+        return;
+    }
+    char *o = pfd[pi].answer;
+    int   n = app(o, 0, text);
+    if (ip) {
+        n = app_ip(o, n, ip);
+        o[n++] = '\n';
+    }
+    pfd[pi].len = n;
+    pfd[pi].off = 0;
+
+    struct parked q = *p;
+    p->used = 0;
+    reply_done(q.task, q.fd, VFS_WRITE, q.len);
+}
+
+/* A connection that will never come up. Whoever was waiting on it has to be
+   told, before the block they are waiting on is wiped. */
+static void abort_waiters(struct tcb *c, const char *why)
+{
+    if (c->opener.used)
+        ctl_answer(&c->opener, why, 0);
+    if (c->reader.used)
+        reply_read(&c->reader, 0, 0);           /* end of file */
+}
+
 /* How much a reader may take now, and whether "nothing" means "wait". A
    connection whose peer has closed and whose queue is empty is at end of
    file, and a reader must be told so rather than parked for ever. */
@@ -1618,7 +1689,17 @@ static void net_wakeups(void)
 {
     for (int i = 0; i < NTCB; i++) {
         struct tcb *c = &tcbs[i];
-        if (c->state == T_FREE || !c->reader.used)
+        if (c->state == T_FREE)
+            continue;
+        if (c->opener.used && c->state != T_SYN_SENT && c->state != T_SYN_RCVD) {
+            char ok[16];
+            int  n = app(ok, 0, "ok ");
+            n += uutoa((unsigned long)i, ok + n);
+            ok[n++] = '\n';
+            ok[n]   = 0;
+            ctl_answer(&c->opener, ok, 0);
+        }
+        if (!c->reader.used)
             continue;
         if (c->rxq_len > 0) {
             char buf[VFS_DATA_MAX];
@@ -1729,7 +1810,29 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
     int   n = 0;
     const char *s = skip_spaces(cmd);
 
-    if (word_is(&s, "connect")) {
+    if (word_is(&s, "resolve")) {
+        if (!*s) {
+            n = app(o, n, "error syntax\n");
+        } else if (dns_at) {
+            n = app(o, n, "error resolver busy\n");
+        } else {
+            int k = 0;
+            while (s[k] && s[k] != ' ' && k < (int)sizeof(dns_name) - 1) {
+                dns_name[k] = s[k];
+                k++;
+            }
+            dns_name[k] = 0;
+            dns_waiter.used = 1;
+            dns_waiter.task = from;
+            dns_waiter.fd   = fd;
+            dns_waiter.len  = wlen;
+            dns_tries = 0;
+            dns_send(dns_name);
+            dns_at = unow_ms() + DNS_TIMEOUT;
+            timers_rearm();
+            return 0;                     /* parked until the answer arrives */
+        }
+    } else if (word_is(&s, "connect")) {
         uint8 ip[4];
         unsigned port;
         const char *p = parse_ip(s, ip);
@@ -1740,9 +1843,14 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
             if (!c)
                 n = app(o, n, "error no free connection\n");
             else {
-                n = app(o, n, "ok ");
-                n += uutoa((unsigned long)(c - tcbs), o + n);
-                o[n++] = '\n';
+                /* Park until the handshake finishes. A program has nothing to
+                   do with a connection that is not up, and telling it the slot
+                   number early only invites it to poll. */
+                c->opener.used = 1;
+                c->opener.task = from;
+                c->opener.fd   = fd;
+                c->opener.len  = wlen;
+                return 0;
             }
         }
     } else if (word_is(&s, "listen")) {
@@ -1951,22 +2059,14 @@ int net_vfs(int from, struct vfs_req *r)
 
 
 /* ---- the demo ----------------------------------------------------------
-   Everything below this line is policy, not protocol: which host to talk to,
-   what to say, and what to do with the answer. It is kept together at the
-   bottom so the stack above it is a stack and nothing else.
+   What is left of it. Everything here is policy — which host to talk to and
+   what to say — and stage by stage it has been moving out of this file and
+   into programs, which is where it belongs. What remains is the outbound
+   call the boot sequence makes so that /net/tcp has something behind it for
+   `hello.elf` to find. Naming a host, resolving it and fetching a page is
+   /GET.ELF's job now, not the stack's. */
 
-   The interesting part is the last item. QEMU's user-mode network is a NAT
-   onto the machine's real one, so a segment sent to an address outside
-   10.0.2.0/24 leaves for the actual internet and the answer comes back from
-   an actual server. That is a far harder examiner than a local `nc`: the
-   sequence numbers are somebody else's, the segments come in the sizes a real
-   stack chooses, and nothing is forgiven. */
-
-#define WEB_HOST "example.com"
-
-static int demo_done, dns_done;
-static int http_shown;              /* bytes of the reply printed so far */
-#define HTTP_SHOW 640
+static int demo_done;
 
 static void demo_start(void)
 {
@@ -1980,56 +2080,10 @@ static void demo_start(void)
         c->is_client = 1;
 }
 
-/* An address, at last, that nobody wrote into this source file. */
-static void web_fetch(const uint8 *addr)
-{
-    struct tcb *c = tcp_connect(addr, 80);
-    if (c)
-        c->http = 1;
-}
-
 static void demo_opened(struct tcb *c)
 {
-    if (c->http) {
-        static const char req[] =
-            "GET / HTTP/1.0\r\nHost: " WEB_HOST "\r\nConnection: close\r\n\r\n";
-        tcp_write(c, req, (int)sizeof(req) - 1);
-        net_puts("  http: GET / -> " WEB_HOST "\n");
-        return;
-    }
     if (c->is_client)
         net_puts("  tcp: /net/tcp is open for business\n");
-    /* An inbound call gets nothing from here. It used to get a greeting,
-       because nothing in the guest was running to answer for itself; now
-       /NETD.ELF is, and deciding what to say to a caller was never the
-       stack's business. */
-}
-
-/* Print what the server said, up to a point — the whole page would bury the
-   console, and the object of the exercise is to show that the bytes are real
-   and in order, not to render a web site. */
-static void demo_received(struct tcb *c, const uint8 *data, int dlen)
-{
-    (void)c;
-    int n = dlen;
-    if (http_shown >= HTTP_SHOW) {
-        net_putn("  http: +", (unsigned long)dlen, " bytes (not shown)\n");
-        return;
-    }
-    if (http_shown + n > HTTP_SHOW)
-        n = HTTP_SHOW - http_shown;
-
-    for (int i = 0; i < n; ) {
-        char line[65];
-        int k = 0;
-        while (i < n && k < 64)
-            line[k++] = (char)data[i++];
-        line[k] = 0;
-        net_puts(line);
-    }
-    http_shown += dlen;
-    if (http_shown >= HTTP_SHOW)
-        net_puts("\n  http: ...\n");
 }
 
 void net_start(void)
@@ -2050,10 +2104,6 @@ static void demo_arp_ready(const uint8 *ip)
 {
     if (ip_eq(ip, gw_ip))
         demo_start();
-    if (ip_eq(ip, dns_ip) && !dns_done) {
-        dns_done = 1;
-        dns_query(WEB_HOST);
-    }
 }
 
 static void arp_input(const uint8 *a, int len)
