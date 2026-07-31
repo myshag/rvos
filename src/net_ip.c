@@ -43,7 +43,10 @@
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
-static const uint8 me_ip[4]   = { 10, 0, 2, 15 };
+/* Not const any more: two of these machines on one wire have to differ,
+   and the address is a property of the running system rather than of the
+   image. /net/ctl sets it. */
+static uint8 me_ip[4]   = { 10, 0, 2, 15 };
 static const uint8 me_mask[4] = { 255, 255, 255, 0 };
 static const uint8 gw_ip[4]   = { 10, 0, 2, 2 };
 
@@ -2024,6 +2027,17 @@ static int ctl_command(int pi, int from, int fd, int wlen, const char *cmd)
                 net_wakeups();
                 return 0;                /* parked, or answered inside there */
             }
+        }
+    } else if (word_is(&s, "address")) {
+        uint8 ip[4];
+        if (!parse_ip(s, ip)) {
+            n = app(o, n, "error syntax\n");
+        } else {
+            umemcpy(me_ip, ip, 4);
+            net_puts("  net: this machine is now ");
+            ip_puts(me_ip);
+            net_puts("\n");
+            n = app(o, n, "ok\n");
         }
     } else if (word_is(&s, "close")) {
         unsigned slot;

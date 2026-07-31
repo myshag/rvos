@@ -356,6 +356,8 @@ $ read the fs server's private data region
     search for which member has a name
 30. a namespace from another machine: a wire protocol, `exportfs`, `import`,
     and the non-blocking send the whole thing turned out to need
+31. two machines on one wire: a runtime address, and one writing to the
+    other's control files through a mounted namespace
 
 ## Loading a program
 
@@ -1644,6 +1646,69 @@ read -> b'ok 3\n'
 --- the guest status, read remotely ---
 tcp 3 listen       :99
 ```
+
+### Two machines, one wire
+
+The host-side implementations prove the format. Two guests prove the thing.
+`-netdev socket` is a plain layer-2 cable between two QEMUs — no slirp, no
+gateway, nothing else on the segment — and both images are identical, so the
+address has to become a property of the running system rather than of the
+build. That is one more line in `/net/ctl`, and the shell grew `write`, which
+is how one speaks to a control file from a prompt.
+
+```
+A$ write /net/ctl address 10.0.2.20
+  net: this machine is now 10.0.2.20
+A$ /EXPORTFS.ELF
+  [exportfs] exporting this namespace on port 564
+```
+```
+B$ write /net/ctl address 10.0.2.21
+B$ import 10.0.2.20 564 /a/
+  arp: who has 10.0.2.20?
+  arp: 10.0.2.20 is at 52:54:00:12:34:56
+  tcp: SYN -> 10.0.2.20:564
+  tcp: [test] dropping this segment before it reaches the card
+  tcp: timeout, retransmitting (attempt 2)
+  tcp: connection established
+mounted
+
+B$ cat /a/README.TXT
+rvos readme
+===========
+Educational RISC-V microkernel with FAT16.
+
+B$ cat /a/proc/tasks
+0  blocked  fs
+2  running  proc  (me)
+518  blocked  /EXPORTFS.ELF        <- A's exportfs, seen from B
+```
+
+The deliberate loss is still armed, so B's SYN was dropped and the
+retransmission timer recovered it — across a real link to another machine
+this time, rather than a loopback.
+
+And then the point of all of it. B writes one line to a file and *A's* TCP
+stack opens a port:
+
+```
+B$ write /a/net/ctl listen 99
+ok 3
+B$ cat /a/net/status
+address  10.0.2.20/24
+tcp 1 listen       :564
+tcp 2 established  :564 <-> 10.0.2.21:40001
+tcp 3 listen       :99
+```
+
+A's own console, independently:
+
+```
+A$   tcp: listening on port 99
+```
+
+Nothing on B knows it is talking to another machine; nothing on A knows its
+caller is one. `write` opens a name and puts bytes in it.
 
 ### No authentication whatsoever
 

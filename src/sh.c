@@ -132,6 +132,64 @@ void sh_main(void)
             continue;
         }
 
+        /* Text to a file, which is how a control file is spoken to. Not a
+           redirection — there are no pipes here — just the write a program
+           would do, available from the prompt. */
+        if (streq(argv[0], "write")) {
+            if (argc < 3) {
+                uputs("usage: write <path> <text...>\n");
+                continue;
+            }
+            char msg[LINEMAX];
+            int k = 0;
+            for (int i = 2; i < argc; i++) {
+                if (i > 2)
+                    msg[k++] = ' ';
+                for (const char *q = argv[i]; *q && k < LINEMAX - 1; q++)
+                    msg[k++] = *q;
+            }
+            msg[k] = 0;
+            int fd = vfs_open(argv[1]);
+            if (fd < 0) {
+                uputs("write: cannot open ");
+                uputs(argv[1]);
+                uputs("\n");
+                continue;
+            }
+            if (vfs_write(fd, msg, k) < 0)
+                uputs("write: refused\n");
+            char back[VFS_DATA_MAX + 1];
+            int n = vfs_read(fd, back, VFS_DATA_MAX);
+            if (n > 0) {
+                back[n] = 0;
+                uputs(back);
+            }
+            vfs_close(fd);
+            continue;
+        }
+
+        /* Start a proxy for another machine's namespace and mount it, which
+           is two calls and no new mechanism. */
+        if (streq(argv[0], "import")) {
+            if (argc < 4) {
+                uputs("usage: import <a.b.c.d> <port> <prefix>\n");
+                continue;
+            }
+            char *av[4];
+            av[0] = (char *)"/IMPORT.ELF";
+            av[1] = argv[1];
+            av[2] = argv[2];
+            av[3] = argv[3];
+            int tid = spawn(av[0], elfbuf, ELFMAX, 4, av);
+            if (tid < 0)
+                uputs("import: cannot run /IMPORT.ELF\n");
+            else if (sys_mount(argv[3], tid, MREPL) < 0)
+                uputs("import: no room in the mount table\n");
+            else
+                uputs("mounted\n");
+            continue;
+        }
+
         /* The other builtin, because it answers the question a loader raises:
            does running programs cost memory permanently? */
         if (streq(argv[0], "mem")) {
